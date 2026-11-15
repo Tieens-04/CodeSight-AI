@@ -1,9 +1,21 @@
 """Unit tests for Settings configuration and structured JSON logging."""
 
+import io
+import json
+import logging
+
 import pytest
+import structlog
 from pydantic import SecretStr
 
 from codesight.core.config import Settings, get_settings
+from codesight.core.logging import (
+    bind_trace_id,
+    clear_trace_context,
+    configure_logging,
+    get_trace_id,
+    sanitize_trace_id,
+)
 
 
 def test_settings_canonical_host_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -69,3 +81,48 @@ def test_get_settings_cache_can_clear() -> None:
     assert first is second
     get_settings.cache_clear()
     assert get_settings() is not first
+
+
+def test_sanitize_trace_id_accepts_valid_and_rejects_hostile_inputs() -> None:
+    assert sanitize_trace_id("  gh-delivery_123.abc  ") == "gh-delivery_123.abc"
+    for bad in [None, "", "   ", "evil\r\ninjected: true", "x" * 129, "bad space", "a/b"]:
+        cleaned = sanitize_trace_id(bad)
+        assert len(cleaned) == 32 and cleaned.isalnum()
+
+
+def test_configure_logging_emits_json_with_trace_id_for_structlog_and_stdlib() -> None:
+    buf = io.StringIO()
+    clear_trace_context()
+    configure_logging(level="INFO", service_name="codesight-test", stream=buf)
+
+    structlog.get_logger("codesight.startup").info("booting")
+
+    tid = bind_trace_id("trace-abc-001")
+    assert tid == "trace-abc-001"
+    assert get_trace_id() == "trace-abc-001"
+
+    structlog.get_logger("codesight.unit").info("custom_event", answer=42)
+    logging.getLogger("uvicorn.error").warning("stdlib_warning")
+
+    clear_trace_context()
+    assert get_trace_id() is None
+    assert logging.getLogger("uvicorn.access").propagate is False
+
+    generated = bind_trace_id()
+    assert len(generated) == 32 and generated.isalnum()
+    clear_trace_context()
+
+    lines = [json.loads(line) for line in buf.getvalue().strip().splitlines()]
+    assert len(lines) == 3
+    assert lines[0]["event"] == "booting"
+    assert lines[0]["trace_id"] == "-"
+    assert lines[1]["event"] == "custom_event"
+    assert lines[1]["answer"] == 42
+    assert lines[1]["trace_id"] == "trace-abc-001"
+    assert lines[1]["service"] == "codesight-test"
+    assert lines[1]["logger"] == "codesight.unit"
+    assert "timestamp" in lines[1]
+    assert lines[2]["event"] == "stdlib_warning"
+    assert lines[2]["trace_id"] == "trace-abc-001"
+    assert lines[2]["service"] == "codesight-test"
+    assert lines[2]["level"] == "warning"
