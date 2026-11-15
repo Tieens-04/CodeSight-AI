@@ -1,0 +1,177 @@
+name: codesight
+
+networks:
+  codesight-net:
+    driver: bridge
+
+volumes:
+  codesight-pgdata:
+  codesight-redisdata:
+  codesight-qdrantdata:
+
+services:
+  codesight-postgres:
+    image: postgres:16-alpine
+    container_name: codesight-postgres
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-codesight}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-codesight_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-codesight}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - codesight-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - codesight-net
+
+  codesight-redis:
+    image: redis:7-alpine
+    container_name: codesight-redis
+    restart: unless-stopped
+    mem_limit: 256m
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 192mb
+      - --maxmemory-policy
+      - volatile-lru
+    ports:
+      - "${REDIS_PORT:-6381}:6379"
+    volumes:
+      - codesight-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - codesight-net
+
+  codesight-qdrant:
+    image: qdrant/qdrant:latest
+    container_name: codesight-qdrant
+    restart: unless-stopped
+    mem_limit: 1g
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - codesight-qdrantdata:/qdrant/storage
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf \"GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && grep -q \"200 OK\" <&3'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - codesight-net
+
+  codesight-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codesight-ai:local
+    container_name: codesight-api
+    restart: unless-stopped
+    mem_limit: 512m
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      POSTGRES_HOST: codesight-postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: codesight-redis
+      REDIS_PORT: 6379
+      QDRANT_HOST: codesight-qdrant
+      QDRANT_HTTP_PORT: 6333
+      QDRANT_GRPC_PORT: 6334
+    ports:
+      - "${API_PORT:-8082}:8000"
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    depends_on:
+      codesight-postgres:
+        condition: service_healthy
+      codesight-redis:
+        condition: service_healthy
+      codesight-qdrant:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - codesight-net
+
+  codesight-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codesight-ai:local
+    container_name: codesight-worker
+    restart: unless-stopped
+    mem_limit: 768m
+    command:
+      - celery
+      - -A
+      - codesight.worker.celery_app:celery_app
+      - worker
+      - --loglevel=INFO
+      - --concurrency=2
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_HOST: codesight-postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: codesight-redis
+      REDIS_PORT: 6379
+      QDRANT_HOST: codesight-qdrant
+      QDRANT_HTTP_PORT: 6333
+      QDRANT_GRPC_PORT: 6334
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    depends_on:
+      codesight-postgres:
+        condition: service_healthy
+      codesight-redis:
+        condition: service_healthy
+      codesight-qdrant:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "celery -A codesight.worker.celery_app:celery_app inspect ping -d celery@$$HOSTNAME --timeout 5",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    networks:
+      - codesight-net
