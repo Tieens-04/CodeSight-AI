@@ -93,16 +93,21 @@ def configure_logging(
     handler = logging.StreamHandler(target_stream)
     handler.setFormatter(formatter)
 
+    normalized_level = level.upper()
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
-    root_logger.setLevel(level.upper())
+    root_logger.setLevel(normalized_level)
 
     uvicorn_access = logging.getLogger("uvicorn.access")
     uvicorn_access.handlers.clear()
     uvicorn_access.propagate = False
 
-    for logger_name in ("uvicorn", "uvicorn.error", "celery", "httpx"):
+    for logger_name in ("uvicorn", "uvicorn.error", "celery", "httpx", "httpcore"):
         lib_logger = logging.getLogger(logger_name)
         lib_logger.handlers.clear()
         lib_logger.propagate = True
+
+    noisy_http_level = logging.DEBUG if normalized_level == "DEBUG" else logging.WARNING
+    for noisy_name in ("httpx", "httpcore"):
+        logging.getLogger(noisy_name).setLevel(noisy_http_level)

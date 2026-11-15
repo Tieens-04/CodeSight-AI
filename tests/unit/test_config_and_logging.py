@@ -126,3 +126,26 @@ def test_configure_logging_emits_json_with_trace_id_for_structlog_and_stdlib() -
     assert lines[2]["trace_id"] == "trace-abc-001"
     assert lines[2]["service"] == "codesight-test"
     assert lines[2]["level"] == "warning"
+
+
+def test_configure_logging_quiets_httpx_info_unless_debug() -> None:
+    buf_info = io.StringIO()
+    clear_trace_context()
+    configure_logging(level="INFO", service_name="codesight-test", stream=buf_info)
+
+    logging.getLogger("httpx").info("HTTP Request: GET http://codesight-qdrant:6333/readyz")
+    logging.getLogger("httpcore").info("connect_tcp.started")
+    logging.getLogger("httpx").warning("httpx_degraded_retry")
+
+    info_lines = [json.loads(line) for line in buf_info.getvalue().strip().splitlines()]
+    assert len(info_lines) == 1
+    assert info_lines[0]["event"] == "httpx_degraded_retry"
+    assert info_lines[0]["level"] == "warning"
+
+    buf_debug = io.StringIO()
+    configure_logging(level="DEBUG", service_name="codesight-test", stream=buf_debug)
+    logging.getLogger("httpx").info("HTTP Request: GET http://codesight-qdrant:6333/readyz")
+
+    debug_lines = [json.loads(line) for line in buf_debug.getvalue().strip().splitlines()]
+    assert len(debug_lines) == 1
+    assert "HTTP Request" in debug_lines[0]["event"]

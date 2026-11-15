@@ -11,6 +11,8 @@ __pycache__
 htmlcov
 .env
 .env.*
+*.pem
+*.key
 tests
 docs
 .agents

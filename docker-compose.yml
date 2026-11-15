@@ -90,7 +90,8 @@ services:
     restart: unless-stopped
     mem_limit: 512m
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 8000
@@ -143,7 +144,8 @@ services:
       - --loglevel=INFO
       - --concurrency=2
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       POSTGRES_HOST: codesight-postgres
       POSTGRES_PORT: 5432
