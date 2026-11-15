@@ -1,0 +1,11 @@
+{
+  "name": "codesight-github",
+  "displayName": "CodeSight GitHub MCP",
+  "version": "1.0.0",
+  "description": "Official GitHub MCP Server integration for CodeSight-AI PR reviews, diffs, blobs, issues, and Actions using OS keyring authentication (`gh auth token`).",
+  "suggestedPrompts": [
+    "Inspect open pull requests and review comments on the target GitHub repository",
+    "Fetch file blob metadata and unified diff hunks for a test PR",
+    "Check GitHub Actions workflow runs and code security alerts"
+  ]
+}
