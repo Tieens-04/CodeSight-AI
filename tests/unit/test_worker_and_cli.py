@@ -50,6 +50,8 @@ def test_celery_signals_propagate_and_clean_trace_id() -> None:
     on_task_postrun()
     assert get_trace_id() is None
     assert celery_app.main == "codesight"
+    assert celery_app.conf.worker_hijack_root_logger is False
+    assert celery_app.conf.worker_redirect_stdouts is False
 
 
 def test_cli_help_and_version_keep_stdout_free_of_json_logs(

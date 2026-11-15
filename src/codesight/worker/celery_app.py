@@ -9,6 +9,7 @@ import structlog
 from celery import Celery
 from celery.signals import (
     before_task_publish,
+    setup_logging,
     task_postrun,
     task_prerun,
     worker_process_init,
@@ -83,6 +84,8 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
         timezone="UTC",
         enable_utc=True,
         broker_connection_retry_on_startup=True,
+        worker_hijack_root_logger=False,
+        worker_redirect_stdouts=False,
     )
     return app
 
@@ -100,6 +103,7 @@ def _typed_task(
 
 
 before_task_publish.connect(inject_trace_id_header, weak=False)
+setup_logging.connect(on_worker_process_init, weak=False)
 worker_process_init.connect(on_worker_process_init, weak=False)
 task_prerun.connect(on_task_prerun, weak=False)
 task_postrun.connect(on_task_postrun, weak=False)
