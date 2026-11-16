@@ -32,6 +32,10 @@ logger = structlog.get_logger("codesight.vcs.auth")
 class GitHubAuthError(RuntimeError):
     """Raised when GitHub authentication fails or credentials are missing."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class GitHubAuthConfigError(GitHubAuthError):
     """Raised when GitHub App private key or repository identifier configuration is invalid."""
@@ -202,13 +206,15 @@ class GitHubAuthProvider:
         )
 
     def _mint_jwt(self) -> str:
-        assert self._settings.github_app_id is not None
-        assert self._settings.github_private_key is not None
-        if self._normalized_pem is None:
-            self._normalized_pem = normalize_private_key(
-                self._settings.github_private_key.get_secret_value()
+        app_id = self._settings.github_app_id
+        private_key = self._settings.github_private_key
+        if app_id is None or private_key is None:
+            raise GitHubAuthConfigError(
+                "GITHUB_APP_ID and GITHUB_PRIVATE_KEY must be configured."
             )
-        return create_app_jwt(self._settings.github_app_id, self._normalized_pem)
+        if self._normalized_pem is None:
+            self._normalized_pem = normalize_private_key(private_key.get_secret_value())
+        return create_app_jwt(app_id, self._normalized_pem)
 
     @staticmethod
     def _app_headers(app_jwt: str) -> dict[str, str]:
@@ -229,8 +235,10 @@ class GitHubAuthProvider:
             resp = await client.post(url, headers=self._app_headers(app_jwt))
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
             raise GitHubAuthError(
-                f"GitHub App token exchange failed with HTTP {exc.response.status_code}."
+                f"GitHub App token exchange failed with HTTP {code}.",
+                status_code=code,
             ) from exc
         except httpx.RequestError as exc:
             raise GitHubAuthError(
@@ -256,8 +264,10 @@ class GitHubAuthProvider:
                 return None
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
             raise GitHubAuthError(
-                f"GitHub installation lookup failed with HTTP {exc.response.status_code}."
+                f"GitHub installation lookup failed with HTTP {code}.",
+                status_code=code,
             ) from exc
         except httpx.RequestError as exc:
             raise GitHubAuthError(
@@ -309,7 +319,7 @@ class GitHubAuthProvider:
                     try:
                         return await self._get_or_exchange_for_installation(int(cached_inst))
                     except GitHubAuthError as exc:
-                        if "HTTP 404" not in str(exc):
+                        if exc.status_code != 404:
                             raise
                         await self._delete_cache(repo_cache_key)
 

@@ -83,6 +83,9 @@ def test_normalize_private_key_supports_multiline_escaped_and_base64() -> None:
         normalize_private_key("not-a-valid-key-secret-value")
     assert "not-a-valid-key-secret-value" not in str(exc_info.value)
 
+    with pytest.raises(GitHubAuthConfigError):
+        normalize_private_key("-----BEGIN PRIVATE KEY-----\nbad\n-----END PRIVATE KEY-----")
+
 
 def test_create_app_jwt_claims_and_rs256_signature() -> None:
     pem_private, pem_public = _generate_rsa_keypair()
@@ -373,6 +376,33 @@ async def test_redis_bytes_cache_and_http_error_and_bool_id_guards() -> None:
         )
         with pytest.raises(GitHubAuthError):
             await provider_net.get_token(installation_id=42)
+        with pytest.raises(GitHubAuthError):
+            await provider_net.get_token(repo_full_name="org/net-fail")
+
+    # Installation lookup HTTP 500 preserves status_code=500
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(500, json={"message": "err"}))
+    ) as client:
+        provider_500 = GitHubAuthProvider(
+            settings,
+            redis_client=_FakeAsyncRedis(),  # type: ignore[arg-type]
+            http_client=client,
+        )
+        with pytest.raises(GitHubAuthError) as lookup_err:
+            await provider_500.get_token(repo_full_name="org/server-err")
+    assert lookup_err.value.status_code == 500
+
+    # Token exchange 201 missing 'token' key raises GitHubAuthError
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(201, json={}))
+    ) as client:
+        provider_empty_tok = GitHubAuthProvider(
+            settings,
+            redis_client=_FakeAsyncRedis(),  # type: ignore[arg-type]
+            http_client=client,
+        )
+        with pytest.raises(GitHubAuthError):
+            await provider_empty_tok.get_token(installation_id=42)
 
 
 @pytest.mark.asyncio
@@ -392,6 +422,8 @@ async def test_repo_installation_id_cached_and_invalidated_on_404() -> None:
             return httpx.Response(200, json={"id": 888})
         if request.url.path == "/app/installations/888/access_tokens":
             return httpx.Response(201, json={"token": "ghs_cached_repo_888"})
+        if request.url.path == "/app/installations/502/access_tokens":
+            return httpx.Response(502, json={"message": "Bad Gateway"})
         if request.url.path == "/app/installations/111/access_tokens":
             return httpx.Response(404, json={"message": "Not Found"})
         if request.url.path == "/repos/org/reinstalled/installation":
@@ -434,3 +466,12 @@ async def test_repo_installation_id_cached_and_invalidated_on_404() -> None:
             "GET /repos/org/reinstalled/installation",
             "POST /app/installations/222/access_tokens",
         ]
+
+        # Non-404 HTTP 502 from cached repo installation preserves cache and propagates status_code
+        fake_redis.store["gh_repo_inst:org/cached"] = "502"
+        calls.clear()
+        with pytest.raises(GitHubAuthError) as cached_502_err:
+            await provider.get_token(repo_full_name="org/cached")
+        assert cached_502_err.value.status_code == 502
+        assert fake_redis.store["gh_repo_inst:org/cached"] == "502"
+        assert calls == ["POST /app/installations/502/access_tokens"]

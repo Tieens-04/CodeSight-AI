@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Final, Literal, Protocol, TypeGuard, cast
 
 import redis.asyncio as redis_async
@@ -15,7 +16,7 @@ import structlog
 from celery import Celery
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -29,6 +30,8 @@ MAX_WEBHOOK_BODY_BYTES: Final[int] = 25 * 1024 * 1024  # 25 MiB ceiling for 512m
 ACTIONABLE_PR_ACTIONS: Final[frozenset[str]] = frozenset({"opened", "synchronize", "reopened"})
 PR_SYNCHRONIZE_DEBOUNCE_SECONDS: Final[int] = 5
 PR_SUPERSEDE_TTL_SECONDS: Final[int] = 86400
+STALE_RECEIVED_SECONDS: Final[int] = 60
+BROKER_PUBLISH_RETRY_DELAY_SECONDS: Final[float] = 0.05
 _ZERO_SHA: Final[str] = "0" * 40
 _MAX_INT32: Final[int] = (1 << 31) - 1
 _MAX_INT64: Final[int] = (1 << 63) - 1
@@ -87,6 +90,12 @@ class WebhookDispatcher(Protocol):
         ...
 
 
+def _decode_redis_str(raw: object) -> str | None:
+    if isinstance(raw, (bytes, bytearray)):
+        return raw.decode("utf-8") or None
+    return str(raw) if raw else None
+
+
 class CeleryWebhookDispatcher:
     """Dispatches webhook jobs to Celery via asyncio.to_thread to keep ASGI non-blocking."""
 
@@ -99,31 +108,75 @@ class CeleryWebhookDispatcher:
         self._app = app
         self._redis_client = redis_client
 
+    async def _publish_task(
+        self,
+        target: Celery,
+        task_name: str,
+        payload_dict: dict[str, Any],
+        *,
+        countdown: int = 0,
+    ) -> str:
+        try:
+            result = await asyncio.to_thread(
+                target.send_task,
+                task_name,
+                args=(payload_dict,),
+                countdown=countdown,
+            )
+        except Exception:
+            await asyncio.sleep(BROKER_PUBLISH_RETRY_DELAY_SECONDS)
+            result = await asyncio.to_thread(
+                target.send_task,
+                task_name,
+                args=(payload_dict,),
+                countdown=countdown,
+            )
+        return str(result.id)
+
     async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
         target = self._app if self._app is not None else celery_app
         countdown = PR_SYNCHRONIZE_DEBOUNCE_SECONDS if payload.action == "synchronize" else 0
         sha_key = f"pr_active:{payload.repo_id}:{payload.pr_number}"
         task_key = f"pr_active_task:{payload.repo_id}:{payload.pr_number}"
+        prev_sha: str | None = None
         prev_task_id: str | None = None
+        wrote_sha = False
 
         if self._redis_client is not None:
             try:
-                prev_raw = await self._redis_client.get(task_key)
-                if isinstance(prev_raw, (bytes, bytearray)):
-                    prev_task_id = prev_raw.decode("utf-8")
-                elif prev_raw:
-                    prev_task_id = str(prev_raw)
-                await self._redis_client.set(sha_key, payload.head_sha, ex=PR_SUPERSEDE_TTL_SECONDS)
+                prev_sha = _decode_redis_str(await self._redis_client.get(sha_key))
+                prev_task_id = _decode_redis_str(await self._redis_client.get(task_key))
+                await self._redis_client.set(
+                    sha_key, payload.head_sha, ex=PR_SUPERSEDE_TTL_SECONDS
+                )
+                wrote_sha = True
             except (redis.exceptions.RedisError, OSError) as exc:
                 logger.warning("webhook_supersede_cache_unavailable", error_type=type(exc).__name__)
 
-        result = await asyncio.to_thread(
-            target.send_task,
-            "codesight.webhook.handle_pr_event",
-            args=(payload.model_dump(mode="json"),),
-            countdown=countdown,
-        )
-        task_id = str(result.id)
+        try:
+            task_id = await self._publish_task(
+                target,
+                "codesight.webhook.handle_pr_event",
+                payload.model_dump(mode="json"),
+                countdown=countdown,
+            )
+        except Exception:
+            if wrote_sha and self._redis_client is not None:
+                try:
+                    current_sha = _decode_redis_str(await self._redis_client.get(sha_key))
+                    if current_sha == payload.head_sha:
+                        if prev_sha is not None:
+                            await self._redis_client.set(
+                                sha_key, prev_sha, ex=PR_SUPERSEDE_TTL_SECONDS
+                            )
+                        else:
+                            await self._redis_client.delete(sha_key)
+                except (redis.exceptions.RedisError, OSError) as rollback_exc:
+                    logger.warning(
+                        "webhook_supersede_rollback_failed",
+                        error_type=type(rollback_exc).__name__,
+                    )
+            raise
 
         if self._redis_client is not None:
             try:
@@ -149,29 +202,44 @@ class CeleryWebhookDispatcher:
 
     async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str:
         target = self._app if self._app is not None else celery_app
-        result = await asyncio.to_thread(
-            target.send_task,
+        return await self._publish_task(
+            target,
             "codesight.webhook.handle_push_event",
-            args=(payload.model_dump(mode="json"),),
+            payload.model_dump(mode="json"),
         )
-        return str(result.id)
 
 
 @dataclass(frozen=True)
-class _ClassifiedWebhook:
-    target_status: Literal["queued", "ignored"]
-    ack_status: Literal["queued", "ignored", "pong"]
+class _IgnoredWebhook:
+    ack_status: Literal["ignored", "pong"]
     action: str | None
-    repo_full_name: str | None = None
-    github_repo_id: int | None = None
-    default_branch: str = "main"
-    installation_id: int | None = None
-    pr_number: int | None = None
-    head_sha: str | None = None
-    base_sha: str | None = None
-    ref: str | None = None
-    before_sha: str | None = None
-    after_sha: str | None = None
+
+
+@dataclass(frozen=True)
+class _QueuedPRWebhook:
+    action: str
+    repo_full_name: str
+    github_repo_id: int | None
+    default_branch: str
+    installation_id: int | None
+    pr_number: int
+    head_sha: str
+    base_sha: str | None
+
+
+@dataclass(frozen=True)
+class _QueuedPushWebhook:
+    action: str | None
+    repo_full_name: str
+    github_repo_id: int | None
+    default_branch: str
+    installation_id: int | None
+    ref: str
+    before_sha: str | None
+    after_sha: str
+
+
+type _ClassifiedWebhook = _IgnoredWebhook | _QueuedPRWebhook | _QueuedPushWebhook
 
 
 def verify_github_signature(
@@ -305,11 +373,11 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
         action = cleaned_action or None
 
     if event_type == "ping":
-        return _ClassifiedWebhook(target_status="ignored", ack_status="pong", action=action)
+        return _IgnoredWebhook(ack_status="pong", action=action)
 
     if event_type == "pull_request":
-        if action not in ACTIONABLE_PR_ACTIONS:
-            return _ClassifiedWebhook(target_status="ignored", ack_status="ignored", action=action)
+        if action is None or action not in ACTIONABLE_PR_ACTIONS:
+            return _IgnoredWebhook(ack_status="ignored", action=action)
 
         full_name, gh_repo_id, default_branch, inst_id = _extract_repo_meta(payload)
         pr_raw = payload.get("pull_request")
@@ -334,9 +402,7 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Webhook payload missing pull_request number or head SHA.",
             )
-        return _ClassifiedWebhook(
-            target_status="queued",
-            ack_status="queued",
+        return _QueuedPRWebhook(
             action=action,
             repo_full_name=full_name,
             github_repo_id=gh_repo_id,
@@ -350,7 +416,7 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
     if event_type == "push":
         repo_raw = payload.get("repository")
         if not isinstance(repo_raw, dict):
-            return _ClassifiedWebhook(target_status="ignored", ack_status="ignored", action=action)
+            return _IgnoredWebhook(ack_status="ignored", action=action)
         full_name, gh_repo_id, default_branch, inst_id = _extract_repo_meta(payload)
         ref = payload.get("ref")
         after_raw = payload.get("after")
@@ -367,9 +433,7 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
             and len(after_sha) <= 64
             and after_sha != _ZERO_SHA
         ):
-            return _ClassifiedWebhook(
-                target_status="queued",
-                ack_status="queued",
+            return _QueuedPushWebhook(
                 action=action,
                 repo_full_name=full_name,
                 github_repo_id=gh_repo_id,
@@ -379,9 +443,9 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
                 before_sha=before_sha if before_sha and len(before_sha) <= 64 else None,
                 after_sha=after_sha,
             )
-        return _ClassifiedWebhook(target_status="ignored", ack_status="ignored", action=action)
+        return _IgnoredWebhook(ack_status="ignored", action=action)
 
-    return _ClassifiedWebhook(target_status="ignored", ack_status="ignored", action=action)
+    return _IgnoredWebhook(ack_status="ignored", action=action)
 
 
 def _stale_repo_name(full_name: str, suffix: str) -> str:
@@ -465,37 +529,41 @@ async def _upsert_repository(
     default_branch: str,
     installation_id: int | None,
 ) -> Repository:
-    updated = await _apply_repo_upsert(
-        session,
-        github_repo_id=github_repo_id,
-        full_name=full_name,
-        default_branch=default_branch,
-        installation_id=installation_id,
-    )
-    if updated is not None:
-        return updated
-
-    repo = Repository(
-        github_repo_id=github_repo_id,
-        full_name=full_name,
-        default_branch=default_branch,
-        installation_id=installation_id,
-    )
-    try:
-        async with session.begin_nested():
-            session.add(repo)
-            await session.flush()
-            return repo
-    except IntegrityError:
-        concurrent = await _apply_repo_upsert(
+    for _ in range(2):
+        updated = await _apply_repo_upsert(
             session,
             github_repo_id=github_repo_id,
             full_name=full_name,
             default_branch=default_branch,
             installation_id=installation_id,
         )
-        assert concurrent is not None
-        return concurrent
+        if updated is not None:
+            return updated
+
+        repo = Repository(
+            github_repo_id=github_repo_id,
+            full_name=full_name,
+            default_branch=default_branch,
+            installation_id=installation_id,
+        )
+        try:
+            async with session.begin_nested():
+                session.add(repo)
+                await session.flush()
+                return repo
+        except IntegrityError:
+            continue
+
+    resolved = await _apply_repo_upsert(
+        session,
+        github_repo_id=github_repo_id,
+        full_name=full_name,
+        default_branch=default_branch,
+        installation_id=installation_id,
+    )
+    if resolved is None:
+        raise RuntimeError(f"Failed to upsert repository '{full_name}'.")
+    return resolved
 
 
 def _get_runtime_settings(request: Request) -> Settings:
@@ -575,7 +643,7 @@ async def receive_github_webhook(
     classified = _classify_webhook(event_type, parsed_body)
     session_factory = _get_session_factory(request)
 
-    if classified.target_status == "ignored":
+    if isinstance(classified, _IgnoredWebhook):
         async with session_factory() as session:
             insert_stmt = (
                 pg_insert(WebhookEvent)
@@ -617,7 +685,8 @@ async def receive_github_webhook(
                 event=event_type,
             )
 
-    # Phase 1: Claim delivery ('received' or reclaim 'failed') + commit Repo before dispatch
+    # Phase 1: Claim delivery ('received', reclaim 'failed' or stale 'received') + commit Repo
+    stale_cutoff = func.now() - timedelta(seconds=STALE_RECEIVED_SECONDS)
     async with session_factory() as session:
         claim_stmt = (
             pg_insert(WebhookEvent)
@@ -633,8 +702,15 @@ async def receive_github_webhook(
                     "status": "received",
                     "event_type": event_type,
                     "action": classified.action,
+                    "received_at": func.now(),
                 },
-                where=(WebhookEvent.status == "failed"),
+                where=or_(
+                    WebhookEvent.status == "failed",
+                    and_(
+                        WebhookEvent.status == "received",
+                        WebhookEvent.received_at < stale_cutoff,
+                    ),
+                ),
             )
             .returning(WebhookEvent.delivery_id)
         )
@@ -653,7 +729,6 @@ async def receive_github_webhook(
                 event=event_type,
             )
 
-        assert classified.repo_full_name is not None
         repo = await _upsert_repository(
             session,
             github_repo_id=classified.github_repo_id,
@@ -671,9 +746,7 @@ async def receive_github_webhook(
     # Phase 2: Dispatch to Celery outside the DB transaction so workers see committed state
     dispatcher = _get_dispatcher(request)
     try:
-        if event_type == "pull_request":
-            assert classified.pr_number is not None and classified.head_sha is not None
-            assert classified.action is not None
+        if isinstance(classified, _QueuedPRWebhook):
             task_id = await dispatcher.dispatch_pull_request(
                 PRWebhookDispatchPayload(
                     delivery_id=delivery_id,
@@ -689,7 +762,6 @@ async def receive_github_webhook(
                 )
             )
         else:
-            assert classified.ref is not None and classified.after_sha is not None
             task_id = await dispatcher.dispatch_push(
                 PushWebhookDispatchPayload(
                     delivery_id=delivery_id,

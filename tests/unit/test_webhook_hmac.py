@@ -6,13 +6,17 @@ import hashlib
 import hmac
 import json
 import time
+import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
+import redis.asyncio as redis_async
+import redis.exceptions
 import sqlalchemy as sa
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -23,6 +27,7 @@ from codesight.api.routes.webhooks import (
     CeleryWebhookDispatcher,
     PRWebhookDispatchPayload,
     PushWebhookDispatchPayload,
+    _upsert_repository,
     verify_github_signature,
 )
 from codesight.core.config import Settings
@@ -30,6 +35,7 @@ from codesight.core.logging import bind_trace_id, clear_trace_context
 from codesight.db.models import Base, Repository, WebhookEvent
 from codesight.db.session import create_session_factory
 from codesight.worker.celery_app import (
+    create_celery_app,
     handle_pr_event,
     handle_push_event,
     is_pr_event_superseded,
@@ -273,10 +279,13 @@ async def test_webhook_idempotency_filtering_cli_upsert_and_broker_rollback(
                     },
                 )
 
-            # 1. ping -> 200 pong, 0 dispatches
+            # 1. ping -> 200 pong, 0 dispatches; duplicate ping -> 200 duplicate
             r_ping = await _send("ping", "deliv-ping-1", {"zen": "Keep it simple"})
             assert r_ping.status_code == 200
             assert r_ping.json()["status"] == "pong"
+            r_ping_dup = await _send("ping", "deliv-ping-1", {"zen": "Keep it simple"})
+            assert r_ping_dup.status_code == 200
+            assert r_ping_dup.json()["status"] == "duplicate"
 
             # 2. pull_request.opened -> 202 queued, backfills CLI repo's github_repo_id + inst_id
             r_pr = await _send(
@@ -418,9 +427,12 @@ async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
             self.store[key] = value
             return True
 
+        async def delete(self, key: str) -> int:
+            return 1 if self.store.pop(key, None) is not None else 0
+
     fake_async_redis = _FakeRedisAsync()
     dispatcher = CeleryWebhookDispatcher(
-        app=_FakeCelery(),  # type: ignore[arg-type]
+        app=_FakeCelery(),
         redis_client=fake_async_redis,  # type: ignore[arg-type]
     )
     pr_task_id = await dispatcher.dispatch_pull_request(
@@ -645,9 +657,9 @@ async def test_webhook_rejects_bool_ints_invalid_slugs_oversize_strings_and_hand
 
             # bool-as-int and out-of-range integer attacks -> 400
             bad_payloads: list[dict[str, Any]] = [
-                _pr_payload(repo_id=True),  # type: ignore[arg-type]
-                _pr_payload(installation_id=True),  # type: ignore[arg-type]
-                _pr_payload(pr_number=True),  # type: ignore[arg-type]
+                _pr_payload(repo_id=True),
+                _pr_payload(installation_id=True),
+                _pr_payload(pr_number=True),
                 _pr_payload(repo_id=-5),
                 _pr_payload(repo_id=2**63),
                 _pr_payload(pr_number=2**31),
@@ -722,19 +734,26 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
         await conn.run_sync(Base.metadata.create_all)
 
     session_factory = create_session_factory(engine)
-    settings = Settings(
-        _env_file=None,
-        github_webhook_secret=SecretStr(TEST_WEBHOOK_SECRET),
+    base_settings = Settings()
+    settings = base_settings.model_copy(
+        update={"github_webhook_secret": SecretStr(TEST_WEBHOOK_SECRET)}
     )
-
-    class _FastFakeCelery:
-        def send_task(self, name: str, **_: Any) -> SimpleNamespace:
-            return SimpleNamespace(id="bench-task-1")
+    bench_queue = f"codesight_bench_{uuid.uuid4().hex[:8]}"
+    bench_celery = create_celery_app(base_settings)
+    bench_celery.conf.task_default_queue = bench_queue
+    redis_client = redis_async.Redis.from_url(
+        base_settings.redis_url,
+        decode_responses=True,
+        socket_timeout=base_settings.health_timeout_seconds,
+    )
 
     app = create_app(
         settings=settings,
         session_factory=session_factory,
-        webhook_dispatcher=CeleryWebhookDispatcher(app=_FastFakeCelery()),  # type: ignore[arg-type]
+        webhook_dispatcher=CeleryWebhookDispatcher(
+            app=bench_celery,
+            redis_client=redis_client,
+        ),
     )
 
     try:
@@ -742,7 +761,7 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            # Warmup request to populate asyncpg connection pool
+            # Warmup request to populate asyncpg + Redis + Celery connections
             warm_raw = json.dumps(_pr_payload(action="opened", pr_number=1)).encode("utf-8")
             warm_resp = await client.post(
                 "/api/v1/webhooks/github",
@@ -757,8 +776,14 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
 
             latencies_ms: list[float] = []
             for idx in range(50):
+                # Every 5th request updates an existing PR to exercise real Redis supersede + revoke
+                pr_num = 1 if idx % 5 == 0 else idx + 2
                 raw = json.dumps(
-                    _pr_payload(action="synchronize", pr_number=idx + 2)
+                    _pr_payload(
+                        action="synchronize",
+                        pr_number=pr_num,
+                        head_sha=f"benchsha{idx:04d}",
+                    )
                 ).encode("utf-8")
                 t0 = time.perf_counter()
                 resp = await client.post(
@@ -776,7 +801,23 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
         mean_ms = sum(latencies_ms) / len(latencies_ms)
         assert mean_ms < 100.0, f"Mean webhook latency {mean_ms:.2f}ms exceeded 100ms SLA"
     finally:
-        await engine.dispose()
+        try:
+            async with session_factory() as cleanup_session:
+                repo_id = (
+                    await cleanup_session.execute(sa.select(Repository.id))
+                ).scalar_one_or_none()
+            if repo_id is not None:
+                keys = [
+                    str(k)
+                    async for k in redis_client.scan_iter(match=f"pr_active*:{repo_id}:*")
+                ]
+                if keys:
+                    await redis_client.delete(*keys)
+            await redis_client.delete(bench_queue)
+        finally:
+            await redis_client.aclose()
+            bench_celery.close()
+            await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -879,5 +920,334 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
             evt2 = await check.get(WebhookEvent, "deliv-slug-reuse")
             assert evt1 is not None and evt1.status == "queued"
             assert evt2 is not None and evt2.status == "queued"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_retry_rollback_and_fail_open_guards() -> None:
+    def _make_pr(head_sha: str) -> PRWebhookDispatchPayload:
+        return PRWebhookDispatchPayload(
+            delivery_id=f"d-{head_sha}",
+            repo_id="repo-r1",
+            github_repo_id=10,
+            repo_full_name="org/retry",
+            default_branch="main",
+            installation_id=20,
+            pr_number=7,
+            head_sha=head_sha,
+            action="synchronize",
+        )
+
+    class _MemoryBytesRedis:
+        def __init__(self, initial: dict[str, str | bytes] | None = None) -> None:
+            self.store: dict[str, str | bytes] = dict(initial or {})
+
+        async def get(self, key: str) -> str | bytes | None:
+            return self.store.get(key)
+
+        async def set(self, key: str, value: str, *, ex: int | None = None) -> bool:
+            self.store[key] = value
+            return True
+
+        async def delete(self, key: str) -> int:
+            return 1 if self.store.pop(key, None) is not None else 0
+
+    class _FlakyCelery:
+        def __init__(self, fail_count: int = 0, *, fail_revoke: bool = False) -> None:
+            self.fail_count = fail_count
+            self.fail_revoke = fail_revoke
+            self.calls = 0
+            self.revoked: list[str] = []
+            self.control = self
+
+        def send_task(self, name: str, **_: Any) -> SimpleNamespace:
+            self.calls += 1
+            if self.calls <= self.fail_count:
+                raise ConnectionError("transient broker error")
+            return SimpleNamespace(id=f"ok-task-{self.calls}")
+
+        def revoke(self, task_id: str, *, terminate: bool = False) -> None:
+            if self.fail_revoke:
+                raise RuntimeError("pidbox unavailable")
+            self.revoked.append(task_id)
+
+    # 1. Transient failure on 1st attempt succeeds on retry and decodes bytes from Redis
+    mem_redis = _MemoryBytesRedis(
+        {"pr_active:repo-r1:7": b"sha-bytes", "pr_active_task:repo-r1:7": b"task-bytes"}
+    )
+    flaky_retry = _FlakyCelery(fail_count=1, fail_revoke=True)
+    dispatcher = CeleryWebhookDispatcher(
+        app=flaky_retry,
+        redis_client=mem_redis,  # type: ignore[arg-type]
+    )
+    task_id = await dispatcher.dispatch_pull_request(_make_pr("sha-next"))
+    assert task_id == "ok-task-2"
+    assert flaky_retry.calls == 2
+    assert mem_redis.store["pr_active:repo-r1:7"] == "sha-next"
+    assert mem_redis.store["pr_active_task:repo-r1:7"] == "ok-task-2"
+
+    # Transient failure on push dispatch also retries once
+    push_flaky = _FlakyCelery(fail_count=1)
+    push_disp = CeleryWebhookDispatcher(app=push_flaky)
+    push_id = await push_disp.dispatch_push(
+        PushWebhookDispatchPayload(
+            delivery_id="d-push",
+            repo_id="repo-r1",
+            github_repo_id=10,
+            repo_full_name="org/retry",
+            default_branch="main",
+            installation_id=20,
+            ref="refs/heads/main",
+            after_sha="abc123",
+        )
+    )
+    assert push_id == "ok-task-2"
+
+    # 2. Persistent failure deletes sha_key when no prior SHA existed
+    empty_redis = _MemoryBytesRedis()
+    down_celery = _FlakyCelery(fail_count=5)
+    down_disp = CeleryWebhookDispatcher(
+        app=down_celery,
+        redis_client=empty_redis,  # type: ignore[arg-type]
+    )
+    with pytest.raises(ConnectionError):
+        await down_disp.dispatch_pull_request(_make_pr("sha-orphan"))
+    assert "pr_active:repo-r1:7" not in empty_redis.store
+    assert "pr_active_task:repo-r1:7" not in empty_redis.store
+
+    # 3. Persistent failure restores prev_sha and does NOT revoke prev_task_id
+    seeded_redis = _MemoryBytesRedis(
+        {"pr_active:repo-r1:7": "sha-prev", "pr_active_task:repo-r1:7": "task-prev"}
+    )
+    down_celery_2 = _FlakyCelery(fail_count=5)
+    down_disp_2 = CeleryWebhookDispatcher(
+        app=down_celery_2,
+        redis_client=seeded_redis,  # type: ignore[arg-type]
+    )
+    with pytest.raises(ConnectionError):
+        await down_disp_2.dispatch_pull_request(_make_pr("sha-failed"))
+    assert seeded_redis.store["pr_active:repo-r1:7"] == "sha-prev"
+    assert seeded_redis.store["pr_active_task:repo-r1:7"] == "task-prev"
+    assert down_celery_2.revoked == []
+
+    # 4. RedisError on get/set fails open and still publishes task
+    class _FailingAsyncRedis:
+        async def get(self, key: str) -> str | None:
+            raise redis.exceptions.ConnectionError("redis offline")
+
+        async def set(self, key: str, value: str, *, ex: int | None = None) -> bool:
+            raise redis.exceptions.ConnectionError("redis offline")
+
+        async def delete(self, key: str) -> int:
+            raise redis.exceptions.ConnectionError("redis offline")
+
+    healthy_celery = _FlakyCelery(fail_count=0)
+    fail_open_disp = CeleryWebhookDispatcher(
+        app=healthy_celery,
+        redis_client=_FailingAsyncRedis(),  # type: ignore[arg-type]
+    )
+    assert await fail_open_disp.dispatch_pull_request(_make_pr("sha-failopen")) == "ok-task-1"
+
+    # 5. Worker is_pr_event_superseded handles bytes, missing key, and Redis ConnectionError
+    class _SyncBytesRedis:
+        def __init__(self, val: bytes | None = None, *, fail: bool = False) -> None:
+            self._val = val
+            self._fail = fail
+
+        def get(self, key: str) -> bytes | None:
+            if self._fail:
+                raise redis.exceptions.ConnectionError("redis down")
+            return self._val
+
+    sample_payload = {"repo_id": "r1", "pr_number": 9, "head_sha": "sha-old"}
+    assert (
+        is_pr_event_superseded(
+            sample_payload,
+            redis_client=_SyncBytesRedis(b"sha-latest"),  # type: ignore[arg-type]
+        )
+        is True
+    )
+    assert (
+        is_pr_event_superseded(
+            {"repo_id": "r1", "pr_number": 9, "head_sha": "sha-latest"},
+            redis_client=_SyncBytesRedis(b"sha-latest"),  # type: ignore[arg-type]
+        )
+        is False
+    )
+    assert (
+        is_pr_event_superseded(
+            sample_payload,
+            redis_client=_SyncBytesRedis(None),  # type: ignore[arg-type]
+        )
+        is False
+    )
+    assert (
+        is_pr_event_superseded(
+            sample_payload,
+            redis_client=_SyncBytesRedis(fail=True),  # type: ignore[arg-type]
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_webhook_stale_received_reclaim_null_repo_id_and_concurrent_upsert(
+    isolated_postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(isolated_postgres_dsn, pool_pre_ping=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = create_session_factory(engine)
+    spy = _SpyDispatcher()
+    app = create_app(
+        settings=Settings(
+            _env_file=None,
+            github_webhook_secret=SecretStr(TEST_WEBHOOK_SECRET),
+        ),
+        session_factory=session_factory,
+        webhook_dispatcher=spy,
+    )
+
+    try:
+        async with session_factory() as seed:
+            seed.add_all(
+                [
+                    WebhookEvent(
+                        delivery_id="deliv-stale-rcv",
+                        event_type="pull_request",
+                        action="opened",
+                        status="received",
+                        received_at=datetime.now(UTC) - timedelta(seconds=120),
+                    ),
+                    WebhookEvent(
+                        delivery_id="deliv-fresh-rcv",
+                        event_type="pull_request",
+                        action="opened",
+                        status="received",
+                        received_at=datetime.now(UTC),
+                    ),
+                ]
+            )
+            await seed.commit()
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            async def _send(delivery: str, body_obj: dict[str, Any]) -> httpx.Response:
+                raw = json.dumps(body_obj).encode("utf-8")
+                return await client.post(
+                    "/api/v1/webhooks/github",
+                    content=raw,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-GitHub-Delivery": delivery,
+                        "X-Hub-Signature-256": _sign_body(raw),
+                    },
+                )
+
+            # 1. Stale 'received' is reclaimed and dispatched; fresh 'received' returns duplicate
+            r_stale = await _send("deliv-stale-rcv", _pr_payload(pr_number=101))
+            r_fresh = await _send("deliv-fresh-rcv", _pr_payload(pr_number=102))
+            assert r_stale.status_code == 202 and r_stale.json()["status"] == "queued"
+            assert r_fresh.status_code == 200 and r_fresh.json()["status"] == "duplicate"
+            assert len(spy.pr_calls) == 1
+
+            # 2. repo_id=None inserts then updates by full_name on subsequent delivery
+            r_null_insert = await _send(
+                "deliv-null-repo-1",
+                _pr_payload(
+                    repo_id=None,
+                    full_name="org/null-id-repo",
+                    default_branch="main",
+                    installation_id=100,
+                ),
+            )
+            r_null_update = await _send(
+                "deliv-null-repo-2",
+                _pr_payload(
+                    repo_id=None,
+                    full_name="org/null-id-repo",
+                    default_branch="develop",
+                    installation_id=4321,
+                ),
+            )
+            assert r_null_insert.status_code == 202
+            assert r_null_update.status_code == 202
+
+            # 3. Non-string repository.full_name and non-string action return 400
+            r_bad_name_type = await _send(
+                "deliv-bad-name-type",
+                {
+                    "action": "opened",
+                    "repository": {"full_name": 123},
+                    "pull_request": {"number": 1, "head": {"sha": "abc"}},
+                },
+            )
+            r_bad_action_type = await _send(
+                "deliv-bad-action-type",
+                {
+                    "action": 123,
+                    "repository": {"full_name": "org/valid"},
+                },
+            )
+            assert r_bad_name_type.status_code == 400
+            assert r_bad_action_type.status_code == 400
+
+        async with session_factory() as check:
+            null_repo = (
+                await check.execute(
+                    sa.select(Repository).where(Repository.full_name == "org/null-id-repo")
+                )
+            ).scalar_one()
+            assert null_repo.github_repo_id is None
+            assert null_repo.default_branch == "develop"
+            assert null_repo.installation_id == 4321
+
+        # 4. Concurrent IntegrityError inside _upsert_repository resolves cleanly on retry
+        async with session_factory() as race_session:
+            orig_begin_nested = race_session.begin_nested
+            triggered = False
+
+            def _raced_begin_nested() -> Any:
+                nonlocal triggered
+                ctx = orig_begin_nested()
+                if not triggered:
+                    triggered = True
+
+                    class _RacingSavepoint:
+                        async def __aenter__(self) -> Any:
+                            async with session_factory() as other_session:
+                                other_session.add(
+                                    Repository(
+                                        github_repo_id=8888,
+                                        full_name="org/race-upsert",
+                                        default_branch="main",
+                                        installation_id=1,
+                                    )
+                                )
+                                await other_session.commit()
+                            return await ctx.__aenter__()
+
+                        async def __aexit__(self, *args: object) -> Any:
+                            return await ctx.__aexit__(*args)
+
+                    return _RacingSavepoint()
+                return ctx
+
+            monkeypatch.setattr(race_session, "begin_nested", _raced_begin_nested)
+            resolved = await _upsert_repository(
+                race_session,
+                github_repo_id=8888,
+                full_name="org/race-upsert",
+                default_branch="trunk",
+                installation_id=99,
+            )
+            await race_session.commit()
+            assert resolved.github_repo_id == 8888
+            assert resolved.default_branch == "trunk"
+            assert resolved.installation_id == 99
     finally:
         await engine.dispose()
