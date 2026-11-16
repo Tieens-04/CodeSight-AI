@@ -6,6 +6,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 
+import redis.asyncio as redis_async
 import structlog
 from fastapi import FastAPI, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -99,18 +100,33 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
+        engine = None
+        redis_client: redis_async.Redis | None = None
         if session_factory is None:
             engine = create_db_engine(active_settings)
             app_instance.state.db_engine = engine
             app_instance.state.session_factory = create_session_factory(engine)
-            try:
-                yield
-            finally:
-                await engine.dispose()
         else:
             app_instance.state.db_engine = None
             app_instance.state.session_factory = session_factory
+
+        if webhook_dispatcher is None:
+            redis_client = redis_async.from_url(
+                active_settings.redis_url,
+                decode_responses=True,
+                socket_timeout=active_settings.health_timeout_seconds,
+            )
+            app_instance.state.webhook_dispatcher = CeleryWebhookDispatcher(
+                redis_client=redis_client
+            )
+
+        try:
             yield
+        finally:
+            if redis_client is not None:
+                await redis_client.aclose()
+            if engine is not None:
+                await engine.dispose()
 
     application = FastAPI(
         title="CodeSight-AI Gateway",

@@ -17,12 +17,12 @@ from codesight.core.config import Settings
 
 
 def create_db_engine(settings: Settings) -> AsyncEngine:
-    """Build pooled asyncpg SQLAlchemy engine tuned for <100ms webhook latency."""
+    """Build pooled asyncpg SQLAlchemy engine with pre-ping resilience."""
     return create_async_engine(
         settings.sqlalchemy_async_dsn,
         pool_size=5,
         max_overflow=10,
-        pool_pre_ping=False,
+        pool_pre_ping=True,
         pool_recycle=1800,
         echo=False,
     )

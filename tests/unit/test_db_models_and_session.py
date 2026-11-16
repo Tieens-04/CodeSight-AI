@@ -78,7 +78,7 @@ async def test_engine_pool_kwargs_and_get_db_session_lifecycle() -> None:
             settings.sqlalchemy_async_dsn,
             pool_size=5,
             max_overflow=10,
-            pool_pre_ping=False,
+            pool_pre_ping=True,
             pool_recycle=1800,
             echo=False,
         )

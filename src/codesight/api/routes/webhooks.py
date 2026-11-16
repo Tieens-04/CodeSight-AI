@@ -9,11 +9,13 @@ import json
 from dataclasses import dataclass
 from typing import Any, Final, Literal, Protocol, TypeGuard, cast
 
+import redis.asyncio as redis_async
+import redis.exceptions
 import structlog
 from celery import Celery
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -25,6 +27,8 @@ from codesight.worker.celery_app import celery_app
 
 MAX_WEBHOOK_BODY_BYTES: Final[int] = 25 * 1024 * 1024  # 25 MiB ceiling for 512m container
 ACTIONABLE_PR_ACTIONS: Final[frozenset[str]] = frozenset({"opened", "synchronize", "reopened"})
+PR_SYNCHRONIZE_DEBOUNCE_SECONDS: Final[int] = 5
+PR_SUPERSEDE_TTL_SECONDS: Final[int] = 86400
 _ZERO_SHA: Final[str] = "0" * 40
 _MAX_INT32: Final[int] = (1 << 31) - 1
 _MAX_INT64: Final[int] = (1 << 63) - 1
@@ -86,17 +90,62 @@ class WebhookDispatcher(Protocol):
 class CeleryWebhookDispatcher:
     """Dispatches webhook jobs to Celery via asyncio.to_thread to keep ASGI non-blocking."""
 
-    def __init__(self, app: Celery | None = None) -> None:
+    def __init__(
+        self,
+        app: Celery | None = None,
+        *,
+        redis_client: redis_async.Redis | None = None,
+    ) -> None:
         self._app = app
+        self._redis_client = redis_client
 
     async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
         target = self._app if self._app is not None else celery_app
+        countdown = PR_SYNCHRONIZE_DEBOUNCE_SECONDS if payload.action == "synchronize" else 0
+        sha_key = f"pr_active:{payload.repo_id}:{payload.pr_number}"
+        task_key = f"pr_active_task:{payload.repo_id}:{payload.pr_number}"
+        prev_task_id: str | None = None
+
+        if self._redis_client is not None:
+            try:
+                prev_raw = await self._redis_client.get(task_key)
+                if isinstance(prev_raw, (bytes, bytearray)):
+                    prev_task_id = prev_raw.decode("utf-8")
+                elif prev_raw:
+                    prev_task_id = str(prev_raw)
+                await self._redis_client.set(sha_key, payload.head_sha, ex=PR_SUPERSEDE_TTL_SECONDS)
+            except (redis.exceptions.RedisError, OSError) as exc:
+                logger.warning("webhook_supersede_cache_unavailable", error_type=type(exc).__name__)
+
         result = await asyncio.to_thread(
             target.send_task,
             "codesight.webhook.handle_pr_event",
             args=(payload.model_dump(mode="json"),),
+            countdown=countdown,
         )
-        return str(result.id)
+        task_id = str(result.id)
+
+        if self._redis_client is not None:
+            try:
+                await self._redis_client.set(task_key, task_id, ex=PR_SUPERSEDE_TTL_SECONDS)
+            except (redis.exceptions.RedisError, OSError) as exc:
+                logger.warning("webhook_supersede_cache_unavailable", error_type=type(exc).__name__)
+
+            if prev_task_id and prev_task_id != task_id:
+                try:
+                    await asyncio.to_thread(
+                        target.control.revoke,
+                        prev_task_id,
+                        terminate=False,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "webhook_supersede_revoke_failed",
+                        superseded_task_id=prev_task_id,
+                        error_type=type(exc).__name__,
+                    )
+
+        return task_id
 
     async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str:
         target = self._app if self._app is not None else celery_app
@@ -335,6 +384,79 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
     return _ClassifiedWebhook(target_status="ignored", ack_status="ignored", action=action)
 
 
+def _stale_repo_name(full_name: str, suffix: str) -> str:
+    tag = f"__stale_{suffix}"
+    return f"{full_name[: max(0, 255 - len(tag))]}{tag}"
+
+
+async def _apply_repo_upsert(
+    session: AsyncSession,
+    *,
+    github_repo_id: int | None,
+    full_name: str,
+    default_branch: str,
+    installation_id: int | None,
+) -> Repository | None:
+    if github_repo_id is None:
+        existing = (
+            await session.execute(select(Repository).where(Repository.full_name == full_name))
+        ).scalar_one_or_none()
+        if existing is None:
+            return None
+        existing.default_branch = default_branch
+        if installation_id is not None:
+            existing.installation_id = installation_id
+        await session.flush()
+        return existing
+
+    rows = list(
+        (
+            await session.execute(
+                select(Repository).where(
+                    or_(
+                        Repository.github_repo_id == github_repo_id,
+                        Repository.full_name == full_name,
+                    )
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_id = next((r for r in rows if r.github_repo_id == github_repo_id), None)
+    by_name = next((r for r in rows if r.full_name == full_name), None)
+
+    if by_id is not None:
+        if by_name is not None and by_name.id != by_id.id:
+            suffix = (
+                str(by_name.github_repo_id)
+                if by_name.github_repo_id is not None
+                else str(by_name.id)[:8]
+            )
+            by_name.full_name = _stale_repo_name(by_name.full_name, suffix)
+            await session.flush()
+        by_id.full_name = full_name
+        by_id.default_branch = default_branch
+        if installation_id is not None:
+            by_id.installation_id = installation_id
+        await session.flush()
+        return by_id
+
+    if by_name is not None:
+        if by_name.github_repo_id is None:
+            by_name.github_repo_id = github_repo_id
+            by_name.default_branch = default_branch
+            if installation_id is not None:
+                by_name.installation_id = installation_id
+            await session.flush()
+            return by_name
+        by_name.full_name = _stale_repo_name(by_name.full_name, str(by_name.github_repo_id))
+        await session.flush()
+        return None
+
+    return None
+
+
 async def _upsert_repository(
     session: AsyncSession,
     *,
@@ -343,21 +465,15 @@ async def _upsert_repository(
     default_branch: str,
     installation_id: int | None,
 ) -> Repository:
-    match_expr = (
-        or_(Repository.github_repo_id == github_repo_id, Repository.full_name == full_name)
-        if github_repo_id is not None
-        else (Repository.full_name == full_name)
+    updated = await _apply_repo_upsert(
+        session,
+        github_repo_id=github_repo_id,
+        full_name=full_name,
+        default_branch=default_branch,
+        installation_id=installation_id,
     )
-    existing = (await session.execute(select(Repository).where(match_expr))).scalar_one_or_none()
-    if existing is not None:
-        if github_repo_id is not None:
-            existing.github_repo_id = github_repo_id
-        existing.full_name = full_name
-        existing.default_branch = default_branch
-        if installation_id is not None:
-            existing.installation_id = installation_id
-        await session.flush()
-        return existing
+    if updated is not None:
+        return updated
 
     repo = Repository(
         github_repo_id=github_repo_id,
@@ -371,16 +487,14 @@ async def _upsert_repository(
             await session.flush()
             return repo
     except IntegrityError:
-        concurrent = (
-            await session.execute(select(Repository).where(match_expr))
-        ).scalar_one()
-        if github_repo_id is not None:
-            concurrent.github_repo_id = github_repo_id
-        concurrent.full_name = full_name
-        concurrent.default_branch = default_branch
-        if installation_id is not None:
-            concurrent.installation_id = installation_id
-        await session.flush()
+        concurrent = await _apply_repo_upsert(
+            session,
+            github_repo_id=github_repo_id,
+            full_name=full_name,
+            default_branch=default_branch,
+            installation_id=installation_id,
+        )
+        assert concurrent is not None
         return concurrent
 
 
@@ -461,34 +575,34 @@ async def receive_github_webhook(
     classified = _classify_webhook(event_type, parsed_body)
     session_factory = _get_session_factory(request)
 
-    async with session_factory() as session:
-        insert_stmt = (
-            pg_insert(WebhookEvent)
-            .values(
-                delivery_id=delivery_id,
-                event_type=event_type,
-                action=classified.action,
-                status=classified.target_status,
+    if classified.target_status == "ignored":
+        async with session_factory() as session:
+            insert_stmt = (
+                pg_insert(WebhookEvent)
+                .values(
+                    delivery_id=delivery_id,
+                    event_type=event_type,
+                    action=classified.action,
+                    status="ignored",
+                )
+                .on_conflict_do_nothing(index_elements=[WebhookEvent.delivery_id])
+                .returning(WebhookEvent.delivery_id)
             )
-            .on_conflict_do_nothing(index_elements=[WebhookEvent.delivery_id])
-            .returning(WebhookEvent.delivery_id)
-        )
-        inserted_delivery_id = (await session.execute(insert_stmt)).scalar_one_or_none()
-        if inserted_delivery_id is None:
-            await session.rollback()
-            response.status_code = status.HTTP_200_OK
-            logger.info(
-                "webhook_duplicate_ignored",
-                delivery_id=delivery_id,
-                github_event=event_type,
-            )
-            return WebhookAckResponse(
-                status="duplicate",
-                delivery_id=delivery_id,
-                event=event_type,
-            )
+            inserted_delivery_id = (await session.execute(insert_stmt)).scalar_one_or_none()
+            if inserted_delivery_id is None:
+                await session.rollback()
+                response.status_code = status.HTTP_200_OK
+                logger.info(
+                    "webhook_duplicate_ignored",
+                    delivery_id=delivery_id,
+                    github_event=event_type,
+                )
+                return WebhookAckResponse(
+                    status="duplicate",
+                    delivery_id=delivery_id,
+                    event=event_type,
+                )
 
-        if classified.target_status == "ignored":
             await session.commit()
             response.status_code = status.HTTP_200_OK
             logger.info(
@@ -503,6 +617,42 @@ async def receive_github_webhook(
                 event=event_type,
             )
 
+    # Phase 1: Claim delivery ('received' or reclaim 'failed') + commit Repo before dispatch
+    async with session_factory() as session:
+        claim_stmt = (
+            pg_insert(WebhookEvent)
+            .values(
+                delivery_id=delivery_id,
+                event_type=event_type,
+                action=classified.action,
+                status="received",
+            )
+            .on_conflict_do_update(
+                index_elements=[WebhookEvent.delivery_id],
+                set_={
+                    "status": "received",
+                    "event_type": event_type,
+                    "action": classified.action,
+                },
+                where=(WebhookEvent.status == "failed"),
+            )
+            .returning(WebhookEvent.delivery_id)
+        )
+        claimed_id = (await session.execute(claim_stmt)).scalar_one_or_none()
+        if claimed_id is None:
+            await session.rollback()
+            response.status_code = status.HTTP_200_OK
+            logger.info(
+                "webhook_duplicate_ignored",
+                delivery_id=delivery_id,
+                github_event=event_type,
+            )
+            return WebhookAckResponse(
+                status="duplicate",
+                delivery_id=delivery_id,
+                event=event_type,
+            )
+
         assert classified.repo_full_name is not None
         repo = await _upsert_repository(
             session,
@@ -511,66 +661,101 @@ async def receive_github_webhook(
             default_branch=classified.default_branch,
             installation_id=classified.installation_id,
         )
-
-        dispatcher = _get_dispatcher(request)
-        try:
-            if event_type == "pull_request":
-                assert classified.pr_number is not None and classified.head_sha is not None
-                assert classified.action is not None
-                task_id = await dispatcher.dispatch_pull_request(
-                    PRWebhookDispatchPayload(
-                        delivery_id=delivery_id,
-                        repo_id=str(repo.id),
-                        github_repo_id=repo.github_repo_id,
-                        repo_full_name=repo.full_name,
-                        default_branch=repo.default_branch,
-                        installation_id=repo.installation_id,
-                        pr_number=classified.pr_number,
-                        head_sha=classified.head_sha,
-                        base_sha=classified.base_sha,
-                        action=classified.action,
-                    )
-                )
-            else:
-                assert classified.ref is not None and classified.after_sha is not None
-                task_id = await dispatcher.dispatch_push(
-                    PushWebhookDispatchPayload(
-                        delivery_id=delivery_id,
-                        repo_id=str(repo.id),
-                        github_repo_id=repo.github_repo_id,
-                        repo_full_name=repo.full_name,
-                        default_branch=repo.default_branch,
-                        installation_id=repo.installation_id,
-                        ref=classified.ref,
-                        before_sha=classified.before_sha,
-                        after_sha=classified.after_sha,
-                    )
-                )
-        except Exception as exc:
-            await session.rollback()
-            logger.error(
-                "webhook_dispatch_failed",
-                delivery_id=delivery_id,
-                github_event=event_type,
-                error_type=type(exc).__name__,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Background task broker unavailable; please retry delivery.",
-            ) from exc
-
+        repo_id_str = str(repo.id)
+        repo_gh_id = repo.github_repo_id
+        repo_full_name = repo.full_name
+        repo_default_branch = repo.default_branch
+        repo_inst_id = repo.installation_id
         await session.commit()
-        response.status_code = status.HTTP_202_ACCEPTED
-        logger.info(
-            "webhook_event_queued",
+
+    # Phase 2: Dispatch to Celery outside the DB transaction so workers see committed state
+    dispatcher = _get_dispatcher(request)
+    try:
+        if event_type == "pull_request":
+            assert classified.pr_number is not None and classified.head_sha is not None
+            assert classified.action is not None
+            task_id = await dispatcher.dispatch_pull_request(
+                PRWebhookDispatchPayload(
+                    delivery_id=delivery_id,
+                    repo_id=repo_id_str,
+                    github_repo_id=repo_gh_id,
+                    repo_full_name=repo_full_name,
+                    default_branch=repo_default_branch,
+                    installation_id=repo_inst_id,
+                    pr_number=classified.pr_number,
+                    head_sha=classified.head_sha,
+                    base_sha=classified.base_sha,
+                    action=classified.action,
+                )
+            )
+        else:
+            assert classified.ref is not None and classified.after_sha is not None
+            task_id = await dispatcher.dispatch_push(
+                PushWebhookDispatchPayload(
+                    delivery_id=delivery_id,
+                    repo_id=repo_id_str,
+                    github_repo_id=repo_gh_id,
+                    repo_full_name=repo_full_name,
+                    default_branch=repo_default_branch,
+                    installation_id=repo_inst_id,
+                    ref=classified.ref,
+                    before_sha=classified.before_sha,
+                    after_sha=classified.after_sha,
+                )
+            )
+    except Exception as exc:
+        try:
+            async with session_factory() as fail_session:
+                await fail_session.execute(
+                    update(WebhookEvent)
+                    .where(WebhookEvent.delivery_id == delivery_id)
+                    .values(status="failed")
+                )
+                await fail_session.commit()
+        except Exception as cleanup_exc:
+            logger.warning(
+                "webhook_mark_failed_error",
+                delivery_id=delivery_id,
+                error_type=type(cleanup_exc).__name__,
+            )
+        logger.error(
+            "webhook_dispatch_failed",
             delivery_id=delivery_id,
             github_event=event_type,
-            action=classified.action,
-            task_id=task_id,
+            error_type=type(exc).__name__,
         )
-        return WebhookAckResponse(
-            status="queued",
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Background task broker unavailable; please retry delivery.",
+        ) from exc
+
+    # Phase 3: Mark event 'queued' after dispatch succeeds (best-effort; 'received' blocks dups)
+    try:
+        async with session_factory() as complete_session:
+            await complete_session.execute(
+                update(WebhookEvent)
+                .where(WebhookEvent.delivery_id == delivery_id)
+                .values(status="queued")
+            )
+            await complete_session.commit()
+    except Exception as exc:
+        logger.warning(
+            "webhook_mark_queued_failed",
             delivery_id=delivery_id,
-            event=event_type,
-            task_id=task_id,
+            error_type=type(exc).__name__,
         )
+
+    response.status_code = status.HTTP_202_ACCEPTED
+    logger.info(
+        "webhook_event_queued",
+        delivery_id=delivery_id,
+        github_event=event_type,
+        action=classified.action,
+        task_id=task_id,
+    )
+    return WebhookAckResponse(
+        status="queued",
+        delivery_id=delivery_id,
+        event=event_type,
+        task_id=task_id,
+    )

@@ -19,6 +19,7 @@ from codesight.core.config import Settings
 from codesight.core.logging import configure_logging
 from codesight.vcs.github_auth import (
     INSTALLATION_TOKEN_TTL_SECONDS,
+    REPO_INSTALLATION_TTL_SECONDS,
     GitHubAuthConfigError,
     GitHubAuthError,
     GitHubAuthProvider,
@@ -59,6 +60,11 @@ class _FakeAsyncRedis:
         self.store[key] = value
         self.set_calls.append((key, value, ex))
         return True
+
+    async def delete(self, key: str) -> int:
+        if self.fail:
+            raise redis.exceptions.ConnectionError("redis offline")
+        return 1 if self.store.pop(key, None) is not None else 0
 
     async def aclose(self) -> None:
         self.closed = True
@@ -367,3 +373,64 @@ async def test_redis_bytes_cache_and_http_error_and_bool_id_guards() -> None:
         )
         with pytest.raises(GitHubAuthError):
             await provider_net.get_token(installation_id=42)
+
+
+@pytest.mark.asyncio
+async def test_repo_installation_id_cached_and_invalidated_on_404() -> None:
+    pem_private, _ = _generate_rsa_keypair()
+    settings = Settings(
+        _env_file=None,
+        github_app_id="12345",
+        github_private_key=SecretStr(pem_private),
+    )
+    fake_redis = _FakeAsyncRedis()
+    calls: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/repos/org/cached/installation":
+            return httpx.Response(200, json={"id": 888})
+        if request.url.path == "/app/installations/888/access_tokens":
+            return httpx.Response(201, json={"token": "ghs_cached_repo_888"})
+        if request.url.path == "/app/installations/111/access_tokens":
+            return httpx.Response(404, json={"message": "Not Found"})
+        if request.url.path == "/repos/org/reinstalled/installation":
+            return httpx.Response(200, json={"id": 222})
+        if request.url.path == "/app/installations/222/access_tokens":
+            return httpx.Response(201, json={"token": "ghs_fresh_222"})
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
+        provider = GitHubAuthProvider(
+            settings,
+            redis_client=fake_redis,  # type: ignore[arg-type]
+            http_client=client,
+        )
+        # First call resolves installation_id=888 and caches both repo->888 & token
+        tok1 = await provider.get_token(repo_full_name="org/cached")
+        assert tok1.get_secret_value() == "ghs_cached_repo_888"
+        assert fake_redis.store["gh_repo_inst:org/cached"] == "888"
+        assert (
+            "gh_repo_inst:org/cached",
+            "888",
+            REPO_INSTALLATION_TTL_SECONDS,
+        ) in fake_redis.set_calls
+
+        # Drop token cache only: second call uses cached ID without GET /installation
+        fake_redis.store.pop("gh_inst_token:888", None)
+        calls.clear()
+        tok2 = await provider.get_token(repo_full_name="org/cached")
+        assert tok2.get_secret_value() == "ghs_cached_repo_888"
+        assert calls == ["POST /app/installations/888/access_tokens"]
+
+        # Stale cached repo installation (111 -> 404) is invalidated and refreshed to 222
+        fake_redis.store["gh_repo_inst:org/reinstalled"] = "111"
+        calls.clear()
+        tok3 = await provider.get_token(repo_full_name="org/reinstalled")
+        assert tok3.get_secret_value() == "ghs_fresh_222"
+        assert fake_redis.store["gh_repo_inst:org/reinstalled"] == "222"
+        assert calls == [
+            "POST /app/installations/111/access_tokens",
+            "GET /repos/org/reinstalled/installation",
+            "POST /app/installations/222/access_tokens",
+        ]

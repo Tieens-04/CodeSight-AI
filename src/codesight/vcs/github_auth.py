@@ -21,6 +21,7 @@ from pydantic import SecretStr
 from codesight.core.config import Settings
 
 INSTALLATION_TOKEN_TTL_SECONDS: Final[int] = 3000  # 50 minutes (GitHub tokens expire at 60m)
+REPO_INSTALLATION_TTL_SECONDS: Final[int] = 3600  # 1 hour cache for repo -> installation_id
 GITHUB_API_VERSION: Final[str] = "2022-11-28"
 GITHUB_ACCEPT_HEADER: Final[str] = "application/vnd.github+json"
 _REPO_SEGMENT_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -111,6 +112,7 @@ class GitHubAuthProvider:
         self._redis_client = redis_client
         self._http_client = http_client
         self._base_url = base_url.rstrip("/")
+        self._normalized_pem: str | None = None
 
     def _has_app_credentials(self) -> bool:
         app_id = self._settings.github_app_id
@@ -136,18 +138,18 @@ class GitHubAuthProvider:
         async with httpx.AsyncClient(timeout=10.0) as client:
             yield client
 
-    async def _read_cached_token(self, installation_id: int) -> str | None:
-        cache_key = f"gh_inst_token:{installation_id}"
-        owns_client = self._redis_client is None
-        client = (
-            self._redis_client
-            if self._redis_client is not None
-            else redis_async.from_url(
-                self._settings.redis_url,
-                decode_responses=True,
-                socket_timeout=self._settings.health_timeout_seconds,
-            )
+    def _get_redis_client(self) -> tuple[redis_async.Redis, bool]:
+        if self._redis_client is not None:
+            return self._redis_client, False
+        client = redis_async.from_url(
+            self._settings.redis_url,
+            decode_responses=True,
+            socket_timeout=self._settings.health_timeout_seconds,
         )
+        return client, True
+
+    async def _read_cache(self, cache_key: str) -> str | None:
+        client, owns_client = self._get_redis_client()
         try:
             raw = await client.get(cache_key)
             if isinstance(raw, (bytes, bytearray)):
@@ -163,20 +165,10 @@ class GitHubAuthProvider:
                 except (redis.exceptions.RedisError, OSError):
                     pass
 
-    async def _write_cached_token(self, installation_id: int, token: str) -> None:
-        cache_key = f"gh_inst_token:{installation_id}"
-        owns_client = self._redis_client is None
-        client = (
-            self._redis_client
-            if self._redis_client is not None
-            else redis_async.from_url(
-                self._settings.redis_url,
-                decode_responses=True,
-                socket_timeout=self._settings.health_timeout_seconds,
-            )
-        )
+    async def _write_cache(self, cache_key: str, value: str, *, ttl_seconds: int) -> None:
+        client, owns_client = self._get_redis_client()
         try:
-            await client.set(cache_key, token, ex=INSTALLATION_TOKEN_TTL_SECONDS)
+            await client.set(cache_key, value, ex=ttl_seconds)
         except (redis.exceptions.RedisError, OSError) as exc:
             logger.warning("github_token_cache_unavailable", error_type=type(exc).__name__)
         finally:
@@ -186,11 +178,37 @@ class GitHubAuthProvider:
                 except (redis.exceptions.RedisError, OSError):
                     pass
 
+    async def _delete_cache(self, cache_key: str) -> None:
+        client, owns_client = self._get_redis_client()
+        try:
+            await client.delete(cache_key)
+        except (redis.exceptions.RedisError, OSError) as exc:
+            logger.warning("github_token_cache_unavailable", error_type=type(exc).__name__)
+        finally:
+            if owns_client:
+                try:
+                    await client.aclose()
+                except (redis.exceptions.RedisError, OSError):
+                    pass
+
+    async def _read_cached_token(self, installation_id: int) -> str | None:
+        return await self._read_cache(f"gh_inst_token:{installation_id}")
+
+    async def _write_cached_token(self, installation_id: int, token: str) -> None:
+        await self._write_cache(
+            f"gh_inst_token:{installation_id}",
+            token,
+            ttl_seconds=INSTALLATION_TOKEN_TTL_SECONDS,
+        )
+
     def _mint_jwt(self) -> str:
         assert self._settings.github_app_id is not None
         assert self._settings.github_private_key is not None
-        pem = normalize_private_key(self._settings.github_private_key.get_secret_value())
-        return create_app_jwt(self._settings.github_app_id, pem)
+        if self._normalized_pem is None:
+            self._normalized_pem = normalize_private_key(
+                self._settings.github_private_key.get_secret_value()
+            )
+        return create_app_jwt(self._settings.github_app_id, self._normalized_pem)
 
     @staticmethod
     def _app_headers(app_jwt: str) -> dict[str, str]:
@@ -252,14 +270,19 @@ class GitHubAuthProvider:
             raise GitHubAuthError("GitHub installation lookup response missing integer 'id'.")
         return inst_id
 
-    async def _get_or_exchange_for_installation(self, installation_id: int) -> SecretStr:
+    async def _get_or_exchange_for_installation(
+        self,
+        installation_id: int,
+        *,
+        app_jwt: str | None = None,
+    ) -> SecretStr:
         cached = await self._read_cached_token(installation_id)
         if cached is not None:
             return SecretStr(cached)
 
-        app_jwt = self._mint_jwt()
+        active_jwt = app_jwt if app_jwt is not None else self._mint_jwt()
         async with self._borrow_http_client() as client:
-            token = await self._exchange_installation_token(client, app_jwt, installation_id)
+            token = await self._exchange_installation_token(client, active_jwt, installation_id)
 
         await self._write_cached_token(installation_id, token)
         return SecretStr(token)
@@ -280,13 +303,31 @@ class GitHubAuthProvider:
                 return await self._get_or_exchange_for_installation(installation_id)
 
             if validated_repo is not None:
+                repo_cache_key = f"gh_repo_inst:{validated_repo}"
+                cached_inst = await self._read_cache(repo_cache_key)
+                if cached_inst and cached_inst.isdigit() and int(cached_inst) >= 1:
+                    try:
+                        return await self._get_or_exchange_for_installation(int(cached_inst))
+                    except GitHubAuthError as exc:
+                        if "HTTP 404" not in str(exc):
+                            raise
+                        await self._delete_cache(repo_cache_key)
+
                 app_jwt = self._mint_jwt()
                 async with self._borrow_http_client() as client:
                     found_id = await self._lookup_repo_installation_id(
                         client, app_jwt, validated_repo
                     )
                 if found_id is not None:
-                    return await self._get_or_exchange_for_installation(found_id)
+                    await self._write_cache(
+                        repo_cache_key,
+                        str(found_id),
+                        ttl_seconds=REPO_INSTALLATION_TTL_SECONDS,
+                    )
+                    return await self._get_or_exchange_for_installation(
+                        found_id,
+                        app_jwt=app_jwt,
+                    )
                 logger.info(
                     "github_app_not_installed_falling_back",
                     repo_full_name=validated_repo,

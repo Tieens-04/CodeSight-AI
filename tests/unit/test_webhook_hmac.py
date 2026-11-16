@@ -29,7 +29,11 @@ from codesight.core.config import Settings
 from codesight.core.logging import bind_trace_id, clear_trace_context
 from codesight.db.models import Base, Repository, WebhookEvent
 from codesight.db.session import create_session_factory
-from codesight.worker.celery_app import handle_pr_event, handle_push_event
+from codesight.worker.celery_app import (
+    handle_pr_event,
+    handle_push_event,
+    is_pr_event_superseded,
+)
 
 TEST_WEBHOOK_SECRET = "super-secret-webhook-key-ca6"
 
@@ -374,12 +378,21 @@ async def test_webhook_idempotency_filtering_cli_upsert_and_broker_rollback(
 @pytest.mark.asyncio
 async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
     isolated_postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_trace_context()
     bind_trace_id("webhook-trace-999")
     sent: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+    revoked: list[tuple[str, bool]] = []
+
+    class _FakeControl:
+        def revoke(self, task_id: str, *, terminate: bool = False) -> None:
+            revoked.append((task_id, terminate))
 
     class _FakeCelery:
+        def __init__(self) -> None:
+            self.control = _FakeControl()
+
         def send_task(
             self,
             name: str,
@@ -387,11 +400,29 @@ async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
             args: tuple[Any, ...] = (),
             kwargs: dict[str, Any] | None = None,
             headers: dict[str, Any] | None = None,
+            countdown: int = 0,
         ) -> SimpleNamespace:
-            sent.append((name, args, {"kwargs": kwargs, "headers": headers}))
+            sent.append(
+                (name, args, {"kwargs": kwargs, "headers": headers, "countdown": countdown})
+            )
             return SimpleNamespace(id=f"celery-id-{len(sent)}")
 
-    dispatcher = CeleryWebhookDispatcher(app=_FakeCelery())  # type: ignore[arg-type]
+    class _FakeRedisAsync:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str) -> str | None:
+            return self.store.get(key)
+
+        async def set(self, key: str, value: str, *, ex: int | None = None) -> bool:
+            self.store[key] = value
+            return True
+
+    fake_async_redis = _FakeRedisAsync()
+    dispatcher = CeleryWebhookDispatcher(
+        app=_FakeCelery(),  # type: ignore[arg-type]
+        redis_client=fake_async_redis,  # type: ignore[arg-type]
+    )
     pr_task_id = await dispatcher.dispatch_pull_request(
         PRWebhookDispatchPayload(
             delivery_id="webhook-trace-999",
@@ -401,8 +432,34 @@ async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
             default_branch="main",
             installation_id=2,
             pr_number=5,
-            head_sha="abc",
+            head_sha="sha-1",
             action="opened",
+        )
+    )
+    pr_sync_1 = await dispatcher.dispatch_pull_request(
+        PRWebhookDispatchPayload(
+            delivery_id="webhook-trace-1000",
+            repo_id="repo-uuid-1",
+            github_repo_id=1,
+            repo_full_name="org/repo",
+            default_branch="main",
+            installation_id=2,
+            pr_number=5,
+            head_sha="sha-2",
+            action="synchronize",
+        )
+    )
+    pr_sync_2 = await dispatcher.dispatch_pull_request(
+        PRWebhookDispatchPayload(
+            delivery_id="webhook-trace-1001",
+            repo_id="repo-uuid-1",
+            github_repo_id=1,
+            repo_full_name="org/repo",
+            default_branch="main",
+            installation_id=2,
+            pr_number=5,
+            head_sha="sha-3",
+            action="synchronize",
         )
     )
     push_task_id = await dispatcher.dispatch_push(
@@ -418,9 +475,57 @@ async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
         )
     )
     assert pr_task_id == "celery-id-1"
-    assert push_task_id == "celery-id-2"
+    assert pr_sync_1 == "celery-id-2"
+    assert pr_sync_2 == "celery-id-3"
+    assert push_task_id == "celery-id-4"
     assert sent[0][0] == "codesight.webhook.handle_pr_event"
-    assert sent[1][0] == "codesight.webhook.handle_push_event"
+    assert sent[0][2]["countdown"] == 0
+    assert sent[1][2]["countdown"] == 5
+    assert sent[2][2]["countdown"] == 5
+    assert sent[3][0] == "codesight.webhook.handle_push_event"
+    assert fake_async_redis.store["pr_active:repo-uuid-1:5"] == "sha-3"
+    assert fake_async_redis.store["pr_active_task:repo-uuid-1:5"] == "celery-id-3"
+    assert revoked == [("celery-id-1", False), ("celery-id-2", False)]
+
+    class _FakeSyncRedis:
+        def __init__(self, data: dict[str, str]) -> None:
+            self._data = data
+            self.closed = False
+
+        def get(self, key: str) -> str | None:
+            return self._data.get(key)
+
+        def close(self) -> None:
+            self.closed = True
+
+    sync_redis = _FakeSyncRedis(fake_async_redis.store)
+    assert (
+        is_pr_event_superseded(
+            {"repo_id": "repo-uuid-1", "pr_number": 5, "head_sha": "sha-2"},
+            redis_client=sync_redis,  # type: ignore[arg-type]
+        )
+        is True
+    )
+    assert (
+        is_pr_event_superseded(
+            {"repo_id": "repo-uuid-1", "pr_number": 5, "head_sha": "sha-3"},
+            redis_client=sync_redis,  # type: ignore[arg-type]
+        )
+        is False
+    )
+    monkeypatch.setattr(
+        "codesight.worker.celery_app.redis_sync.Redis.from_url",
+        lambda *_, **__: sync_redis,
+    )
+    assert handle_pr_event(
+        {
+            "repo_id": "repo-uuid-1",
+            "repo_full_name": "org/repo",
+            "pr_number": 5,
+            "head_sha": "sha-2",
+        }
+    ) == {"status": "superseded", "trace_id": "webhook-trace-999"}
+    assert sync_redis.closed is True
 
     assert handle_pr_event({"repo_full_name": "org/repo", "pr_number": 5}) == {
         "status": "accepted",
@@ -432,7 +537,7 @@ async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
     }
     clear_trace_context()
 
-    # Verify FastAPI lifespan initializes and disposes AsyncEngine when session_factory=None
+    # Verify FastAPI lifespan initializes and disposes AsyncEngine + Redis dispatcher when omitted
     app = create_app(
         settings=Settings(_env_file=None),
         webhook_dispatcher=_SpyDispatcher(),
@@ -440,6 +545,23 @@ async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
     async with app.router.lifespan_context(app):
         assert app.state.db_engine is not None
         assert app.state.session_factory is not None
+
+    class _FakeLifespanRedis:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    lifespan_redis = _FakeLifespanRedis()
+    monkeypatch.setattr("codesight.api.main.redis_async.from_url", lambda *_, **__: lifespan_redis)
+    app_default_disp = create_app(
+        settings=Settings(_env_file=None),
+        session_factory=MagicMock(),
+    )
+    async with app_default_disp.router.lifespan_context(app_default_disp):
+        assert isinstance(app_default_disp.state.webhook_dispatcher, CeleryWebhookDispatcher)
+    assert lifespan_redis.closed is True
 
     # Also verify route returns 503 when session_factory is uninitialized
     uninit_app = create_app(
@@ -590,7 +712,12 @@ async def test_webhook_rejects_bool_ints_invalid_slugs_oversize_strings_and_hand
 async def test_webhook_gateway_warm_mean_latency_under_100ms(
     isolated_postgres_dsn: str,
 ) -> None:
-    engine = create_async_engine(isolated_postgres_dsn, pool_size=5, max_overflow=10)
+    engine = create_async_engine(
+        isolated_postgres_dsn,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+    )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -648,5 +775,109 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
 
         mean_ms = sum(latencies_ms) / len(latencies_ms)
         assert mean_ms < 100.0, f"Mean webhook latency {mean_ms:.2f}ms exceeded 100ms SLA"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collisions(
+    isolated_postgres_dsn: str,
+) -> None:
+    engine = create_async_engine(isolated_postgres_dsn, pool_pre_ping=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = create_session_factory(engine)
+
+    # Seed two repos: Repo A (id=100, org/alpha) and Repo B (id=200, org/beta)
+    async with session_factory() as seed:
+        seed.add_all(
+            [
+                Repository(github_repo_id=100, full_name="org/alpha", default_branch="main"),
+                Repository(github_repo_id=200, full_name="org/beta", default_branch="main"),
+            ]
+        )
+        await seed.commit()
+
+    observed_during_dispatch: list[tuple[str | None, str | None]] = []
+
+    class _VisibilityCheckingDispatcher:
+        async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
+            # Independent connection MUST already see committed Repo + WebhookEvent ('received')
+            async with session_factory() as worker_session:
+                repo_row = (
+                    await worker_session.execute(
+                        sa.select(Repository).where(Repository.full_name == payload.repo_full_name)
+                    )
+                ).scalar_one_or_none()
+                evt_row = await worker_session.get(WebhookEvent, payload.delivery_id)
+                observed_during_dispatch.append(
+                    (
+                        str(repo_row.id) if repo_row else None,
+                        evt_row.status if evt_row else None,
+                    )
+                )
+            return "task-vis-1"
+
+        async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str:
+            return "task-push-vis-1"
+
+    app = create_app(
+        settings=Settings(
+            _env_file=None,
+            github_webhook_secret=SecretStr(TEST_WEBHOOK_SECRET),
+        ),
+        session_factory=session_factory,
+        webhook_dispatcher=_VisibilityCheckingDispatcher(),
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            async def _send(delivery: str, body_obj: dict[str, Any]) -> httpx.Response:
+                raw = json.dumps(body_obj).encode("utf-8")
+                return await client.post(
+                    "/api/v1/webhooks/github",
+                    content=raw,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-GitHub-Delivery": delivery,
+                        "X-Hub-Signature-256": _sign_body(raw),
+                    },
+                )
+
+            # 1. Repo A (id=100) renamed to "org/beta" colliding with Repo B (id=200) -> 202
+            r_rename = await _send(
+                "deliv-rename-collision",
+                _pr_payload(action="opened", repo_id=100, full_name="org/beta", pr_number=10),
+            )
+            assert r_rename.status_code == 202
+
+            # 2. Brand-new Repo C (id=300) reuses "org/beta" -> 202, Repo A archived safely
+            r_reuse = await _send(
+                "deliv-slug-reuse",
+                _pr_payload(action="opened", repo_id=300, full_name="org/beta", pr_number=11),
+            )
+            assert r_reuse.status_code == 202
+
+        assert len(observed_during_dispatch) == 2
+        assert all(
+            repo_id is not None and evt_status == "received"
+            for repo_id, evt_status in observed_during_dispatch
+        )
+
+        async with session_factory() as check:
+            repos = {
+                r.github_repo_id: r.full_name
+                for r in (await check.execute(sa.select(Repository))).scalars().all()
+            }
+            assert repos[200] == "org/beta__stale_200"
+            assert repos[100] == "org/beta__stale_100"
+            assert repos[300] == "org/beta"
+            evt1 = await check.get(WebhookEvent, "deliv-rename-collision")
+            evt2 = await check.get(WebhookEvent, "deliv-slug-reuse")
+            assert evt1 is not None and evt1.status == "queued"
+            assert evt2 is not None and evt2.status == "queued"
     finally:
         await engine.dispose()

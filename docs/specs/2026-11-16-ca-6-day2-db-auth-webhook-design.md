@@ -15,10 +15,10 @@
 ### In Scope (`CA-6`)
 1. Add `sqlalchemy>=2.0.36`, `alembic>=1.14`, and `pyjwt[crypto]>=2.10` via `uv` (`pyproject.toml` + `uv.lock`).
 2. Implement `src/codesight/db/models.py` (`SQLAlchemy 2.0` `DeclarativeBase`, deterministic constraint naming convention, `Mapped[...]` strict typing) and `alembic/versions/0001_initial_schema.py` creating all 4 core tables (`repositories`, `webhook_events`, `pr_reviews`, `review_findings`) plus forward-compatible nullable metadata columns for `CA-14`, `CA-21`, and `CA-25`.
-3. Implement `src/codesight/db/session.py` managing `AsyncEngine` (`pool_size=5`, `max_overflow=10`, `pool_pre_ping=False`, `pool_recycle=1800`) and `async_sessionmaker[AsyncSession]` (`expire_on_commit=False`) wired into FastAPI's `lifespan` context manager.
-4. Configure `alembic.ini` and async `alembic/env.py` reading `Settings.sqlalchemy_async_dsn` dynamically (zero plaintext credentials in `alembic.ini`), and bundle `alembic.ini` + `alembic/` into `Dockerfile` so `codesight-api` runs `alembic upgrade head` idempotently before `uvicorn` starts while keeping the 5-container Compose topology intact.
-5. Implement `src/codesight/vcs/github_auth.py` supporting PEM normalization (multiline, escaped `\n`, or Base64), `RS256` JWT signing (`iat = now - 60s`, `exp = now + 540s`), Installation Access Token exchange cached in Redis (`gh_inst_token:{installation_id}`, TTL `3000s` = `50m`) with fail-open Redis degradation, and automatic fallback to `GITHUB_TOKEN` when GitHub App credentials are unset or target repository returns `404` (`App not installed`) during CLI runs.
-6. Implement `src/codesight/api/routes/webhooks.py` (`POST /api/v1/webhooks/github`) with `25 MiB` streaming payload cap (`413`), `HMAC-SHA256` constant-time verification (`hmac.compare_digest` -> `401`), single-roundtrip PostgreSQL `INSERT ... ON CONFLICT (delivery_id) DO NOTHING RETURNING delivery_id` idempotency, event/branch filtering (`pull_request` `opened`/`synchronize`/`reopened`, non-deleted `push` on `default_branch`, `ping`), repository metadata upsert, and transactional dispatch via injectable `WebhookDispatcher` (`asyncio.to_thread` over Celery stub tasks in `celery_app.py`).
+3. Implement `src/codesight/db/session.py` managing `AsyncEngine` (`pool_size=5`, `max_overflow=10`, `pool_pre_ping=True`, `pool_recycle=1800`) and `async_sessionmaker[AsyncSession]` (`expire_on_commit=False`) wired into FastAPI's `lifespan` context manager.
+4. Configure `alembic.ini` and async `alembic/env.py` reading `Settings.sqlalchemy_async_dsn` dynamically (zero plaintext credentials in `alembic.ini`) with a PostgreSQL transaction advisory lock (`pg_advisory_xact_lock`), bundle `alembic.ini` + `alembic/` into `Dockerfile`, and run `alembic upgrade head` inside a one-shot `codesight-migrate` Compose service before `codesight-api` and `codesight-worker` start.
+5. Implement `src/codesight/vcs/github_auth.py` supporting memoized PEM normalization (multiline, escaped `\n`, or Base64), `RS256` JWT signing (`iat = now - 60s`, `exp = now + 540s`), repo-level installation ID caching (`gh_repo_inst:{owner/repo}`, TTL `3600s` with `404` invalidation), Installation Access Token exchange cached in Redis (`gh_inst_token:{installation_id}`, TTL `3000s` = `50m`) with fail-open Redis degradation, and automatic fallback to `GITHUB_TOKEN` when GitHub App credentials are unset or target repository returns `404` (`App not installed`) during CLI runs.
+6. Implement `src/codesight/api/routes/webhooks.py` (`POST /api/v1/webhooks/github`) with `25 MiB` streaming payload cap (`413`), `HMAC-SHA256` constant-time verification (`hmac.compare_digest` -> `401`), single-roundtrip PostgreSQL atomic idempotency (`received` -> `queued` / `failed` two-phase commit-before-dispatch), event/branch filtering (`pull_request` `opened`/`synchronize`/`reopened`, non-deleted `push` on `default_branch`, `ping`), conflict-safe repository metadata upsert (renaming stale colliding slugs as `__stale_<id>`), `5s` `synchronize` debounce + `pr_active:{repo_id}:{pr_number}` Cancel-on-Supersede guard via injectable `WebhookDispatcher` (`asyncio.to_thread` over Celery stub tasks in `celery_app.py`).
 7. Deliver comprehensive unit tests (`tests/unit/test_webhook_hmac.py`, `tests/unit/test_github_auth.py`) and non-destructive PostgreSQL 16 integration tests (`tests/integration/test_db_migrations.py` using an isolated temporary database on port `5433`).
 
 ### Explicitly Out of Scope (Deferred to Subsequent Tickets)
@@ -33,8 +33,8 @@
 
 ### 2.1 Engine, Session & Lifespan Management (`src/codesight/db/session.py`)
 - **`create_db_engine(settings: Settings) -> AsyncEngine`:**
-  - Uses `create_async_engine(settings.sqlalchemy_async_dsn, pool_size=5, max_overflow=10, pool_pre_ping=False, pool_recycle=1800, echo=False)`.
-  - Omitting `pool_pre_ping` saves an extra `SELECT 1` network roundtrip on every webhook request, preserving `< 100ms` latency while `pool_recycle=1800` refreshes idle connections cleanly.
+  - Uses `create_async_engine(settings.sqlalchemy_async_dsn, pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=1800, echo=False)`.
+  - `pool_pre_ping=True` protects against stale/dropped connections after PostgreSQL restarts, while pooled connections still hold warm webhook mean latency well under `100ms`.
 - **`create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]`:**
   - Configured with `expire_on_commit=False` and `autoflush=False`.
 - **FastAPI Integration:**
@@ -124,9 +124,9 @@ All models inherit from `Base(DeclarativeBase)` with explicit PostgreSQL constra
   - **Resolution Order (`get_token(*, installation_id: int | None = None, repo_full_name: str | None = None) -> SecretStr`):**
     1. **GitHub App Path** (when both `settings.github_app_id` and `settings.github_private_key` are non-empty):
        - If `installation_id` is provided: check Redis `gh_inst_token:{installation_id}` -> on miss, mint RS256 JWT and `POST /app/installations/{installation_id}/access_tokens` -> cache for `3000s` -> return `SecretStr(token)`.
-       - Else if `repo_full_name` (`"owner/repo"`) is provided: mint RS256 JWT and `GET /repos/{owner}/{repo}/installation`.
-         - If `200 OK`: extract `id` as `installation_id`, check/populate `gh_inst_token:{installation_id}`, return `SecretStr(token)`.
-         - If `404 Not Found` (App not installed on target repo, common in CLI `codesight review`): log `"github_app_not_installed_falling_back"` and fall through to step 2.
+        - Else if `repo_full_name` (`"owner/repo"`) is provided: check Redis `gh_repo_inst:{owner/repo}` (`3600s` TTL) first; on miss (or `404` invalidation of a stale cached installation), mint RS256 JWT (using memoized PEM) and `GET /repos/{owner}/{repo}/installation`.
+         - If `200 OK`: extract `id` as `installation_id`, cache `gh_repo_inst:{owner/repo}` (`3600s`), reuse `app_jwt` if token exchange is needed, and return `SecretStr(token)`.
+         - If `404 Not Found` (App not installed on target repo, common in CLI `codesight review`): log `"github_app_not_installed_falling_back"` and fall through to step 2 without caching negative `404`.
     2. **CLI Personal Token Fallback Path:**
        - If `settings.github_token` is configured and non-empty, return `settings.github_token`.
     3. **Failure:** Raise `GitHubAuthError` with an actionable message naming `GITHUB_APP_ID`/`GITHUB_PRIVATE_KEY` or `GITHUB_TOKEN`.
@@ -145,28 +145,28 @@ Incoming POST /api/v1/webhooks/github
   ├─ 3. Verify X-Hub-Signature-256 ("sha256=<hex>") via hmac.compare_digest ──(bad/missing)──► 401 Unauthorized
   ├─ 4. Validate X-GitHub-Delivery & X-GitHub-Event headers + parse JSON object ──(invalid)──► 400 Bad Request
   ├─ 5. Classify event in-memory (`ping` | actionable `pull_request` | actionable `push` | `ignored`) -> target_status (`'queued'` or `'ignored'`)
-  ├─ 6. Atomic Postgres INSERT INTO webhook_events (..., status=target_status) ON CONFLICT (delivery_id) DO NOTHING RETURNING delivery_id
-  │     └──(conflict: None returned)──► 200 OK {"status": "duplicate", "delivery_id": ...} (0 jobs dispatched)
-  ├─ 7. Non-actionable path (`target_status == 'ignored'`):
-  │     ├── event == "ping" ──► commit, return 200 OK {"status": "pong", "delivery_id": ...}
-  │     └── other events / actions / non-default or deleted refs ──► commit, return 200 OK {"status": "ignored", "delivery_id": ...}
-  └─ 8. Actionable path (`target_status == 'queued'`, inside same DB transaction):
-        ├── Upsert `repositories` matching `github_repo_id` OR pre-existing CLI `full_name`
-        ├── Dispatch typed payload via `await dispatcher.dispatch_*(...)` (`asyncio.to_thread` -> Celery)
-        │     └──(if Broker raises)──► ROLLBACK transaction -> 503 Service Unavailable (safe for GitHub retry!)
-        └── Commit transaction ──► 202 Accepted {"status": "queued", "delivery_id": ..., "task_id": ...}
+  ├─ 6. Non-actionable path (`target_status == 'ignored'`):
+  │     └── Atomic INSERT INTO webhook_events (..., status='ignored') ON CONFLICT (delivery_id) DO NOTHING RETURNING delivery_id
+  │           ├──(conflict: None)──► 200 OK {"status": "duplicate", "delivery_id": ...}
+  │           └──(inserted)──► commit -> 200 OK {"status": "pong" | "ignored", "delivery_id": ...}
+  └─ 7. Actionable path (`target_status == 'queued'`, two-phase commit-before-dispatch):
+        ├── Phase 1 (DB Tx 1): INSERT/claim `webhook_events` (`status='received'`, reclaiming `'failed'` on conflict)
+        │     ├──(conflict on non-failed row: None)──► 200 OK {"status": "duplicate", "delivery_id": ...}
+        │     └── Conflict-safe upsert `repositories` (prioritizing `github_repo_id`, retiring colliding stale names as `__stale_<id>`) -> COMMIT
+        ├── Phase 2 (Outside DB Tx): Dispatch typed payload via `await dispatcher.dispatch_*(...)` (`0s` delay on `opened`/`reopened`; `5s` debounce + `pr_active:{repo_id}:{pr_number}` supersede tracking on `synchronize`)
+        │     └──(if Broker raises)──► Short DB Tx: UPDATE `status='failed'` -> 503 Service Unavailable (safe for GitHub retry!)
+        └── Phase 3 (DB Tx 2): Best-effort UPDATE `webhook_events` `status='queued'` -> 202 Accepted {"status": "queued", "delivery_id": ..., "task_id": ...}
 ```
 
 ### 4.2 Repository Upsert & Dispatcher Contract
 - **Repository Upsert Strategy:**
-  - Looks up an existing `Repository` row matching `Repository.github_repo_id == gh_repo_id` or `Repository.full_name == full_name` within the active transaction:
-    - Updates `github_repo_id`, `full_name`, `default_branch`, and `installation_id` if already present (handling both CLI-first rows where `github_repo_id` was `NULL` and GitHub repository renames without `UniqueViolationError`), or inserts a new `Repository` row when neither matches.
+  - Never calls `scalar_one_or_none()` on an `OR` filter (`github_repo_id == X OR full_name == Y`). Instead fetches matching rows, prioritizes matching by `github_repo_id`, backfills CLI rows where `github_repo_id IS NULL`, and archives colliding stale slugs with `__stale_<suffix>` before updating or inserting, guaranteeing zero `MultipleResultsFound` or `UniqueViolationError` on repo renames/slug reuse.
 - **`WebhookDispatcher` Protocol & Celery Stubs:**
   - Defined in `src/codesight/api/routes/webhooks.py` (with DTOs `PRWebhookDispatchPayload` and `PushWebhookDispatchPayload`):
     - `async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str` (returns `task_id`)
     - `async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str` (returns `task_id`)
-  - `CeleryWebhookDispatcher` calls `await asyncio.to_thread(send_task_fn, ...)` targeting stub tasks registered in `src/codesight/worker/celery_app.py`:
-    - `codesight.webhook.handle_pr_event(payload: dict[str, Any]) -> dict[str, Any]`
+  - `CeleryWebhookDispatcher` calls `await asyncio.to_thread(send_task_fn, ...)` (`countdown=5` on `synchronize`, `countdown=0` otherwise), records `pr_active:{repo_id}:{pr_number}` / `pr_active_task:{repo_id}:{pr_number}` in Redis, revokes superseded pending tasks (`control.revoke(..., terminate=False)`), and targets stub tasks registered in `src/codesight/worker/celery_app.py`:
+    - `codesight.webhook.handle_pr_event(payload: dict[str, Any]) -> dict[str, Any]` (includes `is_pr_event_superseded` worker-side guard)
     - `codesight.webhook.handle_push_event(payload: dict[str, Any]) -> dict[str, Any]`
   - Because `asyncio.to_thread` in Python `3.12` copies the active `contextvars.Context`, `TraceIdMiddleware`'s bound `trace_id` (`X-GitHub-Delivery`) is automatically injected into Celery message headers by `inject_trace_id_header` (`CA-5`).
 
@@ -174,10 +174,10 @@ Incoming POST /api/v1/webhooks/github
 
 ## 5. Docker Packaging & Testing Strategy
 
-- **`Dockerfile` & `codesight-api` Startup:**
+- **`Dockerfile` & `codesight-migrate` Init Service:**
   - Copy `alembic.ini` and `alembic/` into `/app/` in the `runtime` stage (`--chown=codesight:codesight`).
-  - Update default `CMD` to `["sh", "-c", "alembic upgrade head && exec uvicorn codesight.api.main:app --host 0.0.0.0 --port 8000"]`.
-  - `codesight-worker` overrides `command:` in `docker-compose.yml`, so only `codesight-api` executes migrations on container boot, preserving the exact 5-service stack and `3.0 GiB` memory budget.
+  - Keep `Dockerfile` `CMD` strictly as `["uvicorn", "codesight.api.main:app", "--host", "0.0.0.0", "--port", "8000"]`.
+  - Add one-shot `codesight-migrate` (`restart: "no"`, `command: ["alembic", "upgrade", "head"]`) in `docker-compose.yml` guarded by PostgreSQL transaction advisory lock (`pg_advisory_xact_lock`); `codesight-api` and `codesight-worker` wait on `codesight-migrate: condition: service_completed_successfully`.
 - **Unit & Integration Tests:**
   - `tests/unit/test_github_auth.py`: Offline tests (`httpx.MockTransport` + fake async Redis) covering PEM formats (`\n`, multiline, Base64, malformed), RS256 JWT claims/signature verification using the corresponding RSA public key, 50-minute Redis cache hit/miss, Redis connection error fail-open, `404` installation fallback to `GITHUB_TOKEN`, and missing-credentials error handling.
   - `tests/unit/test_webhook_hmac.py`: Tests valid/invalid/missing `X-Hub-Signature-256` (`401`), tampered raw bytes, >25 MiB payload (`413`), duplicate `X-GitHub-Delivery` (`200` with `0` duplicate dispatches), `ping` (`200`), `pull_request` (`opened`/`synchronize`/`reopened` -> `202`, `closed`/`edited` -> `200 ignored`), `push` (`refs/heads/main` -> `202`, feature branch / deleted branch -> `200 ignored`), broker failure rollback (`503` -> retry succeeds `202`), and 50-request warm benchmark asserting mean latency `< 100ms`.

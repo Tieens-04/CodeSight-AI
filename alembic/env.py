@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from logging.config import fileConfig
 
+import sqlalchemy as sa
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -53,6 +54,8 @@ def do_run_migrations(connection: Connection) -> None:
     )
 
     with context.begin_transaction():
+        if connection.dialect.name == "postgresql":
+            connection.execute(sa.text("SELECT pg_advisory_xact_lock(739201606)"))
         context.run_migrations()
 
 
