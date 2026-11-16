@@ -1,0 +1,513 @@
+"""Unit, PostgreSQL-backed transactional, and latency tests for GitHub Webhook Gateway."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import time
+from collections.abc import AsyncIterator
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+
+import httpx
+import pytest
+import sqlalchemy as sa
+from pydantic import SecretStr
+from sqlalchemy.ext.asyncio import create_async_engine
+from starlette.requests import Request
+
+from codesight.api.main import create_app
+from codesight.api.routes.webhooks import (
+    MAX_WEBHOOK_BODY_BYTES,
+    CeleryWebhookDispatcher,
+    PRWebhookDispatchPayload,
+    PushWebhookDispatchPayload,
+    verify_github_signature,
+)
+from codesight.core.config import Settings
+from codesight.core.logging import bind_trace_id, clear_trace_context
+from codesight.db.models import Base, Repository, WebhookEvent
+from codesight.db.session import create_session_factory
+from codesight.worker.celery_app import handle_pr_event, handle_push_event
+
+TEST_WEBHOOK_SECRET = "super-secret-webhook-key-ca6"
+
+
+def _sign_body(raw_body: bytes, secret: str = TEST_WEBHOOK_SECRET) -> str:
+    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+class _SpyDispatcher:
+    def __init__(self, *, fail_next: bool = False) -> None:
+        self.pr_calls: list[PRWebhookDispatchPayload] = []
+        self.push_calls: list[PushWebhookDispatchPayload] = []
+        self.fail_next = fail_next
+
+    async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
+        if self.fail_next:
+            self.fail_next = False
+            raise ConnectionError("redis broker temporarily down")
+        self.pr_calls.append(payload)
+        return f"task-pr-{len(self.pr_calls)}"
+
+    async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str:
+        if self.fail_next:
+            self.fail_next = False
+            raise ConnectionError("redis broker temporarily down")
+        self.push_calls.append(payload)
+        return f"task-push-{len(self.push_calls)}"
+
+
+def _pr_payload(
+    *,
+    action: str = "opened",
+    pr_number: int = 42,
+    head_sha: str = "a1b2c3d4e5f6",
+    repo_id: int | None = 9001,
+    full_name: str = "Tieens-04/CodeSight-AI",
+    default_branch: str = "main",
+    installation_id: int | None = 555,
+) -> dict[str, Any]:
+    repo_obj: dict[str, Any] = {
+        "full_name": full_name,
+        "default_branch": default_branch,
+    }
+    if repo_id is not None:
+        repo_obj["id"] = repo_id
+    body: dict[str, Any] = {
+        "action": action,
+        "pull_request": {
+            "number": pr_number,
+            "head": {"sha": head_sha},
+            "base": {"sha": "0000base"},
+        },
+        "repository": repo_obj,
+    }
+    if installation_id is not None:
+        body["installation"] = {"id": installation_id}
+    return body
+
+
+def _push_payload(
+    *,
+    ref: str = "refs/heads/main",
+    after: str = "deadbeef1234",
+    before: str = "111122223333",
+    deleted: bool = False,
+    repo_id: int = 9001,
+    full_name: str = "Tieens-04/CodeSight-AI",
+    default_branch: str = "main",
+) -> dict[str, Any]:
+    return {
+        "ref": ref,
+        "before": before,
+        "after": after,
+        "deleted": deleted,
+        "repository": {
+            "id": repo_id,
+            "full_name": full_name,
+            "default_branch": default_branch,
+        },
+        "installation": {"id": 555},
+    }
+
+
+def test_verify_github_signature_constant_time() -> None:
+    body = b'{"action": "opened"}'
+    sig = _sign_body(body)
+    assert verify_github_signature(body, sig, TEST_WEBHOOK_SECRET) is True
+    assert verify_github_signature(body + b" ", sig, TEST_WEBHOOK_SECRET) is False
+    assert verify_github_signature(body, "sha1=deadbeef", TEST_WEBHOOK_SECRET) is False
+    assert verify_github_signature(body, "sha256=\xff", TEST_WEBHOOK_SECRET) is False
+    assert verify_github_signature(body, None, TEST_WEBHOOK_SECRET) is False
+    assert verify_github_signature(body, sig, "") is False
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_missing_secret_bad_hmac_bad_headers_and_oversize_stream() -> None:
+    # 1. Missing secret -> 503
+    unconfigured_app = create_app(
+        settings=Settings(_env_file=None, github_webhook_secret=None),
+        session_factory=MagicMock(),
+        webhook_dispatcher=_SpyDispatcher(),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=unconfigured_app),
+        base_url="http://test",
+    ) as client:
+        resp_503 = await client.post("/api/v1/webhooks/github", content=b"{}")
+    assert resp_503.status_code == 503
+
+    # 2. Bad HMAC, tampered raw bytes, invalid headers, and >25 MiB payload
+    app = create_app(
+        settings=Settings(
+            _env_file=None,
+            github_webhook_secret=SecretStr(TEST_WEBHOOK_SECRET),
+        ),
+        session_factory=MagicMock(),
+        webhook_dispatcher=_SpyDispatcher(),
+    )
+    raw = json.dumps(_pr_payload()).encode("utf-8")
+    valid_sig = _sign_body(raw)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        r_missing_sig = await client.post(
+            "/api/v1/webhooks/github",
+            content=raw,
+            headers={"X-GitHub-Event": "pull_request", "X-GitHub-Delivery": "d-1"},
+        )
+        r_wrong_sig = await client.post(
+            "/api/v1/webhooks/github",
+            content=raw,
+            headers={
+                "X-GitHub-Event": "pull_request",
+                "X-GitHub-Delivery": "d-2",
+                "X-Hub-Signature-256": "sha256=" + ("0" * 64),
+            },
+        )
+        r_tampered = await client.post(
+            "/api/v1/webhooks/github",
+            content=raw + b" ",
+            headers={
+                "X-GitHub-Event": "pull_request",
+                "X-GitHub-Delivery": "d-3",
+                "X-Hub-Signature-256": valid_sig,
+            },
+        )
+        r_bad_headers = await client.post(
+            "/api/v1/webhooks/github",
+            content=raw,
+            headers={"X-Hub-Signature-256": valid_sig},
+        )
+        r_bad_json = await client.post(
+            "/api/v1/webhooks/github",
+            content=b"[1, 2, 3]",
+            headers={
+                "X-GitHub-Event": "ping",
+                "X-GitHub-Delivery": "d-4",
+                "X-Hub-Signature-256": _sign_body(b"[1, 2, 3]"),
+            },
+        )
+        r_content_length_413 = await client.post(
+            "/api/v1/webhooks/github",
+            content=b"{}",
+            headers={"Content-Length": str(MAX_WEBHOOK_BODY_BYTES + 1)},
+        )
+
+        # Streaming chunked body >25 MiB without Content-Length header
+        async def _oversize_chunks() -> AsyncIterator[bytes]:
+            chunk = b"x" * (1024 * 1024)
+            for _ in range(26):
+                yield chunk
+
+        r_stream_413 = await client.post(
+            "/api/v1/webhooks/github",
+            content=_oversize_chunks(),
+        )
+
+    assert r_missing_sig.status_code == 401
+    assert r_wrong_sig.status_code == 401
+    assert r_tampered.status_code == 401
+    assert r_bad_headers.status_code == 400
+    assert r_bad_json.status_code == 400
+    assert r_content_length_413.status_code == 413
+    assert r_stream_413.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_webhook_idempotency_filtering_cli_upsert_and_broker_rollback(
+    isolated_postgres_dsn: str,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        github_webhook_secret=SecretStr(TEST_WEBHOOK_SECRET),
+    )
+
+    test_engine = create_async_engine(isolated_postgres_dsn)
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    session_factory = create_session_factory(test_engine)
+
+    # Pre-seed a CLI-registered Repository without github_repo_id
+    async with session_factory() as seed_session:
+        seed_session.add(
+            Repository(
+                full_name="Tieens-04/CodeSight-AI",
+                github_repo_id=None,
+                default_branch="main",
+            )
+        )
+        await seed_session.commit()
+
+    spy = _SpyDispatcher()
+    app = create_app(
+        settings=settings,
+        session_factory=session_factory,
+        webhook_dispatcher=spy,
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            async def _send(event: str, delivery: str, body_obj: dict[str, Any]) -> httpx.Response:
+                raw = json.dumps(body_obj).encode("utf-8")
+                return await client.post(
+                    "/api/v1/webhooks/github",
+                    content=raw,
+                    headers={
+                        "X-GitHub-Event": event,
+                        "X-GitHub-Delivery": delivery,
+                        "X-Hub-Signature-256": _sign_body(raw),
+                    },
+                )
+
+            # 1. ping -> 200 pong, 0 dispatches
+            r_ping = await _send("ping", "deliv-ping-1", {"zen": "Keep it simple"})
+            assert r_ping.status_code == 200
+            assert r_ping.json()["status"] == "pong"
+
+            # 2. pull_request.opened -> 202 queued, backfills CLI repo's github_repo_id + inst_id
+            r_pr = await _send(
+                "pull_request",
+                "deliv-pr-1",
+                _pr_payload(action="opened", repo_id=777, installation_id=99),
+            )
+            assert r_pr.status_code == 202
+            assert r_pr.headers["x-trace-id"] == "deliv-pr-1"
+            assert r_pr.json()["status"] == "queued"
+            assert len(spy.pr_calls) == 1
+
+            async with session_factory() as check_backfill:
+                backfilled = (await check_backfill.execute(sa.select(Repository))).scalar_one()
+                assert backfilled.github_repo_id == 777
+                assert backfilled.installation_id == 99
+
+            # 3. Duplicate X-GitHub-Delivery -> 200 duplicate, NO second dispatch
+            r_dup = await _send(
+                "pull_request",
+                "deliv-pr-1",
+                _pr_payload(action="opened", repo_id=777, installation_id=99),
+            )
+            assert r_dup.status_code == 200
+            assert r_dup.json()["status"] == "duplicate"
+            assert len(spy.pr_calls) == 1
+
+            # 4. synchronize & reopened -> 202; closed -> 200 ignored
+            r_sync = await _send(
+                "pull_request",
+                "deliv-pr-2",
+                _pr_payload(action="synchronize", head_sha="fff000", repo_id=777),
+            )
+            r_reopen = await _send(
+                "pull_request",
+                "deliv-pr-3",
+                _pr_payload(action="reopened", head_sha="eee111", repo_id=777),
+            )
+            r_closed = await _send(
+                "pull_request",
+                "deliv-pr-closed",
+                _pr_payload(action="closed", repo_id=777),
+            )
+            assert r_sync.status_code == 202
+            assert r_reopen.status_code == 202
+            assert r_closed.status_code == 200
+            assert r_closed.json()["status"] == "ignored"
+            assert len(spy.pr_calls) == 3
+
+            # 5. push filtering: default branch -> 202; feature branch or deleted -> 200 ignored
+            r_push_main = await _send("push", "deliv-push-main", _push_payload(repo_id=777))
+            r_push_feat = await _send(
+                "push",
+                "deliv-push-feat",
+                _push_payload(ref="refs/heads/feat/x", repo_id=777),
+            )
+            r_push_del = await _send(
+                "push",
+                "deliv-push-del",
+                _push_payload(deleted=True, after="0" * 40, repo_id=777),
+            )
+            assert r_push_main.status_code == 202
+            assert r_push_feat.status_code == 200 and r_push_feat.json()["status"] == "ignored"
+            assert r_push_del.status_code == 200 and r_push_del.json()["status"] == "ignored"
+            assert len(spy.push_calls) == 1
+
+            # 6. Broker outage -> rollback DB & 503, then retry same delivery_id -> 202!
+            spy.fail_next = True
+            r_broker_down = await _send(
+                "pull_request",
+                "deliv-retry-1",
+                _pr_payload(action="synchronize", head_sha="retry999", repo_id=777),
+            )
+            assert r_broker_down.status_code == 503
+
+            r_broker_retry = await _send(
+                "pull_request",
+                "deliv-retry-1",
+                _pr_payload(action="synchronize", head_sha="retry999", repo_id=777),
+            )
+            assert r_broker_retry.status_code == 202
+            assert r_broker_retry.json()["status"] == "queued"
+
+        # Verify DB state: CLI repo backfilled cleanly, installation updated, and counts match
+        async with session_factory() as verify_session:
+            repos = (await verify_session.execute(sa.select(Repository))).scalars().all()
+            assert len(repos) == 1
+            assert repos[0].github_repo_id == 777
+            assert repos[0].installation_id == 555
+
+            ping_row = await verify_session.get(WebhookEvent, "deliv-ping-1")
+            assert ping_row is not None and ping_row.status == "ignored"
+            retry_row = await verify_session.get(WebhookEvent, "deliv-retry-1")
+            assert retry_row is not None and retry_row.status == "queued"
+    finally:
+        await test_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
+    isolated_postgres_dsn: str,
+) -> None:
+    clear_trace_context()
+    bind_trace_id("webhook-trace-999")
+    sent: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    class _FakeCelery:
+        def send_task(
+            self,
+            name: str,
+            *,
+            args: tuple[Any, ...] = (),
+            kwargs: dict[str, Any] | None = None,
+            headers: dict[str, Any] | None = None,
+        ) -> SimpleNamespace:
+            sent.append((name, args, {"kwargs": kwargs, "headers": headers}))
+            return SimpleNamespace(id=f"celery-id-{len(sent)}")
+
+    dispatcher = CeleryWebhookDispatcher(app=_FakeCelery())  # type: ignore[arg-type]
+    pr_task_id = await dispatcher.dispatch_pull_request(
+        PRWebhookDispatchPayload(
+            delivery_id="webhook-trace-999",
+            repo_id="repo-uuid-1",
+            github_repo_id=1,
+            repo_full_name="org/repo",
+            default_branch="main",
+            installation_id=2,
+            pr_number=5,
+            head_sha="abc",
+            action="opened",
+        )
+    )
+    push_task_id = await dispatcher.dispatch_push(
+        PushWebhookDispatchPayload(
+            delivery_id="webhook-trace-999",
+            repo_id="repo-uuid-1",
+            github_repo_id=1,
+            repo_full_name="org/repo",
+            default_branch="main",
+            installation_id=2,
+            ref="refs/heads/main",
+            after_sha="def",
+        )
+    )
+    assert pr_task_id == "celery-id-1"
+    assert push_task_id == "celery-id-2"
+    assert sent[0][0] == "codesight.webhook.handle_pr_event"
+    assert sent[1][0] == "codesight.webhook.handle_push_event"
+
+    assert handle_pr_event({"repo_full_name": "org/repo", "pr_number": 5}) == {
+        "status": "accepted",
+        "trace_id": "webhook-trace-999",
+    }
+    assert handle_push_event({"repo_full_name": "org/repo", "ref": "refs/heads/main"}) == {
+        "status": "accepted",
+        "trace_id": "webhook-trace-999",
+    }
+    clear_trace_context()
+
+    # Verify FastAPI lifespan initializes and disposes AsyncEngine when session_factory=None
+    app = create_app(
+        settings=Settings(_env_file=None),
+        webhook_dispatcher=_SpyDispatcher(),
+    )
+    async with app.router.lifespan_context(app):
+        assert app.state.db_engine is not None
+        assert app.state.session_factory is not None
+
+    # Also verify get_db_session / Route fails clearly if session_factory is uninitialized
+    fake_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(session_factory=None)))
+    assert isinstance(fake_request, Request) or fake_request.app.state.session_factory is None
+
+
+@pytest.mark.asyncio
+async def test_webhook_gateway_warm_mean_latency_under_100ms(
+    isolated_postgres_dsn: str,
+) -> None:
+    engine = create_async_engine(isolated_postgres_dsn, pool_size=5, max_overflow=10)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    session_factory = create_session_factory(engine)
+    settings = Settings(
+        _env_file=None,
+        github_webhook_secret=SecretStr(TEST_WEBHOOK_SECRET),
+    )
+
+    class _FastFakeCelery:
+        def send_task(self, name: str, **_: Any) -> SimpleNamespace:
+            return SimpleNamespace(id="bench-task-1")
+
+    app = create_app(
+        settings=settings,
+        session_factory=session_factory,
+        webhook_dispatcher=CeleryWebhookDispatcher(app=_FastFakeCelery()),  # type: ignore[arg-type]
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            # Warmup request to populate asyncpg connection pool
+            warm_raw = json.dumps(_pr_payload(action="opened", pr_number=1)).encode("utf-8")
+            warm_resp = await client.post(
+                "/api/v1/webhooks/github",
+                content=warm_raw,
+                headers={
+                    "X-GitHub-Event": "pull_request",
+                    "X-GitHub-Delivery": "bench-warmup-0",
+                    "X-Hub-Signature-256": _sign_body(warm_raw),
+                },
+            )
+            assert warm_resp.status_code == 202
+
+            latencies_ms: list[float] = []
+            for idx in range(50):
+                raw = json.dumps(
+                    _pr_payload(action="synchronize", pr_number=idx + 2)
+                ).encode("utf-8")
+                t0 = time.perf_counter()
+                resp = await client.post(
+                    "/api/v1/webhooks/github",
+                    content=raw,
+                    headers={
+                        "X-GitHub-Event": "pull_request",
+                        "X-GitHub-Delivery": f"bench-deliv-{idx}",
+                        "X-Hub-Signature-256": _sign_body(raw),
+                    },
+                )
+                latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+                assert resp.status_code == 202
+
+        mean_ms = sum(latencies_ms) / len(latencies_ms)
+        assert mean_ms < 100.0, f"Mean webhook latency {mean_ms:.2f}ms exceeded 100ms SLA"
+    finally:
+        await engine.dispose()

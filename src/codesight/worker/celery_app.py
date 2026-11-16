@@ -117,3 +117,30 @@ def ping() -> dict[str, str]:
     trace_id = get_trace_id() or "-"
     logger.info("worker_ping_executed", trace_id=trace_id)
     return {"status": "pong", "trace_id": trace_id}
+
+
+@_typed_task(celery_app, name="codesight.webhook.handle_pr_event")
+def handle_pr_event(payload: dict[str, Any]) -> dict[str, str]:
+    """Handle pull_request webhook events (stub wired to full pipeline in CA-7..CA-21)."""
+    trace_id = get_trace_id() or "-"
+    logger.info(
+        "webhook_pr_stub_received",
+        trace_id=trace_id,
+        repo=str(payload.get("repo_full_name", "")),
+        pr_number=payload.get("pr_number"),
+        action=payload.get("action"),
+    )
+    return {"status": "accepted", "trace_id": trace_id}
+
+
+@_typed_task(celery_app, name="codesight.webhook.handle_push_event")
+def handle_push_event(payload: dict[str, Any]) -> dict[str, str]:
+    """Handle default-branch push webhook events (stub wired to syncer in CA-14)."""
+    trace_id = get_trace_id() or "-"
+    logger.info(
+        "webhook_push_stub_received",
+        trace_id=trace_id,
+        repo=str(payload.get("repo_full_name", "")),
+        ref=str(payload.get("ref", "")),
+    )
+    return {"status": "accepted", "trace_id": trace_id}

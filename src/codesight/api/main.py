@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Response, status
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from codesight import __version__
 from codesight.api.health import HealthProbe, HealthResponse, run_health_checks
+from codesight.api.routes.webhooks import (
+    CeleryWebhookDispatcher,
+    WebhookDispatcher,
+)
+from codesight.api.routes.webhooks import (
+    router as webhooks_router,
+)
 from codesight.core.config import Settings, get_settings
 from codesight.core.logging import bind_trace_id, clear_trace_context, configure_logging
+from codesight.db.session import create_db_engine, create_session_factory
 
 _TRACE_HEADER_PRIORITY: tuple[bytes, ...] = (
     b"x-trace-id",
@@ -80,16 +90,41 @@ class TraceIdMiddleware:
 def create_app(
     settings: Settings | None = None,
     probes: Mapping[str, HealthProbe] | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    webhook_dispatcher: WebhookDispatcher | None = None,
 ) -> FastAPI:
     """Create and configure the CodeSight-AI FastAPI application."""
     active_settings = settings if settings is not None else get_settings()
     configure_logging(level=active_settings.log_level, service_name="codesight-api")
 
+    @asynccontextmanager
+    async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
+        if session_factory is None:
+            engine = create_db_engine(active_settings)
+            app_instance.state.db_engine = engine
+            app_instance.state.session_factory = create_session_factory(engine)
+            try:
+                yield
+            finally:
+                await engine.dispose()
+        else:
+            app_instance.state.db_engine = None
+            app_instance.state.session_factory = session_factory
+            yield
+
     application = FastAPI(
         title="CodeSight-AI Gateway",
         version=__version__,
+        lifespan=lifespan,
+    )
+    application.state.settings = active_settings
+    application.state.db_engine = None
+    application.state.session_factory = session_factory
+    application.state.webhook_dispatcher = (
+        webhook_dispatcher if webhook_dispatcher is not None else CeleryWebhookDispatcher()
     )
     application.add_middleware(TraceIdMiddleware)
+    application.include_router(webhooks_router)
 
     @application.get("/health", response_model=HealthResponse)
     async def health_check(response: Response) -> HealthResponse:
