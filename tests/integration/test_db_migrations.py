@@ -143,6 +143,7 @@ async def test_alembic_upgrade_constraints_cascade_and_downgrade(
             await session.rollback()
 
         # Verify valid cascade delete from Repository -> PRReview -> ReviewFinding
+        # in a fresh AsyncSession (guards passive_deletes=True against MissingGreenlet)
         async with session_factory() as session:
             repo = Repository(
                 full_name="Tieens-04/CascadeRepo",
@@ -151,6 +152,7 @@ async def test_alembic_upgrade_constraints_cascade_and_downgrade(
             )
             session.add(repo)
             await session.flush()
+            repo_id = repo.id
             review = PRReview(
                 repo_id=repo.id,
                 pr_number=3,
@@ -175,13 +177,16 @@ async def test_alembic_upgrade_constraints_cascade_and_downgrade(
             session.add(finding)
             await session.commit()
 
-            await session.delete(repo)
-            await session.commit()
+        async with session_factory() as fresh_session:
+            loaded_repo = await fresh_session.get(Repository, repo_id)
+            assert loaded_repo is not None
+            await fresh_session.delete(loaded_repo)
+            await fresh_session.commit()
 
-            remaining_reviews = await session.scalar(
+            remaining_reviews = await fresh_session.scalar(
                 sa.select(sa.func.count()).select_from(PRReview)
             )
-            remaining_findings = await session.scalar(
+            remaining_findings = await fresh_session.scalar(
                 sa.select(sa.func.count()).select_from(ReviewFinding)
             )
             assert remaining_reviews == 0

@@ -79,9 +79,11 @@ def create_app_jwt(
     return jwt.encode(payload, private_key_pem, algorithm="RS256")
 
 
-def _validate_repo_full_name(repo_full_name: str) -> str:
-    parts = repo_full_name.split("/")
-    if len(parts) != 2:
+def validate_repo_full_name(repo_full_name: str) -> str:
+    """Validate GitHub 'owner/repo' slug format and 255-character DB column bound."""
+    cleaned = repo_full_name.strip()
+    parts = cleaned.split("/")
+    if len(parts) != 2 or len(cleaned) > 255:
         raise GitHubAuthConfigError("Invalid repository slug; expected 'owner/repo'.")
     owner, repo = parts
     if (
@@ -148,6 +150,8 @@ class GitHubAuthProvider:
         )
         try:
             raw = await client.get(cache_key)
+            if isinstance(raw, (bytes, bytearray)):
+                return raw.decode("utf-8")
             return str(raw) if raw else None
         except (redis.exceptions.RedisError, OSError) as exc:
             logger.warning("github_token_cache_unavailable", error_type=type(exc).__name__)
@@ -244,7 +248,7 @@ class GitHubAuthProvider:
 
         data = resp.json()
         inst_id = data.get("id") if isinstance(data, dict) else None
-        if not isinstance(inst_id, int):
+        if not isinstance(inst_id, int) or isinstance(inst_id, bool) or inst_id < 1:
             raise GitHubAuthError("GitHub installation lookup response missing integer 'id'.")
         return inst_id
 
@@ -268,7 +272,7 @@ class GitHubAuthProvider:
     ) -> SecretStr:
         """Resolve a GitHub bearer token (App Installation token first, PAT fallback)."""
         validated_repo = (
-            _validate_repo_full_name(repo_full_name) if repo_full_name is not None else None
+            validate_repo_full_name(repo_full_name) if repo_full_name is not None else None
         )
 
         if self._has_app_credentials():

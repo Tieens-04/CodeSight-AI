@@ -92,6 +92,9 @@ def test_create_app_jwt_claims_and_rs256_signature() -> None:
     assert decoded["iat"] == 1_699_999_940
     assert decoded["exp"] == 1_700_000_540
 
+    with pytest.raises(GitHubAuthConfigError):
+        create_app_jwt("   ", pem_private)
+
 
 @pytest.mark.asyncio
 async def test_installation_token_redis_hit_and_miss_with_50m_ttl() -> None:
@@ -297,3 +300,70 @@ async def test_provider_creates_and_closes_transient_clients_when_uninjected(
     assert tok.get_secret_value() == "ghs_transient_88"
     assert fake_redis.closed is True
     assert closed_flags["http_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_redis_bytes_cache_and_http_error_and_bool_id_guards() -> None:
+    pem_private, _ = _generate_rsa_keypair()
+    settings = Settings(
+        _env_file=None,
+        github_app_id="12345",
+        github_private_key=SecretStr(pem_private),
+    )
+
+    class _BytesRedis:
+        async def get(self, key: str) -> bytes:
+            assert key == "gh_inst_token:42"
+            return b"ghs_raw_bytes_42"
+
+        async def set(self, key: str, value: str, *, ex: int | None = None) -> bool:
+            return True
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(500))
+    ) as client:
+        provider_bytes = GitHubAuthProvider(
+            settings,
+            redis_client=_BytesRedis(),  # type: ignore[arg-type]
+            http_client=client,
+        )
+        tok = await provider_bytes.get_token(installation_id=42)
+    assert tok.get_secret_value() == "ghs_raw_bytes_42"
+
+    # Bool ID in installation lookup response must be rejected cleanly
+    def _bool_id_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_bool_id_handler)) as client:
+        provider_bool = GitHubAuthProvider(
+            settings,
+            redis_client=_FakeAsyncRedis(),  # type: ignore[arg-type]
+            http_client=client,
+        )
+        with pytest.raises(GitHubAuthError):
+            await provider_bool.get_token(repo_full_name="org/bool-id")
+
+    # HTTP 500 & RequestError wrap into GitHubAuthError cleanly
+    def _http_500_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"message": "Bad Gateway"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_http_500_handler)) as client:
+        provider_502 = GitHubAuthProvider(
+            settings,
+            redis_client=_FakeAsyncRedis(),  # type: ignore[arg-type]
+            http_client=client,
+        )
+        with pytest.raises(GitHubAuthError):
+            await provider_502.get_token(installation_id=42)
+
+    def _conn_err_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("network unreachable", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_conn_err_handler)) as client:
+        provider_net = GitHubAuthProvider(
+            settings,
+            redis_client=_FakeAsyncRedis(),  # type: ignore[arg-type]
+            http_client=client,
+        )
+        with pytest.raises(GitHubAuthError):
+            await provider_net.get_token(installation_id=42)

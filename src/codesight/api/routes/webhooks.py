@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
-from typing import Any, Final, Literal, Protocol, cast
+from typing import Any, Final, Literal, Protocol, TypeGuard, cast
 
 import structlog
 from celery import Celery
@@ -20,11 +20,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from codesight.core.config import Settings, get_settings
 from codesight.db.models import Repository, WebhookEvent
+from codesight.vcs.github_auth import GitHubAuthConfigError, validate_repo_full_name
 from codesight.worker.celery_app import celery_app
 
 MAX_WEBHOOK_BODY_BYTES: Final[int] = 25 * 1024 * 1024  # 25 MiB ceiling for 512m container
 ACTIONABLE_PR_ACTIONS: Final[frozenset[str]] = frozenset({"opened", "synchronize", "reopened"})
 _ZERO_SHA: Final[str] = "0" * 40
+_MAX_INT32: Final[int] = (1 << 31) - 1
+_MAX_INT64: Final[int] = (1 << 63) - 1
 
 logger = structlog.get_logger("codesight.api.webhooks")
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
@@ -179,6 +182,10 @@ async def read_bounded_body(
     return b"".join(chunks)
 
 
+def _is_strict_positive_int(value: Any, *, max_value: int) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= max_value
+
+
 def _extract_repo_meta(payload: dict[str, Any]) -> tuple[str, int | None, str, int | None]:
     repo_raw = payload.get("repository")
     if not isinstance(repo_raw, dict):
@@ -186,34 +193,67 @@ def _extract_repo_meta(payload: dict[str, Any]) -> tuple[str, int | None, str, i
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Webhook payload missing 'repository' object.",
         )
-    full_name = repo_raw.get("full_name")
-    if not isinstance(full_name, str) or not full_name.strip():
+    full_name_raw = repo_raw.get("full_name")
+    if not isinstance(full_name_raw, str):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Webhook payload missing 'repository.full_name'.",
         )
+    try:
+        full_name = validate_repo_full_name(full_name_raw)
+    except GitHubAuthConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid 'repository.full_name'.",
+        ) from exc
+
     gh_repo_id = repo_raw.get("id")
-    if gh_repo_id is not None and not isinstance(gh_repo_id, int):
+    if gh_repo_id is not None and not _is_strict_positive_int(gh_repo_id, max_value=_MAX_INT64):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid 'repository.id'.",
         )
+
     default_branch = repo_raw.get("default_branch")
-    branch = (
-        default_branch.strip()
-        if isinstance(default_branch, str) and default_branch.strip()
-        else "main"
-    )
+    if default_branch is None:
+        branch = "main"
+    elif not isinstance(default_branch, str) or len(default_branch.strip()) > 128:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid 'repository.default_branch'.",
+        )
+    else:
+        branch = default_branch.strip() or "main"
+
     inst_raw = payload.get("installation")
     inst_id: int | None = None
-    if isinstance(inst_raw, dict) and isinstance(inst_raw.get("id"), int):
-        inst_id = inst_raw["id"]
-    return full_name.strip(), gh_repo_id, branch, inst_id
+    if isinstance(inst_raw, dict) and inst_raw.get("id") is not None:
+        raw_inst_id = inst_raw["id"]
+        if not _is_strict_positive_int(raw_inst_id, max_value=_MAX_INT64):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid 'installation.id'.",
+            )
+        inst_id = raw_inst_id
+    return full_name, gh_repo_id, branch, inst_id
 
 
 def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWebhook:
     raw_action = payload.get("action")
-    action = raw_action if isinstance(raw_action, str) and raw_action else None
+    action: str | None = None
+    if raw_action is not None:
+        if not isinstance(raw_action, str):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid webhook 'action'.",
+            )
+        cleaned_action = raw_action.strip()
+        if len(cleaned_action) > 64:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Webhook 'action' exceeds 64 characters.",
+            )
+        action = cleaned_action or None
 
     if event_type == "ping":
         return _ClassifiedWebhook(target_status="ignored", ack_status="pong", action=action)
@@ -231,14 +271,15 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
             )
         pr_number = pr_raw.get("number")
         head_raw = pr_raw.get("head")
-        head_sha = head_raw.get("sha") if isinstance(head_raw, dict) else None
+        head_sha_raw = head_raw.get("sha") if isinstance(head_raw, dict) else None
         base_raw = pr_raw.get("base")
-        base_sha = base_raw.get("sha") if isinstance(base_raw, dict) else None
+        base_sha_raw = base_raw.get("sha") if isinstance(base_raw, dict) else None
+        head_sha = head_sha_raw.strip() if isinstance(head_sha_raw, str) else ""
+        base_sha = base_sha_raw.strip() if isinstance(base_sha_raw, str) else None
         if (
-            not isinstance(pr_number, int)
-            or pr_number <= 0
-            or not isinstance(head_sha, str)
+            not _is_strict_positive_int(pr_number, max_value=_MAX_INT32)
             or not head_sha
+            or len(head_sha) > 64
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -254,7 +295,7 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
             installation_id=inst_id,
             pr_number=pr_number,
             head_sha=head_sha,
-            base_sha=base_sha if isinstance(base_sha, str) else None,
+            base_sha=base_sha if base_sha and len(base_sha) <= 64 else None,
         )
 
     if event_type == "push":
@@ -263,17 +304,19 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
             return _ClassifiedWebhook(target_status="ignored", ack_status="ignored", action=action)
         full_name, gh_repo_id, default_branch, inst_id = _extract_repo_meta(payload)
         ref = payload.get("ref")
-        after = payload.get("after")
-        before = payload.get("before")
-        deleted = bool(payload.get("deleted", False))
+        after_raw = payload.get("after")
+        before_raw = payload.get("before")
+        after_sha = after_raw.strip() if isinstance(after_raw, str) else ""
+        before_sha = before_raw.strip() if isinstance(before_raw, str) else None
+        deleted = payload.get("deleted") is True
         expected_ref = f"refs/heads/{default_branch}"
         if (
             not deleted
             and isinstance(ref, str)
             and ref == expected_ref
-            and isinstance(after, str)
-            and bool(after)
-            and after != _ZERO_SHA
+            and bool(after_sha)
+            and len(after_sha) <= 64
+            and after_sha != _ZERO_SHA
         ):
             return _ClassifiedWebhook(
                 target_status="queued",
@@ -284,8 +327,8 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
                 default_branch=default_branch,
                 installation_id=inst_id,
                 ref=ref,
-                before_sha=before if isinstance(before, str) else None,
-                after_sha=after,
+                before_sha=before_sha if before_sha and len(before_sha) <= 64 else None,
+                after_sha=after_sha,
             )
         return _ClassifiedWebhook(target_status="ignored", ack_status="ignored", action=action)
 

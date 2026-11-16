@@ -81,6 +81,7 @@ class Repository(Base):
     reviews: Mapped[list[PRReview]] = relationship(
         back_populates="repository",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -209,6 +210,7 @@ class PRReview(Base):
     findings: Mapped[list[ReviewFinding]] = relationship(
         back_populates="pr_review",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 

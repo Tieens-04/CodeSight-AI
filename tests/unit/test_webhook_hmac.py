@@ -16,7 +16,6 @@ import pytest
 import sqlalchemy as sa
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import create_async_engine
-from starlette.requests import Request
 
 from codesight.api.main import create_app
 from codesight.api.routes.webhooks import (
@@ -442,9 +441,149 @@ async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
         assert app.state.db_engine is not None
         assert app.state.session_factory is not None
 
-    # Also verify get_db_session / Route fails clearly if session_factory is uninitialized
-    fake_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(session_factory=None)))
-    assert isinstance(fake_request, Request) or fake_request.app.state.session_factory is None
+    # Also verify route returns 503 when session_factory is uninitialized
+    uninit_app = create_app(
+        settings=Settings(
+            _env_file=None,
+            github_webhook_secret=SecretStr(TEST_WEBHOOK_SECRET),
+        ),
+        session_factory=None,
+        webhook_dispatcher=_SpyDispatcher(),
+    )
+    valid_raw = json.dumps(_pr_payload()).encode("utf-8")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=uninit_app),
+        base_url="http://test",
+    ) as client:
+        r_uninit = await client.post(
+            "/api/v1/webhooks/github",
+            content=valid_raw,
+            headers={
+                "X-GitHub-Event": "pull_request",
+                "X-GitHub-Delivery": "deliv-no-db",
+                "X-Hub-Signature-256": _sign_body(valid_raw),
+            },
+        )
+    assert r_uninit.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_bool_ints_invalid_slugs_oversize_strings_and_handles_edge_events(
+    isolated_postgres_dsn: str,
+) -> None:
+    engine = create_async_engine(isolated_postgres_dsn)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = create_session_factory(engine)
+    spy = _SpyDispatcher()
+    app = create_app(
+        settings=Settings(
+            _env_file=None,
+            github_webhook_secret=SecretStr(TEST_WEBHOOK_SECRET),
+        ),
+        session_factory=session_factory,
+        webhook_dispatcher=spy,
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            async def _post(
+                event: str,
+                delivery: str,
+                raw_bytes: bytes,
+                extra_headers: dict[str, str] | None = None,
+            ) -> httpx.Response:
+                hdrs = {
+                    "X-GitHub-Event": event,
+                    "X-GitHub-Delivery": delivery,
+                    "X-Hub-Signature-256": _sign_body(raw_bytes),
+                }
+                if extra_headers:
+                    hdrs.update(extra_headers)
+                return await client.post("/api/v1/webhooks/github", content=raw_bytes, headers=hdrs)
+
+            # Invalid Content-Length and invalid JSON -> 400
+            r_bad_cl = await client.post(
+                "/api/v1/webhooks/github",
+                content=b"{}",
+                headers={"Content-Length": "not-an-int"},
+            )
+            r_neg_cl = await client.post(
+                "/api/v1/webhooks/github",
+                content=b"{}",
+                headers={"Content-Length": "-1"},
+            )
+            r_bad_json = await _post("ping", "d-bad-json", b"{not json")
+            assert r_bad_cl.status_code == 400
+            assert r_neg_cl.status_code == 400
+            assert r_bad_json.status_code == 400
+
+            # bool-as-int and out-of-range integer attacks -> 400
+            bad_payloads: list[dict[str, Any]] = [
+                _pr_payload(repo_id=True),  # type: ignore[arg-type]
+                _pr_payload(installation_id=True),  # type: ignore[arg-type]
+                _pr_payload(pr_number=True),  # type: ignore[arg-type]
+                _pr_payload(repo_id=-5),
+                _pr_payload(repo_id=2**63),
+                _pr_payload(pr_number=2**31),
+                # String length / slug / whitespace SHA attacks -> 400
+                _pr_payload(full_name="../evil"),
+                _pr_payload(full_name="org/" + ("a" * 260)),
+                _pr_payload(default_branch="b" * 129),
+                _pr_payload(action="c" * 65),
+                _pr_payload(head_sha="   "),
+                # Missing repository or pull_request objects -> 400
+                {"action": "opened"},
+                {"action": "opened", "repository": {"id": 1, "full_name": "org/repo"}},
+            ]
+            for idx, bad_obj in enumerate(bad_payloads):
+                resp = await _post(
+                    "pull_request",
+                    f"d-bad-payload-{idx}",
+                    json.dumps(bad_obj).encode("utf-8"),
+                )
+                assert (
+                    resp.status_code == 400
+                ), f"Expected 400 for case {idx}, got {resp.status_code}"
+
+            # Independent push deletion cases & ignored events -> 200 ignored, 0 dispatches
+            r_zero_sha = await _post(
+                "push",
+                "d-push-zero-sha",
+                json.dumps(_push_payload(deleted=False, after="0" * 40)).encode("utf-8"),
+            )
+            r_deleted_only = await _post(
+                "push",
+                "d-push-deleted-only",
+                json.dumps(_push_payload(deleted=True, after="deadbeef")).encode("utf-8"),
+            )
+            r_push_no_repo = await _post(
+                "push",
+                "d-push-no-repo",
+                json.dumps({"ref": "refs/heads/main", "after": "abc"}).encode("utf-8"),
+            )
+            r_unknown_evt = await _post(
+                "issues",
+                "d-unknown-evt",
+                json.dumps({"action": "opened"}).encode("utf-8"),
+            )
+            assert r_zero_sha.status_code == 200 and r_zero_sha.json()["status"] == "ignored"
+            assert (
+                r_deleted_only.status_code == 200
+                and r_deleted_only.json()["status"] == "ignored"
+            )
+            assert (
+                r_push_no_repo.status_code == 200
+                and r_push_no_repo.json()["status"] == "ignored"
+            )
+            assert r_unknown_evt.status_code == 200 and r_unknown_evt.json()["status"] == "ignored"
+            assert spy.pr_calls == []
+            assert spy.push_calls == []
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
