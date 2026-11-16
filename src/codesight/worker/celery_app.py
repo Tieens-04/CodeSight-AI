@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any, ParamSpec, TypeVar, cast
 
+import redis as redis_sync
+import redis.exceptions
 import structlog
 from celery import Celery
 from celery.signals import (
@@ -117,3 +119,89 @@ def ping() -> dict[str, str]:
     trace_id = get_trace_id() or "-"
     logger.info("worker_ping_executed", trace_id=trace_id)
     return {"status": "pong", "trace_id": trace_id}
+
+
+def is_pr_event_superseded(
+    payload: Mapping[str, Any],
+    *,
+    redis_client: redis_sync.Redis | None = None,
+) -> bool:
+    """Return True if a newer head_sha has superseded this pull_request review task."""
+    repo_id = payload.get("repo_id")
+    pr_number = payload.get("pr_number")
+    head_sha = payload.get("head_sha")
+    if (
+        not isinstance(repo_id, str)
+        or not repo_id
+        or not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
+        or not isinstance(head_sha, str)
+        or not head_sha
+    ):
+        return False
+
+    sha_key = f"pr_active:{repo_id}:{pr_number}"
+    owns_client = redis_client is None
+    client = (
+        redis_client
+        if redis_client is not None
+        else redis_sync.Redis.from_url(
+            get_settings().redis_url,
+            decode_responses=True,
+            socket_timeout=0.5,
+        )
+    )
+    try:
+        raw = client.get(sha_key)
+        if isinstance(raw, (bytes, bytearray)):
+            latest_sha = raw.decode("utf-8")
+        elif raw:
+            latest_sha = str(raw)
+        else:
+            latest_sha = ""
+        return bool(latest_sha and latest_sha != head_sha)
+    except (redis.exceptions.RedisError, OSError) as exc:
+        logger.warning("worker_supersede_check_unavailable", error_type=type(exc).__name__)
+        return False
+    finally:
+        if owns_client:
+            try:
+                client.close()
+            except (redis.exceptions.RedisError, OSError):
+                pass
+
+
+@_typed_task(celery_app, name="codesight.webhook.handle_pr_event")
+def handle_pr_event(payload: dict[str, Any]) -> dict[str, str]:
+    """Handle pull_request webhook events (stub wired to full pipeline in CA-7..CA-21)."""
+    trace_id = get_trace_id() or "-"
+    if is_pr_event_superseded(payload):
+        logger.info(
+            "webhook_pr_superseded",
+            trace_id=trace_id,
+            repo=str(payload.get("repo_full_name", "")),
+            pr_number=payload.get("pr_number"),
+            head_sha=str(payload.get("head_sha", "")),
+        )
+        return {"status": "superseded", "trace_id": trace_id}
+    logger.info(
+        "webhook_pr_stub_received",
+        trace_id=trace_id,
+        repo=str(payload.get("repo_full_name", "")),
+        pr_number=payload.get("pr_number"),
+        action=payload.get("action"),
+    )
+    return {"status": "accepted", "trace_id": trace_id}
+
+
+@_typed_task(celery_app, name="codesight.webhook.handle_push_event")
+def handle_push_event(payload: dict[str, Any]) -> dict[str, str]:
+    """Handle default-branch push webhook events (stub wired to syncer in CA-14)."""
+    trace_id = get_trace_id() or "-"
+    logger.info(
+        "webhook_push_stub_received",
+        trace_id=trace_id,
+        repo=str(payload.get("repo_full_name", "")),
+        ref=str(payload.get("ref", "")),
+    )
+    return {"status": "accepted", "trace_id": trace_id}

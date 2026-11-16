@@ -4,14 +4,17 @@ version = "0.1.0"
 description = "Autonomous PR Reviewer & Technical Debt Radar"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+    "alembic>=1.14",
     "asyncpg>=0.30",
     "celery[redis]>=5.4",
     "fastapi>=0.115",
     "httpx>=0.28",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
+    "pyjwt[crypto]>=2.10",
     "redis>=5.2",
     "rich>=13.9",
+    "sqlalchemy[asyncio]>=2.0.36",
     "structlog>=24.4",
     "typer>=0.13",
     "uvicorn[standard]>=0.32",
@@ -63,3 +66,4 @@ testpaths = ["tests"]
 [tool.coverage.run]
 source = ["src/codesight"]
 branch = true
+concurrency = ["greenlet", "thread"]

@@ -81,6 +81,30 @@ services:
     networks:
       - codesight-net
 
+  codesight-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codesight-ai:local
+    container_name: codesight-migrate
+    restart: "no"
+    mem_limit: 256m
+    command:
+      - alembic
+      - upgrade
+      - head
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_HOST: codesight-postgres
+      POSTGRES_PORT: 5432
+    depends_on:
+      codesight-postgres:
+        condition: service_healthy
+    networks:
+      - codesight-net
+
   codesight-api:
     build:
       context: .
@@ -109,6 +133,8 @@ services:
     depends_on:
       codesight-postgres:
         condition: service_healthy
+      codesight-migrate:
+        condition: service_completed_successfully
       codesight-redis:
         condition: service_healthy
       codesight-qdrant:
@@ -159,6 +185,8 @@ services:
     depends_on:
       codesight-postgres:
         condition: service_healthy
+      codesight-migrate:
+        condition: service_completed_successfully
       codesight-redis:
         condition: service_healthy
       codesight-qdrant:

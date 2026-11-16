@@ -22,6 +22,8 @@ RUN groupadd --gid 10001 codesight \
 WORKDIR /app
 
 COPY --from=builder --chown=codesight:codesight /app/.venv /app/.venv
+COPY --chown=codesight:codesight alembic.ini ./alembic.ini
+COPY --chown=codesight:codesight alembic ./alembic
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED="1" \
