@@ -22,6 +22,8 @@ RUN groupadd --gid 10001 codesight \
 WORKDIR /app
 
 COPY --from=builder --chown=codesight:codesight /app/.venv /app/.venv
+COPY --chown=codesight:codesight alembic.ini ./alembic.ini
+COPY --chown=codesight:codesight alembic ./alembic
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED="1" \
@@ -31,4 +33,4 @@ USER codesight
 
 EXPOSE 8000
 
-CMD ["uvicorn", "codesight.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn codesight.api.main:app --host 0.0.0.0 --port 8000"]
