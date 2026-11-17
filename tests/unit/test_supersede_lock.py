@@ -111,3 +111,100 @@ async def test_supersede_lock_fail_open_on_redis_errors_and_invalid_payloads() -
     broken_sync.ensure_active("r1", 1, "sha-1", stage="entry")
 
     assert is_pr_event_superseded({"repo_id": "", "pr_number": True, "head_sha": "x"}) is False
+
+
+@pytest.mark.asyncio
+async def test_execute_pr_review_lifecycle_blocks_stale_publish_and_cleans_workspace() -> None:
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from codesight.config_reader.repo_config import RepoConfig
+    from codesight.core.logging import bind_trace_id, clear_trace_context
+    from codesight.worker.celery_app import PRReviewLifecycleContext, execute_pr_review_lifecycle
+
+    settings = Settings(_env_file=None)
+    async_client = redis_async.Redis.from_url(Settings().redis_url, decode_responses=True)
+    repo_id = f"lifecycle-repo-{uuid.uuid4().hex[:8]}"
+    pr_num = 99
+    lock = AsyncSupersedeLock(async_client)
+    fake_loader = AsyncMock()
+    fake_loader.load.return_value = RepoConfig(min_debt_score=80, review_action="REQUEST_CHANGES")
+
+    observed_workspaces: list[Path] = []
+    publish_calls: list[str] = []
+
+    try:
+        await lock.claim_active_sha(repo_id, pr_num, "sha-1")
+        bind_trace_id("trace-lifecycle-1")
+
+        async def _review_then_supersede(ctx: PRReviewLifecycleContext) -> None:
+            assert ctx.workspace_dir.exists()
+            assert ctx.repo_config.min_debt_score == 80
+            (ctx.workspace_dir / "scratch.diff").write_text("diff", encoding="utf-8")
+            observed_workspaces.append(ctx.workspace_dir)
+            # Developer pushes SHA_2 while SHA_1 is midway through review!
+            await lock.claim_active_sha(repo_id, pr_num, "sha-2")
+
+        async def _publish(ctx: PRReviewLifecycleContext) -> None:
+            publish_calls.append(str(ctx.payload["head_sha"]))
+
+        res_stale = await execute_pr_review_lifecycle(
+            {
+                "repo_id": repo_id,
+                "repo_full_name": "org/demo",
+                "default_branch": "main",
+                "pr_number": pr_num,
+                "head_sha": "sha-1",
+            },
+            settings=settings,
+            supersede_lock=lock,
+            config_loader=fake_loader,
+            review_fn=_review_then_supersede,
+            publish_fn=_publish,
+        )
+        assert res_stale == {"status": "superseded", "trace_id": "trace-lifecycle-1"}
+        assert publish_calls == []
+        assert len(observed_workspaces) == 1 and not observed_workspaces[0].exists()
+
+        # Active SHA_2 completes review + publish and still wipes workspace
+        async def _review_active(ctx: PRReviewLifecycleContext) -> None:
+            observed_workspaces.append(ctx.workspace_dir)
+
+        res_ok = await execute_pr_review_lifecycle(
+            {
+                "repo_id": repo_id,
+                "repo_full_name": "org/demo",
+                "default_branch": "main",
+                "pr_number": pr_num,
+                "head_sha": "sha-2",
+            },
+            settings=settings,
+            supersede_lock=lock,
+            config_loader=fake_loader,
+            review_fn=_review_active,
+            publish_fn=_publish,
+        )
+        assert res_ok == {"status": "accepted", "trace_id": "trace-lifecycle-1"}
+        assert publish_calls == ["sha-2"]
+        assert not observed_workspaces[1].exists()
+
+        # Entry supersede check (check_entry_supersede=True, owned Redis auto-created)
+        res_entry_stale = await execute_pr_review_lifecycle(
+            {
+                "repo_id": repo_id,
+                "repo_full_name": "org/demo",
+                "default_branch": "main",
+                "pr_number": pr_num,
+                "head_sha": "sha-1",
+            },
+            settings=Settings(),
+            check_entry_supersede=True,
+        )
+        assert res_entry_stale["status"] == "superseded"
+    finally:
+        clear_trace_context()
+        await async_client.delete(
+            pr_active_sha_key(repo_id, pr_num),
+            pr_active_task_key(repo_id, pr_num),
+        )
+        await async_client.aclose()

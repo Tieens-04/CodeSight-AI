@@ -1,5 +1,19 @@
-"""Celery asynchronous task worker and Cancel-on-Supersede lock."""
+"""Celery asynchronous task worker, retry policy, and Cancel-on-Supersede lock."""
 
+from codesight.worker.celery_app import (
+    MAX_TASK_RETRIES,
+    RETRY_BASE_SECONDS,
+    RETRY_CAP_SECONDS,
+    CodeSightTask,
+    PRReviewLifecycleContext,
+    classify_retryable_exception,
+    compute_retry_countdown,
+    create_celery_app,
+    execute_pr_review_lifecycle,
+    handle_pr_event,
+    handle_push_event,
+    ping,
+)
 from codesight.worker.supersede_lock import (
     PR_SUPERSEDE_TTL_SECONDS,
     PR_SYNCHRONIZE_DEBOUNCE_SECONDS,
@@ -13,13 +27,25 @@ from codesight.worker.supersede_lock import (
 )
 
 __all__ = [
+    "MAX_TASK_RETRIES",
     "PR_SUPERSEDE_TTL_SECONDS",
     "PR_SYNCHRONIZE_DEBOUNCE_SECONDS",
+    "RETRY_BASE_SECONDS",
+    "RETRY_CAP_SECONDS",
     "AsyncSupersedeLock",
+    "CodeSightTask",
+    "PRReviewLifecycleContext",
     "PRSupersededError",
     "SupersedeClaim",
     "SyncSupersedeLock",
+    "classify_retryable_exception",
+    "compute_retry_countdown",
+    "create_celery_app",
+    "execute_pr_review_lifecycle",
+    "handle_pr_event",
+    "handle_push_event",
     "is_pr_event_superseded",
+    "ping",
     "pr_active_sha_key",
     "pr_active_task_key",
 ]
