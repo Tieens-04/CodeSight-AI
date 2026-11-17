@@ -197,10 +197,26 @@ async def test_execute_pr_review_lifecycle_blocks_stale_publish_and_cleans_works
                 "pr_number": pr_num,
                 "head_sha": "sha-1",
             },
-            settings=Settings(),
+            settings=Settings(_env_file=None),
             check_entry_supersede=True,
         )
         assert res_entry_stale["status"] == "superseded"
+
+        # Incomplete stub payload does not call live GitHub even when GITHUB_TOKEN is configured
+        from pydantic import SecretStr
+
+        from codesight.worker.celery_app import handle_pr_event
+
+        stub_settings = Settings(_env_file=None, github_token=SecretStr("ghp_offline_unit_stub"))
+        res_stub = await execute_pr_review_lifecycle(
+            {"repo_full_name": "org/unconfigured-stub", "pr_number": 5},
+            settings=stub_settings,
+            check_entry_supersede=False,
+        )
+        assert res_stub["status"] == "accepted"
+        assert handle_pr_event({"repo_full_name": "org/unconfigured-stub", "pr_number": 5})[
+            "status"
+        ] == "accepted"
     finally:
         clear_trace_context()
         await async_client.delete(

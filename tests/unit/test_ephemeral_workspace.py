@@ -93,6 +93,32 @@ async def test_async_ephemeral_workspace_and_path_traversal_guards(tmp_path: Pat
     assert not ws.exists()
 
 
+def test_rmtree_onexc_grants_dir_exec_bit_and_skips_chmod_on_symlinks(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    from codesight.core.ephemeral import _on_rmtree_error
+
+    ro_dir = tmp_path / "ro_subdir"
+    ro_dir.mkdir()
+    chmod_calls: list[tuple[str, int]] = []
+    retry_fn = MagicMock()
+
+    with patch(
+        "codesight.core.ephemeral.os.chmod",
+        side_effect=lambda p, m: chmod_calls.append((str(p), m)),
+    ):
+        _on_rmtree_error(retry_fn, str(ro_dir), PermissionError("denied"))
+        assert chmod_calls == [(str(ro_dir), stat.S_IRWXU)]
+        retry_fn.assert_called_once_with(str(ro_dir))
+
+        chmod_calls.clear()
+        retry_fn.reset_mock()
+        with patch("codesight.core.ephemeral.os.path.islink", return_value=True):
+            _on_rmtree_error(retry_fn, str(tmp_path / "sym"), PermissionError("denied"))
+        assert chmod_calls == []
+        retry_fn.assert_called_once_with(str(tmp_path / "sym"))
+
+
 def test_parse_retry_after_clamps_delta_http_date_and_ratelimit_reset() -> None:
     assert parse_retry_after_header({"Retry-After": "12"}) == 12.0
     assert parse_retry_after_header({"retry-after": "999"}) == 60.0

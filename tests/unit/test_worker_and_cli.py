@@ -123,6 +123,23 @@ def test_celery_reliability_settings_retry_classification_and_jitter() -> None:
         httpx.HTTPStatusError("429", request=req, response=resp_429)
     ) == (True, 11.0)
 
+    resp_403_rl = httpx.Response(403, headers={"Retry-After": "22"}, request=req)
+    cause_403_rl = httpx.HTTPStatusError("403 rl", request=req, response=resp_403_rl)
+    assert classify_retryable_exception(cause_403_rl) == (True, 22.0)
+
+    gh_429_exc = GitHubAuthError("429 auth", status_code=429)
+    gh_429_exc.__cause__ = httpx.HTTPStatusError("429", request=req, response=resp_429)
+    assert classify_retryable_exception(gh_429_exc) == (True, 11.0)
+
+    gh_403_rl_exc = GitHubAuthError("403 auth rl", status_code=403)
+    gh_403_rl_exc.__cause__ = cause_403_rl
+    assert classify_retryable_exception(gh_403_rl_exc) == (True, 22.0)
+
+    resp_403_plain = httpx.Response(403, request=req)
+    gh_403_plain = GitHubAuthError("403 forbidden", status_code=403)
+    gh_403_plain.__cause__ = httpx.HTTPStatusError("403", request=req, response=resp_403_plain)
+    assert classify_retryable_exception(gh_403_plain) == (False, None)
+
     resp_422 = httpx.Response(422, request=req)
     assert classify_retryable_exception(
         httpx.HTTPStatusError("422", request=req, response=resp_422)
@@ -222,3 +239,25 @@ def test_codesight_task_retries_transient_errors_and_aborts_retry_when_supersede
         clear_trace_context()
     assert res == {"status": "superseded", "trace_id": "superseded-retry-trace"}
     retry_mock.assert_not_called()
+
+    # 5. Bound task preserves self.request (id, retries, called_directly=False) during run()
+    def _bound_fn(self: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": self.request.id,
+            "retries": self.request.retries,
+            "called_directly": self.request.called_directly,
+            "ok": payload["ok"],
+        }
+
+    bound_task: Any = local_app.task(name="codesight.test.bound_task", bind=True)(_bound_fn)
+    bound_task.push_request(id="live-worker-id-99", retries=2, called_directly=False)
+    try:
+        bound_res = bound_task({"ok": True})
+    finally:
+        bound_task.pop_request()
+    assert bound_res == {
+        "id": "live-worker-id-99",
+        "retries": 2,
+        "called_directly": False,
+        "ok": True,
+    }

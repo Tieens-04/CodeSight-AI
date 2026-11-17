@@ -118,6 +118,18 @@ def is_pr_event_superseded(
     )
 
 
+def _classify_http_status_response(resp: httpx.Response) -> tuple[bool, float | None]:
+    code = resp.status_code
+    is_rl_403 = code == 403 and bool(
+        resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-remaining") == "0"
+    )
+    if code == 429 or is_rl_403:
+        return True, parse_retry_after_header(resp.headers)
+    if 500 <= code < 600:
+        return True, None
+    return False, None
+
+
 def classify_retryable_exception(exc: BaseException) -> tuple[bool, float | None]:
     """Return (is_retryable, optional_retry_after_seconds) for worker exception triage."""
     if isinstance(exc, (PRSupersededError, GitHubAuthConfigError)):
@@ -127,23 +139,17 @@ def classify_retryable_exception(exc: BaseException) -> tuple[bool, float | None
     if isinstance(exc, RetryableTaskError):
         return True, None
     if isinstance(exc, GitHubAuthError):
+        cause = exc.__cause__
+        if isinstance(cause, httpx.HTTPStatusError):
+            return _classify_http_status_response(cause.response)
         code = exc.status_code
         if code == 429 or (code is not None and 500 <= code < 600):
             return True, None
-        if code is None and isinstance(exc.__cause__, httpx.RequestError):
+        if code is None and isinstance(cause, httpx.RequestError):
             return True, None
         return False, None
     if isinstance(exc, httpx.HTTPStatusError):
-        resp = exc.response
-        code = resp.status_code
-        is_rl_403 = code == 403 and bool(
-            resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-remaining") == "0"
-        )
-        if code == 429 or is_rl_403:
-            return True, parse_retry_after_header(resp.headers)
-        if 500 <= code < 600:
-            return True, None
-        return False, None
+        return _classify_http_status_response(exc.response)
     if isinstance(
         exc,
         (
@@ -183,6 +189,8 @@ class CodeSightTask(Task):  # type: ignore[misc]
             getattr(req, "id", None)
         )
         try:
+            if is_worker_delivery:
+                return self.run(*args, **kwargs)
             return super().__call__(*args, **kwargs)
         except Exception as exc:
             if not is_worker_delivery:
@@ -201,8 +209,8 @@ class CodeSightTask(Task):  # type: ignore[misc]
                 )
                 raise
 
-            first_arg = args[0] if args else None
-            if isinstance(first_arg, Mapping) and is_pr_event_superseded(first_arg):
+            payload_arg = args[0] if args else kwargs.get("payload")
+            if isinstance(payload_arg, Mapping) and is_pr_event_superseded(payload_arg):
                 trace_id = get_trace_id() or "-"
                 logger.info(
                     "worker_pr_retry_aborted_superseded",
@@ -390,7 +398,8 @@ async def execute_pr_review_lifecycle(
                     installation_id=inst_id,
                 )
             elif (
-                isinstance(repo_full_name, str)
+                coords is not None
+                and isinstance(repo_full_name, str)
                 and repo_full_name
                 and _has_github_credentials(active_settings)
             ):

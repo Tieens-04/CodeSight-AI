@@ -28,7 +28,9 @@ def _create_workspace_dir(base_dir: Path | str | None, prefix: str) -> Path:
 
 
 def _on_rmtree_error(func: Callable[..., Any], target_path: str, _exc: BaseException) -> None:
-    os.chmod(target_path, stat.S_IWRITE | stat.S_IREAD)
+    if not os.path.islink(target_path):
+        mode = stat.S_IRWXU if os.path.isdir(target_path) else (stat.S_IWRITE | stat.S_IREAD)
+        os.chmod(target_path, mode)
     func(target_path)
 
 
