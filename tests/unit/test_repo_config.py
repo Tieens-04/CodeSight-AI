@@ -251,3 +251,28 @@ def test_example_codesight_yaml_parses_cleanly() -> None:
     example_bytes = Path(".codesight.example.yaml").read_bytes()
     parsed = parse_repo_config_yaml(example_bytes, source=".codesight.example.yaml")
     assert 0 <= parsed.min_debt_score <= 100
+
+
+@pytest.mark.parametrize("bad_glob", ["[z-a].py", "/", "./"])
+def test_invalid_glob_syntax_in_ignore_paths_rejected_and_salvages_siblings(
+    bad_glob: str,
+) -> None:
+    with pytest.raises(ValueError):
+        RepoConfig(ignore_paths=(bad_glob,))
+
+    stream = io.StringIO()
+    configure_logging(level="WARNING", service_name="test-repo-config-glob", stream=stream)
+    cfg = parse_repo_config_yaml(
+        f"min_debt_score: 75\nignore_paths:\n  - '{bad_glob}'\n",
+        source=".codesight.yaml",
+    )
+    assert cfg.min_debt_score == 75
+    assert cfg.ignore_paths == ()
+    raw_logs = stream.getvalue()
+    assert bad_glob not in raw_logs
+    logs = [json.loads(line) for line in raw_logs.splitlines() if line.strip()]
+    assert any(
+        entry["event"] == "repo_config_invalid_fallback"
+        and entry["invalid_fields"] == ["ignore_paths"]
+        for entry in logs
+    )

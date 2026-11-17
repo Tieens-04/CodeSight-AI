@@ -21,6 +21,7 @@ from codesight.core.errors import (
     RetryableTaskError,
     parse_retry_after_header,
 )
+from codesight.diff.file_filter import compile_posix_glob
 from codesight.vcs.github_auth import (
     GitHubAuthError,
     GitHubAuthProvider,
@@ -82,6 +83,7 @@ class RepoConfig(BaseModel):
                 raise ValueError(
                     f"Each ignore_paths entry must be 1..{MAX_IGNORE_PATTERN_CHARS} characters."
                 )
+            compile_posix_glob(normalized)
             cleaned_patterns.append(normalized)
         return tuple(cleaned_patterns)
 
@@ -92,9 +94,7 @@ class RepoConfig(BaseModel):
             raise ValueError("custom_rules must be a UTF-8 string without NUL bytes.")
         cleaned = value.strip()
         if len(cleaned) > MAX_CUSTOM_RULES_CHARS:
-            raise ValueError(
-                f"custom_rules must not exceed {MAX_CUSTOM_RULES_CHARS} characters."
-            )
+            raise ValueError(f"custom_rules must not exceed {MAX_CUSTOM_RULES_CHARS} characters.")
         return cleaned
 
     @property
@@ -159,9 +159,7 @@ def parse_repo_config_yaml(
     try:
         return RepoConfig.model_validate(parsed)
     except ValidationError as exc:
-        invalid_fields = sorted(
-            {str(err["loc"][0]) for err in exc.errors() if err.get("loc")}
-        )
+        invalid_fields = sorted({str(err["loc"][0]) for err in exc.errors() if err.get("loc")})
         logger.warning(
             "repo_config_invalid_fallback",
             source=source,
@@ -176,10 +174,7 @@ def parse_repo_config_yaml(
 
 
 def _is_rate_limited_403(headers: httpx.Headers) -> bool:
-    return bool(
-        headers.get("retry-after")
-        or headers.get("x-ratelimit-remaining") == "0"
-    )
+    return bool(headers.get("retry-after") or headers.get("x-ratelimit-remaining") == "0")
 
 
 class RepoConfigLoader:
