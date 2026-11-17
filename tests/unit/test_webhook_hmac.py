@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import io
 import json
 import statistics
-import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -726,13 +726,25 @@ async def test_webhook_rejects_bool_ints_invalid_slugs_oversize_strings_and_hand
         await engine.dispose()
 
 
-def _is_coverage_or_trace_active() -> bool:
-    if sys.gettrace() is not None:
-        return True
-    cov_mod = sys.modules.get("coverage")
-    cov_cls = getattr(cov_mod, "Coverage", None) if cov_mod is not None else None
-    current_fn = getattr(cov_cls, "current", None)
-    return bool(callable(current_fn) and current_fn() is not None)
+@contextlib.contextmanager
+def _pause_coverage_tracer() -> Iterator[None]:
+    """Pause coverage.py tracing strictly during the timed SLA loop after warmups."""
+    try:
+        import coverage
+    except ImportError:
+        yield
+        return
+
+    active_cov = coverage.Coverage.current()
+    if active_cov is None:
+        yield
+        return
+
+    active_cov.stop()
+    try:
+        yield
+    finally:
+        active_cov.start()
 
 
 @pytest.mark.integration
@@ -797,36 +809,34 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
                 assert warm_resp.status_code == 202
 
             latencies_ms: list[float] = []
-            for idx in range(50):
-                # Every 5th request updates an existing PR to exercise real Redis supersede + revoke
-                pr_num = 1 if idx % 5 == 0 else idx + 2
-                raw = json.dumps(
-                    _pr_payload(
-                        action="synchronize",
-                        pr_number=pr_num,
-                        head_sha=f"benchsha{idx:04d}",
+            with _pause_coverage_tracer():
+                for idx in range(50):
+                    # Every 5th request updates an existing PR to exercise real supersede + revoke
+                    pr_num = 1 if idx % 5 == 0 else idx + 2
+                    raw = json.dumps(
+                        _pr_payload(
+                            action="synchronize",
+                            pr_number=pr_num,
+                            head_sha=f"benchsha{idx:04d}",
+                        )
+                    ).encode("utf-8")
+                    t0 = time.perf_counter()
+                    resp = await client.post(
+                        "/api/v1/webhooks/github",
+                        content=raw,
+                        headers={
+                            "X-GitHub-Event": "pull_request",
+                            "X-GitHub-Delivery": f"bench-deliv-{idx}",
+                            "X-Hub-Signature-256": _sign_body(raw),
+                        },
                     )
-                ).encode("utf-8")
-                t0 = time.perf_counter()
-                resp = await client.post(
-                    "/api/v1/webhooks/github",
-                    content=raw,
-                    headers={
-                        "X-GitHub-Event": "pull_request",
-                        "X-GitHub-Delivery": f"bench-deliv-{idx}",
-                        "X-Hub-Signature-256": _sign_body(raw),
-                    },
-                )
-                latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-                assert resp.status_code == 202
+                    latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+                    assert resp.status_code == 202
 
         mean_ms = statistics.fmean(latencies_ms)
         median_ms = statistics.median(latencies_ms)
-        mean_budget_ms = 150.0 if _is_coverage_or_trace_active() else 100.0
         assert median_ms < 100.0, f"Median webhook latency {median_ms:.2f}ms exceeded 100ms SLA"
-        assert mean_ms < mean_budget_ms, (
-            f"Mean webhook latency {mean_ms:.2f}ms exceeded {mean_budget_ms:.0f}ms budget"
-        )
+        assert mean_ms < 100.0, f"Mean webhook latency {mean_ms:.2f}ms exceeded 100ms SLA"
     finally:
         configure_logging(level=base_settings.log_level)
         try:
