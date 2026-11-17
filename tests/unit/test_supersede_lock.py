@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import uuid
 
 import pytest
@@ -107,6 +108,51 @@ async def test_live_redis_lua_cas_claim_rollback_and_superseded_detection() -> N
         )
         assert await async_client.get(pr_active_sha_key(repo_id, oo_pr)) == "sha-2"
         assert await async_client.get(pr_active_ts_key(repo_id, oo_pr)) == "2000000"
+
+        # 5. Lua + non-Lua Set fallback interoperability on the same live Redis keys (no WRONGTYPE)
+        class _NoEvalProxy:
+            def __init__(self, inner: redis_async.Redis) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> object:
+                if name == "eval":
+                    raise AttributeError("eval disabled")
+                return getattr(self._inner, name)
+
+        fallback_lock = AsyncSupersedeLock(_NoEvalProxy(async_client))  # type: ignore[arg-type]
+        c_lua_3 = await lock.claim_active_sha(
+            repo_id, oo_pr, "sha-3", before_sha="sha-2", event_ts_ms=3_000_000
+        )
+        assert c_lua_3.claimed is True and c_lua_3.stale is False
+        assert await async_client.type(pr_active_ancestors_key(repo_id, oo_pr)) == "set"
+
+        # Non-Lua fallback detects sha-2 in Redis Set written by Lua without WRONGTYPE
+        c_fb_stale = await fallback_lock.claim_active_sha(
+            repo_id, oo_pr, "sha-2", before_sha="sha-1", event_ts_ms=4_000_000
+        )
+        assert c_fb_stale.claimed is False and c_fb_stale.stale is True
+
+        # Non-Lua fallback advances to sha-4 and Lua path sees sha-3 in the shared Set
+        c_fb_4 = await fallback_lock.claim_active_sha(
+            repo_id, oo_pr, "sha-4", before_sha="sha-3", event_ts_ms=5_000_000
+        )
+        assert c_fb_4.claimed is True and c_fb_4.stale is False
+        assert await async_client.type(pr_active_ancestors_key(repo_id, oo_pr)) == "set"
+
+        c_lua_stale = await lock.claim_active_sha(
+            repo_id, oo_pr, "sha-3", before_sha="sha-2", event_ts_ms=6_000_000
+        )
+        assert c_lua_stale.claimed is False and c_lua_stale.stale is True
+
+        await fallback_lock.rollback_active_sha(
+            repo_id,
+            oo_pr,
+            attempted_sha="sha-4",
+            prev_sha=c_fb_4.prev_sha,
+            before_sha="sha-3",
+            prev_ts_ms=c_fb_4.prev_ts_ms,
+        )
+        assert await async_client.get(pr_active_sha_key(repo_id, oo_pr)) == "sha-3"
     finally:
         await async_client.delete(
             pr_active_sha_key(repo_id, pr_num),
@@ -287,17 +333,78 @@ async def test_offline_out_of_order_guard_and_worker_pre_publish_lock_creation(
     class _OfflineAsyncRedis:
         def __init__(self) -> None:
             self.store: dict[str, str] = {}
+            self.sets: dict[str, set[str]] = {}
             self.closed = False
 
+        @staticmethod
+        def _wrongtype() -> redis.exceptions.ResponseError:
+            return redis.exceptions.ResponseError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+
         async def get(self, key: str) -> str | None:
+            if key in self.sets:
+                raise self._wrongtype()
             return self.store.get(key)
 
         async def set(self, key: str, value: str, *, ex: int | None = None) -> bool:
+            if key in self.sets:
+                raise self._wrongtype()
             self.store[key] = value
             return True
 
-        async def delete(self, key: str) -> int:
-            return 1 if self.store.pop(key, None) is not None else 0
+        async def sismember(self, key: str, member: str) -> int:
+            if key in self.store:
+                raise self._wrongtype()
+            return 1 if member in self.sets.get(key, set()) else 0
+
+        async def sadd(self, key: str, *members: str) -> int:
+            if key in self.store:
+                raise self._wrongtype()
+            bucket = self.sets.setdefault(key, set())
+            added = 0
+            for member in members:
+                if member not in bucket:
+                    bucket.add(member)
+                    added += 1
+            return added
+
+        async def srem(self, key: str, *members: str) -> int:
+            if key in self.store:
+                raise self._wrongtype()
+            bucket = self.sets.get(key)
+            if not bucket:
+                return 0
+            removed = 0
+            for member in members:
+                if member in bucket:
+                    bucket.remove(member)
+                    removed += 1
+            if not bucket:
+                self.sets.pop(key, None)
+            return removed
+
+        async def scard(self, key: str) -> int:
+            if key in self.store:
+                raise self._wrongtype()
+            return len(self.sets.get(key, set()))
+
+        async def smembers(self, key: str) -> builtins.set[str]:
+            if key in self.store:
+                raise self._wrongtype()
+            return set(self.sets.get(key, set()))
+
+        async def expire(self, key: str, seconds: int) -> bool:
+            return key in self.store or key in self.sets
+
+        async def delete(self, *keys: str) -> int:
+            removed = 0
+            for key in keys:
+                if self.store.pop(key, None) is not None:
+                    removed += 1
+                if self.sets.pop(key, None) is not None:
+                    removed += 1
+            return removed
 
         async def aclose(self) -> None:
             self.closed = True

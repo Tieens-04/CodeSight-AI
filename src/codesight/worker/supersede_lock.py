@@ -227,13 +227,14 @@ class AsyncSupersedeLock:
             prev_ts_ms = None
             if track_causal:
                 prev_ts_ms = _parse_int_str(await self._client.get(ts_key))
-                raw_anc = _decode_redis_str(await self._client.get(ancestors_key))
-                ancestors = {s for s in raw_anc.split("|") if s} if raw_anc else set()
                 is_direct_successor = bool(
                     prev_sha and clean_before and clean_before == prev_sha
                 )
                 if prev_sha and prev_sha != head_sha and not is_direct_successor:
-                    if head_sha in ancestors or (
+                    is_known_ancestor = bool(
+                        await self._client.sismember(ancestors_key, head_sha)
+                    )
+                    if is_known_ancestor or (
                         norm_ts > 0 and prev_ts_ms is not None and norm_ts < prev_ts_ms
                     ):
                         return SupersedeClaim(
@@ -243,18 +244,13 @@ class AsyncSupersedeLock:
                             stale=True,
                             prev_ts_ms=prev_ts_ms,
                         )
-                ancestors.discard(head_sha)
-                if clean_before and clean_before != head_sha:
-                    ancestors.add(clean_before)
                 await self._client.set(sha_key, head_sha, ex=ttl_seconds)
-                if ancestors:
-                    await self._client.set(
-                        ancestors_key,
-                        "|".join(sorted(ancestors)),
-                        ex=ttl_seconds,
-                    )
-                elif raw_anc is not None:
-                    await self._client.delete(ancestors_key)
+                await self._client.srem(ancestors_key, head_sha)
+                if clean_before and clean_before != head_sha:
+                    await self._client.sadd(ancestors_key, clean_before)
+                    await self._client.expire(ancestors_key, ttl_seconds)
+                elif int(await self._client.scard(ancestors_key)) > 0:
+                    await self._client.expire(ancestors_key, ttl_seconds)
                 if norm_ts > 0:
                     next_ts = norm_ts
                     if (
@@ -321,18 +317,9 @@ class AsyncSupersedeLock:
                 else:
                     await self._client.delete(sha_key)
                 if clean_before:
-                    raw_anc = _decode_redis_str(await self._client.get(ancestors_key))
-                    if raw_anc:
-                        ancestors = {s for s in raw_anc.split("|") if s}
-                        ancestors.discard(clean_before)
-                        if ancestors:
-                            await self._client.set(
-                                ancestors_key,
-                                "|".join(sorted(ancestors)),
-                                ex=ttl_seconds,
-                            )
-                        else:
-                            await self._client.delete(ancestors_key)
+                    await self._client.srem(ancestors_key, clean_before)
+                    if int(await self._client.scard(ancestors_key)) > 0:
+                        await self._client.expire(ancestors_key, ttl_seconds)
                 if ts_arg:
                     await self._client.set(ts_key, ts_arg, ex=ttl_seconds)
                 else:
