@@ -105,6 +105,7 @@ class CeleryWebhookDispatcher:
     ) -> None:
         self._app = app
         self._redis_client = redis_client
+        self._lock = AsyncSupersedeLock(redis_client) if redis_client is not None else None
 
     async def _publish_task(
         self,
@@ -134,7 +135,7 @@ class CeleryWebhookDispatcher:
     async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
         target = self._app if self._app is not None else celery_app
         countdown = PR_SYNCHRONIZE_DEBOUNCE_SECONDS if payload.action == "synchronize" else 0
-        lock = AsyncSupersedeLock(self._redis_client) if self._redis_client is not None else None
+        lock = self._lock
         claim = (
             await lock.claim_active_sha(
                 payload.repo_id,
@@ -172,7 +173,8 @@ class CeleryWebhookDispatcher:
                     attempted_sha=payload.head_sha,
                     prev_sha=claim.prev_sha,
                     ttl_seconds=PR_SUPERSEDE_TTL_SECONDS,
-                    before_sha=payload.before_sha,
+                    added_ancestor=claim.added_ancestor,
+                    removed_ancestor=claim.removed_ancestor,
                     prev_ts_ms=claim.prev_ts_ms,
                 )
             raise

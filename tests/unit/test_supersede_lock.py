@@ -96,6 +96,8 @@ async def test_live_redis_lua_cas_claim_rollback_and_superseded_detection() -> N
             repo_id, oo_pr, "sha-1", before_sha="sha-2", event_ts_ms=3_000_000
         )
         assert c_revert.claimed is True and c_revert.stale is False
+        assert c_revert.added_ancestor == "sha-2"
+        assert c_revert.removed_ancestor == "sha-1"
         assert await async_client.get(pr_active_sha_key(repo_id, oo_pr)) == "sha-1"
 
         await lock.rollback_active_sha(
@@ -103,11 +105,38 @@ async def test_live_redis_lua_cas_claim_rollback_and_superseded_detection() -> N
             oo_pr,
             attempted_sha="sha-1",
             prev_sha=c_revert.prev_sha,
-            before_sha="sha-2",
+            added_ancestor=c_revert.added_ancestor,
+            removed_ancestor=c_revert.removed_ancestor,
             prev_ts_ms=c_revert.prev_ts_ms,
         )
         assert await async_client.get(pr_active_sha_key(repo_id, oo_pr)) == "sha-2"
         assert await async_client.get(pr_active_ts_key(repo_id, oo_pr)) == "2000000"
+        assert bool(await async_client.sismember(pr_active_ancestors_key(repo_id, oo_pr), "sha-1"))
+        assert not bool(
+            await async_client.sismember(pr_active_ancestors_key(repo_id, oo_pr), "sha-2")
+        )
+        # Reverted-then-rolled-back sha-1 remains rejected as stale when arriving out of order
+        c_oo1_after_rb = await lock.claim_active_sha(
+            repo_id, oo_pr, "sha-1", before_sha="sha-0", event_ts_ms=1_500_000
+        )
+        assert c_oo1_after_rb.claimed is False and c_oo1_after_rb.stale is True
+
+        # Pre-existing ancestor in pr_active_ancestors is preserved on rollback
+        await async_client.sadd(pr_active_ancestors_key(repo_id, oo_pr), "sha-0")
+        c_dup_anc = await lock.claim_active_sha(
+            repo_id, oo_pr, "sha-2b", before_sha="sha-0", event_ts_ms=2_500_000
+        )
+        assert c_dup_anc.claimed is True and c_dup_anc.added_ancestor is None
+        await lock.rollback_active_sha(
+            repo_id,
+            oo_pr,
+            attempted_sha="sha-2b",
+            prev_sha=c_dup_anc.prev_sha,
+            added_ancestor=c_dup_anc.added_ancestor,
+            removed_ancestor=c_dup_anc.removed_ancestor,
+            prev_ts_ms=c_dup_anc.prev_ts_ms,
+        )
+        assert bool(await async_client.sismember(pr_active_ancestors_key(repo_id, oo_pr), "sha-0"))
 
         # 5. Lua + non-Lua Set fallback interoperability on the same live Redis keys (no WRONGTYPE)
         class _NoEvalProxy:
@@ -149,7 +178,8 @@ async def test_live_redis_lua_cas_claim_rollback_and_superseded_detection() -> N
             oo_pr,
             attempted_sha="sha-4",
             prev_sha=c_fb_4.prev_sha,
-            before_sha="sha-3",
+            added_ancestor=c_fb_4.added_ancestor,
+            removed_ancestor=c_fb_4.removed_ancestor,
             prev_ts_ms=c_fb_4.prev_ts_ms,
         )
         assert await async_client.get(pr_active_sha_key(repo_id, oo_pr)) == "sha-3"
@@ -503,6 +533,39 @@ async def test_offline_out_of_order_guard_and_worker_pre_publish_lock_creation(
     )
     assert t_revert == "task-2"
     assert revoked_tasks == ["task-1"]
+
+    # Offline fallback rollback restores removed revert ancestor and preserves pre-existing ones
+    fb_lock = AsyncSupersedeLock(mem_redis)  # type: ignore[arg-type]
+    c_fb_dup = await fb_lock.claim_active_sha(
+        "repo-oo", 8, "sha-2c", before_sha="sha-2", event_ts_ms=4_000_000
+    )
+    assert c_fb_dup.claimed is True and c_fb_dup.added_ancestor is None
+    await fb_lock.rollback_active_sha(
+        "repo-oo",
+        8,
+        attempted_sha="sha-2c",
+        prev_sha=c_fb_dup.prev_sha,
+        added_ancestor=c_fb_dup.added_ancestor,
+        removed_ancestor=c_fb_dup.removed_ancestor,
+        prev_ts_ms=c_fb_dup.prev_ts_ms,
+    )
+    assert "sha-2" in mem_redis.sets[pr_active_ancestors_key("repo-oo", 8)]
+
+    c_fb_rev = await fb_lock.claim_active_sha(
+        "repo-oo", 8, "sha-2", before_sha="sha-1", event_ts_ms=5_000_000
+    )
+    assert c_fb_rev.added_ancestor == "sha-1" and c_fb_rev.removed_ancestor == "sha-2"
+    await fb_lock.rollback_active_sha(
+        "repo-oo",
+        8,
+        attempted_sha="sha-2",
+        prev_sha=c_fb_rev.prev_sha,
+        added_ancestor=c_fb_rev.added_ancestor,
+        removed_ancestor=c_fb_rev.removed_ancestor,
+        prev_ts_ms=c_fb_rev.prev_ts_ms,
+    )
+    assert "sha-2" in mem_redis.sets[pr_active_ancestors_key("repo-oo", 8)]
+    assert "sha-1" not in mem_redis.sets[pr_active_ancestors_key("repo-oo", 8)]
 
     # 3. Worker spine creates AsyncSupersedeLock even without publish_fn / entry check
     worker_redis = _OfflineAsyncRedis()

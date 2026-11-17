@@ -28,17 +28,25 @@ local is_direct_successor = (p_sha and p_sha ~= '' and before_sha ~= '' and befo
 
 if p_sha and p_sha ~= '' and p_sha ~= head_sha and not is_direct_successor then
     if redis.call('SISMEMBER', KEYS[3], head_sha) == 1 then
-        return {p_sha, p_task or '', '0', tostring(p_ts)}
+        return {p_sha, p_task or '', '0', tostring(p_ts), '', ''}
     end
     if event_ts > 0 and p_ts > 0 and event_ts < p_ts then
-        return {p_sha, p_task or '', '0', tostring(p_ts)}
+        return {p_sha, p_task or '', '0', tostring(p_ts), '', ''}
     end
 end
 
 redis.call('SET', KEYS[1], head_sha, 'EX', ttl)
-redis.call('SREM', KEYS[3], head_sha)
+local removed_anc = ''
+if redis.call('SREM', KEYS[3], head_sha) == 1 then
+    removed_anc = head_sha
+end
+local added_anc = ''
 if before_sha ~= '' and before_sha ~= head_sha then
-    redis.call('SADD', KEYS[3], before_sha)
+    if redis.call('SADD', KEYS[3], before_sha) == 1 then
+        added_anc = before_sha
+    end
+    redis.call('EXPIRE', KEYS[3], ttl)
+elseif redis.call('SCARD', KEYS[3]) > 0 then
     redis.call('EXPIRE', KEYS[3], ttl)
 end
 if event_ts > 0 then
@@ -48,7 +56,7 @@ if event_ts > 0 then
     end
     redis.call('SET', KEYS[4], tostring(next_ts), 'EX', ttl)
 end
-return {p_sha or '', p_task or '', '1', tostring(p_ts)}
+return {p_sha or '', p_task or '', '1', tostring(p_ts), added_anc, removed_anc}
 """
 
 _ROLLBACK_LUA: Final[str] = """
@@ -63,7 +71,13 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
         redis.call('SREM', KEYS[2], ARGV[4])
     end
     if ARGV[5] ~= '' then
-        redis.call('SET', KEYS[3], ARGV[5], 'EX', ttl)
+        redis.call('SADD', KEYS[2], ARGV[5])
+    end
+    if redis.call('SCARD', KEYS[2]) > 0 then
+        redis.call('EXPIRE', KEYS[2], ttl)
+    end
+    if ARGV[6] ~= '' then
+        redis.call('SET', KEYS[3], ARGV[6], 'EX', ttl)
     else
         redis.call('DEL', KEYS[3])
     end
@@ -154,6 +168,8 @@ class SupersedeClaim:
     claimed: bool
     stale: bool = False
     prev_ts_ms: int | None = None
+    added_ancestor: str | None = None
+    removed_ancestor: str | None = None
 
 
 class AsyncSupersedeLock:
@@ -212,6 +228,8 @@ class AsyncSupersedeLock:
                 prev_task = _decode_redis_str(items[1]) if len(items) > 1 else None
                 claimed_flag = _decode_redis_str(items[2]) if len(items) > 2 else "1"
                 prev_ts_ms = _parse_int_str(items[3]) if len(items) > 3 else None
+                added_ancestor = _decode_redis_str(items[4]) if len(items) > 4 else None
+                removed_ancestor = _decode_redis_str(items[5]) if len(items) > 5 else None
                 is_stale = claimed_flag == "0"
                 return SupersedeClaim(
                     prev_sha=prev_sha,
@@ -219,12 +237,16 @@ class AsyncSupersedeLock:
                     claimed=not is_stale,
                     stale=is_stale,
                     prev_ts_ms=prev_ts_ms,
+                    added_ancestor=added_ancestor,
+                    removed_ancestor=removed_ancestor,
                 )
 
             prev_sha = _decode_redis_str(await self._client.get(sha_key))
             prev_task = _decode_redis_str(await self._client.get(task_key))
             track_causal = bool(clean_before) or norm_ts > 0
             prev_ts_ms = None
+            added_ancestor = None
+            removed_ancestor = None
             if track_causal:
                 prev_ts_ms = _parse_int_str(await self._client.get(ts_key))
                 is_direct_successor = bool(
@@ -245,9 +267,11 @@ class AsyncSupersedeLock:
                             prev_ts_ms=prev_ts_ms,
                         )
                 await self._client.set(sha_key, head_sha, ex=ttl_seconds)
-                await self._client.srem(ancestors_key, head_sha)
+                if int(await self._client.srem(ancestors_key, head_sha)) > 0:
+                    removed_ancestor = head_sha
                 if clean_before and clean_before != head_sha:
-                    await self._client.sadd(ancestors_key, clean_before)
+                    if int(await self._client.sadd(ancestors_key, clean_before)) > 0:
+                        added_ancestor = clean_before
                     await self._client.expire(ancestors_key, ttl_seconds)
                 elif int(await self._client.scard(ancestors_key)) > 0:
                     await self._client.expire(ancestors_key, ttl_seconds)
@@ -268,6 +292,8 @@ class AsyncSupersedeLock:
                 claimed=True,
                 stale=False,
                 prev_ts_ms=prev_ts_ms,
+                added_ancestor=added_ancestor,
+                removed_ancestor=removed_ancestor,
             )
         except (redis.exceptions.RedisError, OSError) as exc:
             logger.warning(
@@ -284,14 +310,16 @@ class AsyncSupersedeLock:
         attempted_sha: str,
         prev_sha: str | None,
         ttl_seconds: int = PR_SUPERSEDE_TTL_SECONDS,
-        before_sha: str | None = None,
+        added_ancestor: str | None = None,
+        removed_ancestor: str | None = None,
         prev_ts_ms: int | None = None,
     ) -> None:
-        """Atomically restore prev_sha (or delete key) iff active_head_sha == attempted_sha."""
+        """Restore prev_sha and exact ancestor delta iff active_head_sha == attempted_sha."""
         sha_key = pr_active_sha_key(repo_id, pr_number)
         ancestors_key = pr_active_ancestors_key(repo_id, pr_number)
         ts_key = pr_active_ts_key(repo_id, pr_number)
-        clean_before = before_sha.strip() if before_sha else ""
+        clean_added = added_ancestor.strip() if added_ancestor else ""
+        clean_removed = removed_ancestor.strip() if removed_ancestor else ""
         ts_arg = str(prev_ts_ms) if prev_ts_ms is not None and prev_ts_ms > 0 else ""
         eval_fn = self._eval_callable()
         try:
@@ -305,7 +333,8 @@ class AsyncSupersedeLock:
                     attempted_sha,
                     prev_sha or "",
                     ttl_seconds,
-                    clean_before,
+                    clean_added,
+                    clean_removed,
                     ts_arg,
                 )
                 return
@@ -316,10 +345,14 @@ class AsyncSupersedeLock:
                     await self._client.set(sha_key, prev_sha, ex=ttl_seconds)
                 else:
                     await self._client.delete(sha_key)
-                if clean_before:
-                    await self._client.srem(ancestors_key, clean_before)
-                    if int(await self._client.scard(ancestors_key)) > 0:
-                        await self._client.expire(ancestors_key, ttl_seconds)
+                if clean_added:
+                    await self._client.srem(ancestors_key, clean_added)
+                if clean_removed:
+                    await self._client.sadd(ancestors_key, clean_removed)
+                if (clean_added or clean_removed) and int(
+                    await self._client.scard(ancestors_key)
+                ) > 0:
+                    await self._client.expire(ancestors_key, ttl_seconds)
                 if ts_arg:
                     await self._client.set(ts_key, ts_arg, ex=ttl_seconds)
                 else:
