@@ -113,7 +113,7 @@ def parse_repo_config_yaml(
     *,
     source: str = ".codesight.yaml",
 ) -> RepoConfig:
-    """Parse raw .codesight.yaml safely, returning atomic RepoConfig() defaults on any error."""
+    """Parse raw .codesight.yaml safely, salvaging valid sibling fields on ValidationError."""
     if isinstance(raw_yaml, bytes):
         if len(raw_yaml) > MAX_REPO_CONFIG_BYTES:
             logger.warning("repo_config_invalid_fallback", source=source, reason="oversize")
@@ -168,7 +168,11 @@ def parse_repo_config_yaml(
             reason="validation_error",
             invalid_fields=invalid_fields,
         )
-        return RepoConfig()
+        salvaged = {k: v for k, v in parsed.items() if k not in invalid_fields}
+        try:
+            return RepoConfig.model_validate(salvaged)
+        except ValidationError:
+            return RepoConfig()
 
 
 def _is_rate_limited_403(headers: httpx.Headers) -> bool:

@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Final, Literal, Protocol, TypeGuard, cast
 
 import redis.asyncio as redis_async
@@ -54,6 +54,8 @@ class PRWebhookDispatchPayload(BaseModel):
     pr_number: int
     head_sha: str
     base_sha: str | None = None
+    before_sha: str | None = None
+    updated_at_ms: int | None = None
     action: str
 
 
@@ -139,10 +141,21 @@ class CeleryWebhookDispatcher:
                 payload.pr_number,
                 payload.head_sha,
                 ttl_seconds=PR_SUPERSEDE_TTL_SECONDS,
+                before_sha=payload.before_sha,
+                event_ts_ms=payload.updated_at_ms,
             )
             if lock is not None
             else None
         )
+        if claim is not None and claim.stale:
+            logger.info(
+                "webhook_pr_out_of_order_superseded",
+                repo_id=payload.repo_id,
+                pr_number=payload.pr_number,
+                stale_head_sha=payload.head_sha,
+                active_head_sha=claim.prev_sha,
+            )
+            return f"superseded:{claim.prev_sha or 'stale'}"
 
         try:
             task_id = await self._publish_task(
@@ -159,11 +172,27 @@ class CeleryWebhookDispatcher:
                     attempted_sha=payload.head_sha,
                     prev_sha=claim.prev_sha,
                     ttl_seconds=PR_SUPERSEDE_TTL_SECONDS,
+                    before_sha=payload.before_sha,
+                    prev_ts_ms=claim.prev_ts_ms,
                 )
             raise
 
+        async def _revoke_superseded(superseded_task_id: str) -> None:
+            try:
+                await asyncio.to_thread(
+                    target.control.revoke,
+                    superseded_task_id,
+                    terminate=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "webhook_supersede_revoke_failed",
+                    superseded_task_id=superseded_task_id,
+                    error_type=type(exc).__name__,
+                )
+
         if lock is not None:
-            await lock.record_active_task(
+            record_coro = lock.record_active_task(
                 payload.repo_id,
                 payload.pr_number,
                 head_sha=payload.head_sha,
@@ -172,18 +201,9 @@ class CeleryWebhookDispatcher:
             )
             prev_task_id = claim.prev_task_id if claim is not None else None
             if prev_task_id and prev_task_id != task_id:
-                try:
-                    await asyncio.to_thread(
-                        target.control.revoke,
-                        prev_task_id,
-                        terminate=False,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "webhook_supersede_revoke_failed",
-                        superseded_task_id=prev_task_id,
-                        error_type=type(exc).__name__,
-                    )
+                await asyncio.gather(record_coro, _revoke_superseded(prev_task_id))
+            else:
+                await record_coro
 
         return task_id
 
@@ -212,6 +232,26 @@ class _QueuedPRWebhook:
     pr_number: int
     head_sha: str
     base_sha: str | None
+    before_sha: str | None = None
+    updated_at_ms: int | None = None
+
+
+def _parse_iso_timestamp_ms(raw: Any) -> int | None:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = f"{cleaned[:-1]}+00:00"
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    ts_ms = int(dt.timestamp() * 1000)
+    return ts_ms if ts_ms > 0 else None
 
 
 @dataclass(frozen=True)
@@ -380,6 +420,14 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
         base_sha_raw = base_raw.get("sha") if isinstance(base_raw, dict) else None
         head_sha = head_sha_raw.strip() if isinstance(head_sha_raw, str) else ""
         base_sha = base_sha_raw.strip() if isinstance(base_sha_raw, str) else None
+        before_raw = payload.get("before")
+        before_sha_clean = before_raw.strip() if isinstance(before_raw, str) else ""
+        before_sha = (
+            before_sha_clean
+            if before_sha_clean and len(before_sha_clean) <= 64 and before_sha_clean != _ZERO_SHA
+            else None
+        )
+        updated_at_ms = _parse_iso_timestamp_ms(pr_raw.get("updated_at"))
         if (
             not _is_strict_positive_int(pr_number, max_value=_MAX_INT32)
             or not head_sha
@@ -398,6 +446,8 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
             pr_number=pr_number,
             head_sha=head_sha,
             base_sha=base_sha if base_sha and len(base_sha) <= 64 else None,
+            before_sha=before_sha,
+            updated_at_ms=updated_at_ms,
         )
 
     if event_type == "push":
@@ -454,10 +504,14 @@ async def _apply_repo_upsert(
         ).scalar_one_or_none()
         if existing is None:
             return None
-        existing.default_branch = default_branch
-        if installation_id is not None:
-            existing.installation_id = installation_id
-        await session.flush()
+        needs_update = existing.default_branch != default_branch or (
+            installation_id is not None and existing.installation_id != installation_id
+        )
+        if needs_update:
+            existing.default_branch = default_branch
+            if installation_id is not None:
+                existing.installation_id = installation_id
+            await session.flush()
         return existing
 
     rows = list(
@@ -486,11 +540,17 @@ async def _apply_repo_upsert(
             )
             by_name.full_name = _stale_repo_name(by_name.full_name, suffix)
             await session.flush()
-        by_id.full_name = full_name
-        by_id.default_branch = default_branch
-        if installation_id is not None:
-            by_id.installation_id = installation_id
-        await session.flush()
+        needs_update = (
+            by_id.full_name != full_name
+            or by_id.default_branch != default_branch
+            or (installation_id is not None and by_id.installation_id != installation_id)
+        )
+        if needs_update:
+            by_id.full_name = full_name
+            by_id.default_branch = default_branch
+            if installation_id is not None:
+                by_id.installation_id = installation_id
+            await session.flush()
         return by_id
 
     if by_name is not None:
@@ -745,6 +805,8 @@ async def receive_github_webhook(
                     pr_number=classified.pr_number,
                     head_sha=classified.head_sha,
                     base_sha=classified.base_sha,
+                    before_sha=classified.before_sha,
+                    updated_at_ms=classified.updated_at_ms,
                     action=classified.action,
                 )
             )

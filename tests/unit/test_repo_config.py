@@ -217,6 +217,36 @@ async def test_loader_propagates_429_secondary_403_5xx_timeout_and_auth_errors()
             await loader.load("org/server-down")
 
 
+def test_partial_invalid_fields_preserve_valid_sibling_settings() -> None:
+    stream = io.StringIO()
+    configure_logging(level="WARNING", service_name="test-repo-config", stream=stream)
+    secret_comment = "DO_NOT_LEAK_SIBLING_TEST_RAW_YAML"
+    cfg = parse_repo_config_yaml(
+        f"""
+        # {secret_comment}
+        min_debt_score: 999
+        review_action: request_changes
+        ignore_paths:
+          - "vendor/**"
+        custom_rules: "Use AsyncSession."
+        """,
+        source=".codesight.yaml",
+    )
+    assert cfg.min_debt_score == 60
+    assert cfg.review_action == "REQUEST_CHANGES"
+    assert cfg.ignore_paths == ("vendor/**",)
+    assert cfg.custom_rules == "Use AsyncSession."
+
+    logs = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+    assert any(
+        entry["event"] == "repo_config_invalid_fallback"
+        and entry["reason"] == "validation_error"
+        and entry["invalid_fields"] == ["min_debt_score"]
+        for entry in logs
+    )
+    assert secret_comment not in stream.getvalue()
+
+
 def test_example_codesight_yaml_parses_cleanly() -> None:
     example_bytes = Path(".codesight.example.yaml").read_bytes()
     parsed = parse_repo_config_yaml(example_bytes, source=".codesight.example.yaml")

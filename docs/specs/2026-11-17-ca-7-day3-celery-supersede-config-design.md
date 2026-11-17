@@ -56,11 +56,15 @@ T1 starts execution:                                     │
 ```
 
 - **`AsyncSupersedeLock` (used by `webhooks.py` and async worker stages):**
-  - `claim_active_sha(repo_id, pr_number, head_sha, *, ttl_seconds=86400) -> SupersedeClaim`:
-    - Executes a 1-RTT Lua script reading `(GET sha_key, GET task_key)` and writing `SET sha_key head_sha EX ttl` atomically.
+  - `claim_active_sha(repo_id, pr_number, head_sha, *, ttl_seconds=86400, before_sha=None, event_ts_ms=None) -> SupersedeClaim`:
+    - Executes a 1-RTT Lua script reading `(GET sha_key, GET task_key, GET ts_key)` and writing `SET sha_key head_sha EX ttl` atomically while guarding against out-of-order GitHub webhook delivery:
+      - Records superseded `before_sha` values in `pr_active_ancestors:{repo_id}:{pr_number}` (`Redis SET`, `TTL = 86400s`) and monotonic `pull_request.updated_at` epoch-ms in `pr_active_ts:{repo_id}:{pr_number}`.
+      - If an incoming non-direct-successor commit (`before_sha != active_head_sha`) is already in `pr_active_ancestors` or carries `event_ts_ms < active_ts_ms`, the Lua script returns `claimed=False, stale=True` so `CeleryWebhookDispatcher` skips publishing/revoking and logs `webhook_pr_out_of_order_superseded`.
+      - Intentional force-push reverts (`before_sha == active_head_sha`) bypass the stale rejection so reverting back to a prior SHA succeeds cleanly.
+      - **Known limitation:** 3+ rapid non-adjacent force-pushes reordered within the same 1-second GitHub `updated_at` timestamp resolution remain ambiguous without external commit-graph ancestry queries.
     - If an injected unit-test Redis double lacks `.eval`, gracefully falls back to sequential `get`/`set` so lightweight test doubles remain compatible.
-  - `rollback_active_sha(repo_id, pr_number, *, attempted_sha, prev_sha, ttl_seconds=86400) -> None`:
-    - Executes a Lua Compare-And-Set (`CAS`) script: restores `prev_sha` (or `DEL sha_key` when `prev_sha` is `None`) **only if** `GET(sha_key) == attempted_sha`. Prevents a failed broker publish on `SHA_2` from clobbering `SHA_3` if `SHA_3` arrived concurrently.
+  - `rollback_active_sha(repo_id, pr_number, *, attempted_sha, prev_sha, ttl_seconds=86400, before_sha=None, prev_ts_ms=None) -> None`:
+    - Executes a Lua Compare-And-Set (`CAS`) script: restores `prev_sha` (or `DEL sha_key` when `prev_sha` is `None`), removes `before_sha` from `pr_active_ancestors`, and restores `pr_active_ts` **only if** `GET(sha_key) == attempted_sha`. Prevents a failed broker publish on `SHA_2` from clobbering `SHA_3` if `SHA_3` arrived concurrently.
   - `record_active_task(repo_id, pr_number, *, head_sha, task_id, ttl_seconds=86400) -> None`:
     - Executes a Lua CAS script setting `task_key = task_id` (`EX ttl`) **only if** `GET(sha_key) == head_sha`.
   - `check_superseded(repo_id, pr_number, head_sha) -> tuple[bool, str | None]` and `ensure_active(repo_id, pr_number, head_sha, *, stage: str = "pre_publish") -> None`:
@@ -151,7 +155,8 @@ T1 starts execution:                                     │
 | Both `.codesight.yaml` and `.codesight.yml` return `404` | `INFO` `repo_config_not_found` | Return `RepoConfig()` defaults |
 | Empty / comment-only YAML (`safe_load -> None`) | `INFO` `repo_config_loaded` | Treat as `{}` -> `RepoConfig()` defaults |
 | Unknown top-level YAML keys alongside valid fields | `WARNING` `repo_config_unknown_keys_ignored` | Log key names only; ignore unknown keys and validate known fields |
-| Malformed YAML, invalid Base64/UTF-8, `type != "file"`, `> 64 KiB`, non-dict root, or `ValidationError` on any known field | `WARNING` `repo_config_invalid_fallback` | Log structured `reason` (**zero raw YAML content logged**, `NFR-3`); return atomic `RepoConfig()` defaults |
+| Malformed YAML, invalid Base64/UTF-8, `type != "file"`, `> 64 KiB`, or non-dict root | `WARNING` `repo_config_invalid_fallback` | Log structured `reason` (**zero raw YAML content logged**, `NFR-3`); return `RepoConfig()` defaults |
+| Pydantic `ValidationError` on specific known field(s) | `WARNING` `repo_config_invalid_fallback` | Log `reason="validation_error"` + `invalid_fields` (**zero raw YAML content logged**, `NFR-3`); drop only invalid fields and preserve valid sibling fields |
 | GitHub `HTTP 429` or `HTTP 403` with rate-limit headers | `WARNING` `repo_config_rate_limited` | Raise `RateLimitTaskError(retry_after_seconds=...)` -> Celery backoff |
 | GitHub `HTTP 500/502/503/504` or `httpx.TransportError` / `TimeoutException` | `WARNING` `repo_config_transient_error` | Raise `RetryableTaskError` -> Celery backoff |
 | GitHub `HTTP 401` or non-rate-limit `HTTP 403` | `ERROR` `repo_config_auth_error` | Raise `GitHubAuthError(status_code=code)` -> fail fast (no retry) |

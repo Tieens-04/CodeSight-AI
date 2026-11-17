@@ -19,16 +19,53 @@ PR_SYNCHRONIZE_DEBOUNCE_SECONDS: Final[int] = 5
 _CLAIM_LUA: Final[str] = """
 local p_sha = redis.call('GET', KEYS[1])
 local p_task = redis.call('GET', KEYS[2])
-redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
-return {p_sha or '', p_task or ''}
+local p_ts = tonumber(redis.call('GET', KEYS[4]) or '0') or 0
+local head_sha = ARGV[1]
+local ttl = tonumber(ARGV[2])
+local before_sha = ARGV[3]
+local event_ts = tonumber(ARGV[4]) or 0
+local is_direct_successor = (p_sha and p_sha ~= '' and before_sha ~= '' and before_sha == p_sha)
+
+if p_sha and p_sha ~= '' and p_sha ~= head_sha and not is_direct_successor then
+    if redis.call('SISMEMBER', KEYS[3], head_sha) == 1 then
+        return {p_sha, p_task or '', '0', tostring(p_ts)}
+    end
+    if event_ts > 0 and p_ts > 0 and event_ts < p_ts then
+        return {p_sha, p_task or '', '0', tostring(p_ts)}
+    end
+end
+
+redis.call('SET', KEYS[1], head_sha, 'EX', ttl)
+redis.call('SREM', KEYS[3], head_sha)
+if before_sha ~= '' and before_sha ~= head_sha then
+    redis.call('SADD', KEYS[3], before_sha)
+    redis.call('EXPIRE', KEYS[3], ttl)
+end
+if event_ts > 0 then
+    local next_ts = event_ts
+    if not is_direct_successor and p_ts > next_ts then
+        next_ts = p_ts
+    end
+    redis.call('SET', KEYS[4], tostring(next_ts), 'EX', ttl)
+end
+return {p_sha or '', p_task or '', '1', tostring(p_ts)}
 """
 
 _ROLLBACK_LUA: Final[str] = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
+    local ttl = tonumber(ARGV[3])
     if ARGV[2] ~= '' then
-        redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+        redis.call('SET', KEYS[1], ARGV[2], 'EX', ttl)
     else
         redis.call('DEL', KEYS[1])
+    end
+    if ARGV[4] ~= '' then
+        redis.call('SREM', KEYS[2], ARGV[4])
+    end
+    if ARGV[5] ~= '' then
+        redis.call('SET', KEYS[3], ARGV[5], 'EX', ttl)
+    else
+        redis.call('DEL', KEYS[3])
     end
     return 1
 end
@@ -56,6 +93,16 @@ def pr_active_task_key(repo_id: str, pr_number: int) -> str:
     return f"pr_active_task:{repo_id}:{pr_number}"
 
 
+def pr_active_ancestors_key(repo_id: str, pr_number: int) -> str:
+    """Return canonical Redis key storing superseded ancestor head_shas for a PR."""
+    return f"pr_active_ancestors:{repo_id}:{pr_number}"
+
+
+def pr_active_ts_key(repo_id: str, pr_number: int) -> str:
+    """Return canonical Redis key storing the latest PR event timestamp (epoch ms)."""
+    return f"pr_active_ts:{repo_id}:{pr_number}"
+
+
 def _decode_redis_str(raw: object) -> str | None:
     if isinstance(raw, (bytes, bytearray)):
         decoded = raw.decode("utf-8")
@@ -63,6 +110,17 @@ def _decode_redis_str(raw: object) -> str | None:
     if isinstance(raw, str):
         return raw or None
     return str(raw) if raw else None
+
+
+def _parse_int_str(raw: object) -> int | None:
+    decoded = _decode_redis_str(raw)
+    if decoded is None:
+        return None
+    try:
+        val = int(decoded)
+    except ValueError:
+        return None
+    return val if val > 0 else None
 
 
 class PRSupersededError(Exception):
@@ -94,6 +152,8 @@ class SupersedeClaim:
     prev_sha: str | None
     prev_task_id: str | None
     claimed: bool
+    stale: bool = False
+    prev_ts_ms: int | None = None
 
 
 class AsyncSupersedeLock:
@@ -115,23 +175,104 @@ class AsyncSupersedeLock:
         head_sha: str,
         *,
         ttl_seconds: int = PR_SUPERSEDE_TTL_SECONDS,
+        before_sha: str | None = None,
+        event_ts_ms: int | None = None,
     ) -> SupersedeClaim:
-        """Atomically read previous SHA/task and set active_head_sha in Redis."""
+        """Atomically read previous SHA/task and set active_head_sha in Redis.
+
+        Guards against out-of-order GitHub webhook delivery by checking the causal
+        ``before_sha`` ancestor set and monotonic ``event_ts_ms`` while still
+        allowing direct force-push reverts (where ``before_sha == active_sha``).
+        Residual known limitation: 3+ rapid non-adjacent force-pushes reordered
+        within the same 1-second GitHub ``updated_at`` resolution remain ambiguous.
+        """
         sha_key = pr_active_sha_key(repo_id, pr_number)
         task_key = pr_active_task_key(repo_id, pr_number)
+        ancestors_key = pr_active_ancestors_key(repo_id, pr_number)
+        ts_key = pr_active_ts_key(repo_id, pr_number)
+        clean_before = before_sha.strip() if before_sha else ""
+        norm_ts = event_ts_ms if event_ts_ms is not None and event_ts_ms > 0 else 0
         eval_fn = self._eval_callable()
         try:
             if eval_fn is not None:
-                raw_res = await eval_fn(_CLAIM_LUA, 2, sha_key, task_key, head_sha, ttl_seconds)
+                raw_res = await eval_fn(
+                    _CLAIM_LUA,
+                    4,
+                    sha_key,
+                    task_key,
+                    ancestors_key,
+                    ts_key,
+                    head_sha,
+                    ttl_seconds,
+                    clean_before,
+                    norm_ts,
+                )
                 items = cast(Sequence[object], raw_res)
                 prev_sha = _decode_redis_str(items[0]) if len(items) > 0 else None
                 prev_task = _decode_redis_str(items[1]) if len(items) > 1 else None
-                return SupersedeClaim(prev_sha=prev_sha, prev_task_id=prev_task, claimed=True)
+                claimed_flag = _decode_redis_str(items[2]) if len(items) > 2 else "1"
+                prev_ts_ms = _parse_int_str(items[3]) if len(items) > 3 else None
+                is_stale = claimed_flag == "0"
+                return SupersedeClaim(
+                    prev_sha=prev_sha,
+                    prev_task_id=prev_task,
+                    claimed=not is_stale,
+                    stale=is_stale,
+                    prev_ts_ms=prev_ts_ms,
+                )
 
             prev_sha = _decode_redis_str(await self._client.get(sha_key))
             prev_task = _decode_redis_str(await self._client.get(task_key))
-            await self._client.set(sha_key, head_sha, ex=ttl_seconds)
-            return SupersedeClaim(prev_sha=prev_sha, prev_task_id=prev_task, claimed=True)
+            track_causal = bool(clean_before) or norm_ts > 0
+            prev_ts_ms = None
+            if track_causal:
+                prev_ts_ms = _parse_int_str(await self._client.get(ts_key))
+                raw_anc = _decode_redis_str(await self._client.get(ancestors_key))
+                ancestors = {s for s in raw_anc.split("|") if s} if raw_anc else set()
+                is_direct_successor = bool(
+                    prev_sha and clean_before and clean_before == prev_sha
+                )
+                if prev_sha and prev_sha != head_sha and not is_direct_successor:
+                    if head_sha in ancestors or (
+                        norm_ts > 0 and prev_ts_ms is not None and norm_ts < prev_ts_ms
+                    ):
+                        return SupersedeClaim(
+                            prev_sha=prev_sha,
+                            prev_task_id=prev_task,
+                            claimed=False,
+                            stale=True,
+                            prev_ts_ms=prev_ts_ms,
+                        )
+                ancestors.discard(head_sha)
+                if clean_before and clean_before != head_sha:
+                    ancestors.add(clean_before)
+                await self._client.set(sha_key, head_sha, ex=ttl_seconds)
+                if ancestors:
+                    await self._client.set(
+                        ancestors_key,
+                        "|".join(sorted(ancestors)),
+                        ex=ttl_seconds,
+                    )
+                elif raw_anc is not None:
+                    await self._client.delete(ancestors_key)
+                if norm_ts > 0:
+                    next_ts = norm_ts
+                    if (
+                        not is_direct_successor
+                        and prev_ts_ms is not None
+                        and prev_ts_ms > next_ts
+                    ):
+                        next_ts = prev_ts_ms
+                    await self._client.set(ts_key, str(next_ts), ex=ttl_seconds)
+            else:
+                await self._client.set(sha_key, head_sha, ex=ttl_seconds)
+            return SupersedeClaim(
+                prev_sha=prev_sha,
+                prev_task_id=prev_task,
+                claimed=True,
+                stale=False,
+                prev_ts_ms=prev_ts_ms,
+            )
         except (redis.exceptions.RedisError, OSError) as exc:
             logger.warning(
                 "webhook_supersede_cache_unavailable",
@@ -147,19 +288,29 @@ class AsyncSupersedeLock:
         attempted_sha: str,
         prev_sha: str | None,
         ttl_seconds: int = PR_SUPERSEDE_TTL_SECONDS,
+        before_sha: str | None = None,
+        prev_ts_ms: int | None = None,
     ) -> None:
         """Atomically restore prev_sha (or delete key) iff active_head_sha == attempted_sha."""
         sha_key = pr_active_sha_key(repo_id, pr_number)
+        ancestors_key = pr_active_ancestors_key(repo_id, pr_number)
+        ts_key = pr_active_ts_key(repo_id, pr_number)
+        clean_before = before_sha.strip() if before_sha else ""
+        ts_arg = str(prev_ts_ms) if prev_ts_ms is not None and prev_ts_ms > 0 else ""
         eval_fn = self._eval_callable()
         try:
             if eval_fn is not None:
                 await eval_fn(
                     _ROLLBACK_LUA,
-                    1,
+                    3,
                     sha_key,
+                    ancestors_key,
+                    ts_key,
                     attempted_sha,
                     prev_sha or "",
                     ttl_seconds,
+                    clean_before,
+                    ts_arg,
                 )
                 return
 
@@ -169,6 +320,23 @@ class AsyncSupersedeLock:
                     await self._client.set(sha_key, prev_sha, ex=ttl_seconds)
                 else:
                     await self._client.delete(sha_key)
+                if clean_before:
+                    raw_anc = _decode_redis_str(await self._client.get(ancestors_key))
+                    if raw_anc:
+                        ancestors = {s for s in raw_anc.split("|") if s}
+                        ancestors.discard(clean_before)
+                        if ancestors:
+                            await self._client.set(
+                                ancestors_key,
+                                "|".join(sorted(ancestors)),
+                                ex=ttl_seconds,
+                            )
+                        else:
+                            await self._client.delete(ancestors_key)
+                if ts_arg:
+                    await self._client.set(ts_key, ts_arg, ex=ttl_seconds)
+                else:
+                    await self._client.delete(ts_key)
         except (redis.exceptions.RedisError, OSError) as exc:
             logger.warning(
                 "webhook_supersede_rollback_failed",

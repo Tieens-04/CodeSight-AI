@@ -64,6 +64,10 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+strict_markers = true
+markers = [
+    "integration: tests requiring live local Docker services (PostgreSQL 5433 / Redis 6381)",
+]
 
 [tool.coverage.run]
 source = ["src/codesight"]

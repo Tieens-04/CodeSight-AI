@@ -302,6 +302,7 @@ class PRReviewLifecycleContext:
     trace_id: str
     workspace_dir: Path
     repo_config: RepoConfig
+    supersede_lock: AsyncSupersedeLock | None = None
 
 
 def _has_github_credentials(settings: Settings) -> bool:
@@ -350,11 +351,7 @@ async def execute_pr_review_lifecycle(
     owned_redis: redis_async.Redis | None = None
     active_lock = supersede_lock
 
-    if (
-        active_lock is None
-        and coords is not None
-        and (check_entry_supersede or publish_fn is not None)
-    ):
+    if active_lock is None and coords is not None:
         owned_redis = redis_async.from_url(
             active_settings.redis_url,
             decode_responses=True,
@@ -417,6 +414,7 @@ async def execute_pr_review_lifecycle(
                 trace_id=trace_id,
                 workspace_dir=workspace_dir,
                 repo_config=repo_config,
+                supersede_lock=active_lock,
             )
 
             if review_fn is not None:

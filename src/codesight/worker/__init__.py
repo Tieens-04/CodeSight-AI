@@ -22,8 +22,10 @@ from codesight.worker.supersede_lock import (
     SupersedeClaim,
     SyncSupersedeLock,
     is_pr_event_superseded,
+    pr_active_ancestors_key,
     pr_active_sha_key,
     pr_active_task_key,
+    pr_active_ts_key,
 )
 
 __all__ = [
@@ -46,6 +48,8 @@ __all__ = [
     "handle_push_event",
     "is_pr_event_superseded",
     "ping",
+    "pr_active_ancestors_key",
     "pr_active_sha_key",
     "pr_active_task_key",
+    "pr_active_ts_key",
 ]

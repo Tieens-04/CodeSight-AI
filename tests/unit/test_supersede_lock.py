@@ -15,11 +15,14 @@ from codesight.worker.supersede_lock import (
     PRSupersededError,
     SyncSupersedeLock,
     is_pr_event_superseded,
+    pr_active_ancestors_key,
     pr_active_sha_key,
     pr_active_task_key,
+    pr_active_ts_key,
 )
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_live_redis_lua_cas_claim_rollback_and_superseded_detection() -> None:
     settings = Settings()
@@ -73,10 +76,47 @@ async def test_live_redis_lua_cas_claim_rollback_and_superseded_detection() -> N
             repo_id, pr_num, attempted_sha="sha-1", prev_sha=None
         )
         assert await async_client.get(pr_active_sha_key(repo_id, pr_num)) is None
+
+        # 4. Out-of-order SHA_2 before SHA_1 rejects SHA_1, while direct revert succeeds
+        oo_pr = pr_num + 1
+        c_oo2 = await lock.claim_active_sha(
+            repo_id, oo_pr, "sha-2", before_sha="sha-1", event_ts_ms=2_000_000
+        )
+        assert c_oo2.claimed is True and c_oo2.stale is False
+
+        c_oo1_late = await lock.claim_active_sha(
+            repo_id, oo_pr, "sha-1", before_sha="sha-0", event_ts_ms=1_000_000
+        )
+        assert c_oo1_late.claimed is False and c_oo1_late.stale is True
+        assert c_oo1_late.prev_sha == "sha-2"
+        assert await async_client.get(pr_active_sha_key(repo_id, oo_pr)) == "sha-2"
+
+        c_revert = await lock.claim_active_sha(
+            repo_id, oo_pr, "sha-1", before_sha="sha-2", event_ts_ms=3_000_000
+        )
+        assert c_revert.claimed is True and c_revert.stale is False
+        assert await async_client.get(pr_active_sha_key(repo_id, oo_pr)) == "sha-1"
+
+        await lock.rollback_active_sha(
+            repo_id,
+            oo_pr,
+            attempted_sha="sha-1",
+            prev_sha=c_revert.prev_sha,
+            before_sha="sha-2",
+            prev_ts_ms=c_revert.prev_ts_ms,
+        )
+        assert await async_client.get(pr_active_sha_key(repo_id, oo_pr)) == "sha-2"
+        assert await async_client.get(pr_active_ts_key(repo_id, oo_pr)) == "2000000"
     finally:
         await async_client.delete(
             pr_active_sha_key(repo_id, pr_num),
             pr_active_task_key(repo_id, pr_num),
+            pr_active_ancestors_key(repo_id, pr_num),
+            pr_active_ts_key(repo_id, pr_num),
+            pr_active_sha_key(repo_id, pr_num + 1),
+            pr_active_task_key(repo_id, pr_num + 1),
+            pr_active_ancestors_key(repo_id, pr_num + 1),
+            pr_active_ts_key(repo_id, pr_num + 1),
         )
         await async_client.aclose()
         sync_client.close()
@@ -113,6 +153,7 @@ async def test_supersede_lock_fail_open_on_redis_errors_and_invalid_payloads() -
     assert is_pr_event_superseded({"repo_id": "", "pr_number": True, "head_sha": "x"}) is False
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_execute_pr_review_lifecycle_blocks_stale_publish_and_cleans_workspace() -> None:
     from pathlib import Path
@@ -222,5 +263,169 @@ async def test_execute_pr_review_lifecycle_blocks_stale_publish_and_cleans_works
         await async_client.delete(
             pr_active_sha_key(repo_id, pr_num),
             pr_active_task_key(repo_id, pr_num),
+            pr_active_ancestors_key(repo_id, pr_num),
+            pr_active_ts_key(repo_id, pr_num),
         )
         await async_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_offline_out_of_order_guard_and_worker_pre_publish_lock_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from typing import Any
+
+    from codesight.api.routes.webhooks import (
+        CeleryWebhookDispatcher,
+        PRWebhookDispatchPayload,
+        _classify_webhook,
+    )
+    from codesight.core.logging import bind_trace_id, clear_trace_context
+    from codesight.worker.celery_app import PRReviewLifecycleContext, execute_pr_review_lifecycle
+
+    class _OfflineAsyncRedis:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+            self.closed = False
+
+        async def get(self, key: str) -> str | None:
+            return self.store.get(key)
+
+        async def set(self, key: str, value: str, *, ex: int | None = None) -> bool:
+            self.store[key] = value
+            return True
+
+        async def delete(self, key: str) -> int:
+            return 1 if self.store.pop(key, None) is not None else 0
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    sent_tasks: list[tuple[str, str]] = []
+    revoked_tasks: list[str] = []
+
+    class _FakeControl:
+        def revoke(self, task_id: str, *, terminate: bool = False) -> None:
+            revoked_tasks.append(task_id)
+
+    class _FakeCelery:
+        control = _FakeControl()
+
+        def send_task(self, name: str, *, args: tuple[Any, ...] = (), **_: Any) -> SimpleNamespace:
+            tid = f"task-{len(sent_tasks) + 1}"
+            sent_tasks.append((tid, str(args[0]["head_sha"])))
+            return SimpleNamespace(id=tid)
+
+    # 1. Verify webhook classifier extracts before_sha and updated_at_ms
+    classified = _classify_webhook(
+        "pull_request",
+        {
+            "action": "synchronize",
+            "before": "sha-1",
+            "repository": {"id": 10, "full_name": "org/demo", "default_branch": "main"},
+            "pull_request": {
+                "number": 8,
+                "updated_at": "2026-11-17T06:00:02Z",
+                "head": {"sha": "sha-2"},
+                "base": {"sha": "base-0"},
+            },
+        },
+    )
+    assert getattr(classified, "before_sha", None) == "sha-1"
+    assert getattr(classified, "updated_at_ms", None) is not None
+
+    # 2. Out-of-order SHA_1 arriving after SHA_2 does NOT publish or revoke SHA_2's task
+    mem_redis = _OfflineAsyncRedis()
+    dispatcher = CeleryWebhookDispatcher(
+        app=_FakeCelery(),
+        redis_client=mem_redis,  # type: ignore[arg-type]
+    )
+    t_sha2 = await dispatcher.dispatch_pull_request(
+        PRWebhookDispatchPayload(
+            delivery_id="d2",
+            repo_id="repo-oo",
+            github_repo_id=10,
+            repo_full_name="org/demo",
+            default_branch="main",
+            installation_id=None,
+            pr_number=8,
+            head_sha="sha-2",
+            before_sha="sha-1",
+            updated_at_ms=2_000_000,
+            action="synchronize",
+        )
+    )
+    assert t_sha2 == "task-1"
+
+    t_stale = await dispatcher.dispatch_pull_request(
+        PRWebhookDispatchPayload(
+            delivery_id="d1",
+            repo_id="repo-oo",
+            github_repo_id=10,
+            repo_full_name="org/demo",
+            default_branch="main",
+            installation_id=None,
+            pr_number=8,
+            head_sha="sha-1",
+            before_sha="sha-0",
+            updated_at_ms=1_000_000,
+            action="synchronize",
+        )
+    )
+    assert t_stale == "superseded:sha-2"
+    assert sent_tasks == [("task-1", "sha-2")]
+    assert revoked_tasks == []
+    assert mem_redis.store[pr_active_sha_key("repo-oo", 8)] == "sha-2"
+
+    # Direct force-push revert (before_sha == active sha-2) succeeds
+    t_revert = await dispatcher.dispatch_pull_request(
+        PRWebhookDispatchPayload(
+            delivery_id="d3",
+            repo_id="repo-oo",
+            github_repo_id=10,
+            repo_full_name="org/demo",
+            default_branch="main",
+            installation_id=None,
+            pr_number=8,
+            head_sha="sha-1",
+            before_sha="sha-2",
+            updated_at_ms=3_000_000,
+            action="synchronize",
+        )
+    )
+    assert t_revert == "task-2"
+    assert revoked_tasks == ["task-1"]
+
+    # 3. Worker spine creates AsyncSupersedeLock even without publish_fn / entry check
+    worker_redis = _OfflineAsyncRedis()
+    worker_redis.store[pr_active_sha_key("repo-w", 4)] = "sha-a"
+    monkeypatch.setattr(
+        "codesight.worker.celery_app.redis_async.from_url",
+        lambda *_, **__: worker_redis,
+    )
+    bind_trace_id("trace-offline-prepub")
+    seen_locks: list[AsyncSupersedeLock | None] = []
+    try:
+        async def _review_with_mid_supersede(ctx: PRReviewLifecycleContext) -> None:
+            seen_locks.append(ctx.supersede_lock)
+            assert ctx.supersede_lock is not None
+            await ctx.supersede_lock.claim_active_sha("repo-w", 4, "sha-b")
+
+        res = await execute_pr_review_lifecycle(
+            {
+                "repo_id": "repo-w",
+                "repo_full_name": "org/demo",
+                "default_branch": "main",
+                "pr_number": 4,
+                "head_sha": "sha-a",
+            },
+            settings=Settings(_env_file=None),
+            review_fn=_review_with_mid_supersede,
+            check_entry_supersede=False,
+        )
+        assert res == {"status": "superseded", "trace_id": "trace-offline-prepub"}
+        assert len(seen_locks) == 1 and seen_locks[0] is not None
+        assert worker_redis.closed is True
+    finally:
+        clear_trace_context()
