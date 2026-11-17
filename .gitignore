@@ -25,7 +25,9 @@ build/
 htmlcov/
 coverage.xml
 
-# Local scratch & OS files
+# Local scratch, AI workflow task runs & OS files
 .superpowers/
+.ai-workflow/tasks/*
+!.ai-workflow/tasks/.gitkeep
 .DS_Store
 Thumbs.db
