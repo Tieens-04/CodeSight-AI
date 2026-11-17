@@ -43,6 +43,7 @@ def _inspect_schema(sync_conn: sa.Connection) -> dict[str, Any]:
     return {"tables": tables, "indexes": indexes, "uniques": uniques}
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_alembic_upgrade_constraints_cascade_and_downgrade(
     isolated_postgres_dsn: str,

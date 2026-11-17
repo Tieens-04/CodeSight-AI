@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
+import io
 import json
+import statistics
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -31,7 +34,7 @@ from codesight.api.routes.webhooks import (
     verify_github_signature,
 )
 from codesight.core.config import Settings
-from codesight.core.logging import bind_trace_id, clear_trace_context
+from codesight.core.logging import bind_trace_id, clear_trace_context, configure_logging
 from codesight.db.models import Base, Repository, WebhookEvent
 from codesight.db.session import create_session_factory
 from codesight.worker.celery_app import (
@@ -229,6 +232,7 @@ async def test_webhook_rejects_missing_secret_bad_hmac_bad_headers_and_oversize_
     assert r_stream_413.status_code == 413
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_webhook_idempotency_filtering_cli_upsert_and_broker_rollback(
     isolated_postgres_dsn: str,
@@ -384,6 +388,7 @@ async def test_webhook_idempotency_filtering_cli_upsert_and_broker_rollback(
         await test_engine.dispose()
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
     isolated_postgres_dsn: str,
@@ -601,6 +606,7 @@ async def test_celery_dispatcher_and_stub_tasks_and_lifespan(
     assert r_uninit.status_code == 503
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_webhook_rejects_bool_ints_invalid_slugs_oversize_strings_and_handles_edge_events(
     isolated_postgres_dsn: str,
@@ -720,6 +726,28 @@ async def test_webhook_rejects_bool_ints_invalid_slugs_oversize_strings_and_hand
         await engine.dispose()
 
 
+@contextlib.contextmanager
+def _pause_coverage_tracer() -> Iterator[None]:
+    """Pause coverage.py tracing strictly during the timed SLA loop after warmups."""
+    try:
+        import coverage
+    except ImportError:
+        yield
+        return
+
+    active_cov = coverage.Coverage.current()
+    if active_cov is None:
+        yield
+        return
+
+    active_cov.stop()
+    try:
+        yield
+    finally:
+        active_cov.start()
+
+
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_webhook_gateway_warm_mean_latency_under_100ms(
     isolated_postgres_dsn: str,
@@ -756,51 +784,61 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
         ),
     )
 
+    configure_logging(level="INFO", service_name="codesight-bench", stream=io.StringIO())
     try:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            # Warmup request to populate asyncpg + Redis + Celery connections
-            warm_raw = json.dumps(_pr_payload(action="opened", pr_number=1)).encode("utf-8")
-            warm_resp = await client.post(
-                "/api/v1/webhooks/github",
-                content=warm_raw,
-                headers={
-                    "X-GitHub-Event": "pull_request",
-                    "X-GitHub-Delivery": "bench-warmup-0",
-                    "X-Hub-Signature-256": _sign_body(warm_raw),
-                },
-            )
-            assert warm_resp.status_code == 202
-
-            latencies_ms: list[float] = []
-            for idx in range(50):
-                # Every 5th request updates an existing PR to exercise real Redis supersede + revoke
-                pr_num = 1 if idx % 5 == 0 else idx + 2
-                raw = json.dumps(
-                    _pr_payload(
-                        action="synchronize",
-                        pr_number=pr_num,
-                        head_sha=f"benchsha{idx:04d}",
-                    )
+            # Warmup 0 + 1: populate asyncpg, Redis, Celery broker & Kombu pidbox revoke sockets
+            for idx, (action, sha) in enumerate(
+                (("opened", "benchwarm0000"), ("synchronize", "benchwarm0001"))
+            ):
+                warm_raw = json.dumps(
+                    _pr_payload(action=action, pr_number=1, head_sha=sha)
                 ).encode("utf-8")
-                t0 = time.perf_counter()
-                resp = await client.post(
+                warm_resp = await client.post(
                     "/api/v1/webhooks/github",
-                    content=raw,
+                    content=warm_raw,
                     headers={
                         "X-GitHub-Event": "pull_request",
-                        "X-GitHub-Delivery": f"bench-deliv-{idx}",
-                        "X-Hub-Signature-256": _sign_body(raw),
+                        "X-GitHub-Delivery": f"bench-warmup-{idx}",
+                        "X-Hub-Signature-256": _sign_body(warm_raw),
                     },
                 )
-                latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-                assert resp.status_code == 202
+                assert warm_resp.status_code == 202
 
-        mean_ms = sum(latencies_ms) / len(latencies_ms)
+            latencies_ms: list[float] = []
+            with _pause_coverage_tracer():
+                for idx in range(50):
+                    # Every 5th request updates an existing PR to exercise real supersede + revoke
+                    pr_num = 1 if idx % 5 == 0 else idx + 2
+                    raw = json.dumps(
+                        _pr_payload(
+                            action="synchronize",
+                            pr_number=pr_num,
+                            head_sha=f"benchsha{idx:04d}",
+                        )
+                    ).encode("utf-8")
+                    t0 = time.perf_counter()
+                    resp = await client.post(
+                        "/api/v1/webhooks/github",
+                        content=raw,
+                        headers={
+                            "X-GitHub-Event": "pull_request",
+                            "X-GitHub-Delivery": f"bench-deliv-{idx}",
+                            "X-Hub-Signature-256": _sign_body(raw),
+                        },
+                    )
+                    latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+                    assert resp.status_code == 202
+
+        mean_ms = statistics.fmean(latencies_ms)
+        median_ms = statistics.median(latencies_ms)
+        assert median_ms < 100.0, f"Median webhook latency {median_ms:.2f}ms exceeded 100ms SLA"
         assert mean_ms < 100.0, f"Mean webhook latency {mean_ms:.2f}ms exceeded 100ms SLA"
     finally:
+        configure_logging(level=base_settings.log_level)
         try:
             async with session_factory() as cleanup_session:
                 repo_id = (
@@ -820,6 +858,7 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
             await engine.dispose()
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collisions(
     isolated_postgres_dsn: str,
@@ -842,7 +881,7 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
     observed_during_dispatch: list[tuple[str | None, str | None]] = []
 
     class _VisibilityCheckingDispatcher:
-        async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
+        async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str | None:
             # Independent connection MUST already see committed Repo + WebhookEvent ('received')
             async with session_factory() as worker_session:
                 repo_row = (
@@ -857,6 +896,8 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
                         evt_row.status if evt_row else None,
                     )
                 )
+            if payload.delivery_id == "deliv-superseded-stale":
+                return None
             return "task-vis-1"
 
         async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str:
@@ -902,7 +943,20 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
             )
             assert r_reuse.status_code == 202
 
-        assert len(observed_during_dispatch) == 2
+            # 3. Stale out-of-order PR delivery (dispatcher returns None) -> 200 status='superseded'
+            r_sup = await _send(
+                "deliv-superseded-stale",
+                _pr_payload(action="synchronize", repo_id=300, full_name="org/beta", pr_number=11),
+            )
+            assert r_sup.status_code == 200
+            assert r_sup.json() == {
+                "status": "superseded",
+                "delivery_id": "deliv-superseded-stale",
+                "event": "pull_request",
+                "task_id": None,
+            }
+
+        assert len(observed_during_dispatch) == 3
         assert all(
             repo_id is not None and evt_status == "received"
             for repo_id, evt_status in observed_during_dispatch
@@ -918,8 +972,10 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
             assert repos[300] == "org/beta"
             evt1 = await check.get(WebhookEvent, "deliv-rename-collision")
             evt2 = await check.get(WebhookEvent, "deliv-slug-reuse")
+            evt3 = await check.get(WebhookEvent, "deliv-superseded-stale")
             assert evt1 is not None and evt1.status == "queued"
             assert evt2 is not None and evt2.status == "queued"
+            assert evt3 is not None and evt3.status == "ignored"
     finally:
         await engine.dispose()
 
@@ -1091,6 +1147,7 @@ async def test_dispatcher_retry_rollback_and_fail_open_guards() -> None:
     )
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_webhook_stale_received_reclaim_null_repo_id_and_concurrent_upsert(
     isolated_postgres_dsn: str,

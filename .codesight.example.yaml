@@ -1,0 +1,25 @@
+# ==============================================================================
+# CodeSight-AI Repository Configuration (.codesight.yaml)
+# Place a copy named `.codesight.yaml` at the root of your default branch.
+# ==============================================================================
+
+# Minimum Technical Debt Score (0..100) before the Smart Quality Gate flags PRs.
+min_debt_score: 60
+
+# GitHub PR review event emitted when CRITICAL findings or gate failures occur:
+#   - COMMENT          (default: non-blocking inline + summary feedback)
+#   - REQUEST_CHANGES  (blocks merge when branch protection requires approval)
+review_action: COMMENT
+
+# Additional POSIX glob patterns excluded from AST indexing and PR diff review
+# (combined with CodeSight-AI's built-in lockfile/binary/migration exclusions).
+ignore_paths:
+  - "docs/generated/**"
+  - "**/*.snap"
+  - "vendor/**"
+
+# Optional project-specific architectural and security guidelines (<= 4000 chars)
+# injected into ContextBuilder and Critic Agent prompts.
+custom_rules: |
+  - Services and API route handlers must use SQLAlchemy AsyncSession; never run blocking I/O inside async functions.
+  - Never persist raw customer source code on disk or inside vector database payloads (Zero-Code Persistence).

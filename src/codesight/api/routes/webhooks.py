@@ -7,11 +7,10 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Final, Literal, Protocol, TypeGuard, cast
 
 import redis.asyncio as redis_async
-import redis.exceptions
 import structlog
 from celery import Celery
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -25,11 +24,14 @@ from codesight.core.config import Settings, get_settings
 from codesight.db.models import Repository, WebhookEvent
 from codesight.vcs.github_auth import GitHubAuthConfigError, validate_repo_full_name
 from codesight.worker.celery_app import celery_app
+from codesight.worker.supersede_lock import (
+    PR_SUPERSEDE_TTL_SECONDS,
+    PR_SYNCHRONIZE_DEBOUNCE_SECONDS,
+    AsyncSupersedeLock,
+)
 
 MAX_WEBHOOK_BODY_BYTES: Final[int] = 25 * 1024 * 1024  # 25 MiB ceiling for 512m container
 ACTIONABLE_PR_ACTIONS: Final[frozenset[str]] = frozenset({"opened", "synchronize", "reopened"})
-PR_SYNCHRONIZE_DEBOUNCE_SECONDS: Final[int] = 5
-PR_SUPERSEDE_TTL_SECONDS: Final[int] = 86400
 STALE_RECEIVED_SECONDS: Final[int] = 60
 BROKER_PUBLISH_RETRY_DELAY_SECONDS: Final[float] = 0.05
 _ZERO_SHA: Final[str] = "0" * 40
@@ -52,6 +54,8 @@ class PRWebhookDispatchPayload(BaseModel):
     pr_number: int
     head_sha: str
     base_sha: str | None = None
+    before_sha: str | None = None
+    updated_at_ms: int | None = None
     action: str
 
 
@@ -72,7 +76,7 @@ class PushWebhookDispatchPayload(BaseModel):
 class WebhookAckResponse(BaseModel):
     """Structured acknowledgment returned by POST /api/v1/webhooks/github."""
 
-    status: Literal["queued", "duplicate", "ignored", "pong"]
+    status: Literal["queued", "superseded", "duplicate", "ignored", "pong"]
     delivery_id: str
     event: str
     task_id: str | None = None
@@ -81,19 +85,13 @@ class WebhookAckResponse(BaseModel):
 class WebhookDispatcher(Protocol):
     """Protocol abstracting background dispatch for test injection."""
 
-    async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
-        """Enqueue a pull_request review job and return its task ID."""
+    async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str | None:
+        """Enqueue a pull_request review job and return its task ID, or None if stale."""
         ...
 
     async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str:
         """Enqueue a default-branch incremental sync job and return its task ID."""
         ...
-
-
-def _decode_redis_str(raw: object) -> str | None:
-    if isinstance(raw, (bytes, bytearray)):
-        return raw.decode("utf-8") or None
-    return str(raw) if raw else None
 
 
 class CeleryWebhookDispatcher:
@@ -107,6 +105,7 @@ class CeleryWebhookDispatcher:
     ) -> None:
         self._app = app
         self._redis_client = redis_client
+        self._lock = AsyncSupersedeLock(redis_client) if redis_client is not None else None
 
     async def _publish_task(
         self,
@@ -133,25 +132,31 @@ class CeleryWebhookDispatcher:
             )
         return str(result.id)
 
-    async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
+    async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str | None:
         target = self._app if self._app is not None else celery_app
         countdown = PR_SYNCHRONIZE_DEBOUNCE_SECONDS if payload.action == "synchronize" else 0
-        sha_key = f"pr_active:{payload.repo_id}:{payload.pr_number}"
-        task_key = f"pr_active_task:{payload.repo_id}:{payload.pr_number}"
-        prev_sha: str | None = None
-        prev_task_id: str | None = None
-        wrote_sha = False
-
-        if self._redis_client is not None:
-            try:
-                prev_sha = _decode_redis_str(await self._redis_client.get(sha_key))
-                prev_task_id = _decode_redis_str(await self._redis_client.get(task_key))
-                await self._redis_client.set(
-                    sha_key, payload.head_sha, ex=PR_SUPERSEDE_TTL_SECONDS
-                )
-                wrote_sha = True
-            except (redis.exceptions.RedisError, OSError) as exc:
-                logger.warning("webhook_supersede_cache_unavailable", error_type=type(exc).__name__)
+        lock = self._lock
+        claim = (
+            await lock.claim_active_sha(
+                payload.repo_id,
+                payload.pr_number,
+                payload.head_sha,
+                ttl_seconds=PR_SUPERSEDE_TTL_SECONDS,
+                before_sha=payload.before_sha,
+                event_ts_ms=payload.updated_at_ms,
+            )
+            if lock is not None
+            else None
+        )
+        if claim is not None and claim.stale:
+            logger.info(
+                "webhook_pr_out_of_order_superseded",
+                repo_id=payload.repo_id,
+                pr_number=payload.pr_number,
+                stale_head_sha=payload.head_sha,
+                active_head_sha=claim.prev_sha,
+            )
+            return None
 
         try:
             task_id = await self._publish_task(
@@ -161,42 +166,46 @@ class CeleryWebhookDispatcher:
                 countdown=countdown,
             )
         except Exception:
-            if wrote_sha and self._redis_client is not None:
-                try:
-                    current_sha = _decode_redis_str(await self._redis_client.get(sha_key))
-                    if current_sha == payload.head_sha:
-                        if prev_sha is not None:
-                            await self._redis_client.set(
-                                sha_key, prev_sha, ex=PR_SUPERSEDE_TTL_SECONDS
-                            )
-                        else:
-                            await self._redis_client.delete(sha_key)
-                except (redis.exceptions.RedisError, OSError) as rollback_exc:
-                    logger.warning(
-                        "webhook_supersede_rollback_failed",
-                        error_type=type(rollback_exc).__name__,
-                    )
+            if lock is not None and claim is not None and claim.claimed:
+                await lock.rollback_active_sha(
+                    payload.repo_id,
+                    payload.pr_number,
+                    attempted_sha=payload.head_sha,
+                    prev_sha=claim.prev_sha,
+                    ttl_seconds=PR_SUPERSEDE_TTL_SECONDS,
+                    added_ancestor=claim.added_ancestor,
+                    removed_ancestor=claim.removed_ancestor,
+                    prev_ts_ms=claim.prev_ts_ms,
+                )
             raise
 
-        if self._redis_client is not None:
+        async def _revoke_superseded(superseded_task_id: str) -> None:
             try:
-                await self._redis_client.set(task_key, task_id, ex=PR_SUPERSEDE_TTL_SECONDS)
-            except (redis.exceptions.RedisError, OSError) as exc:
-                logger.warning("webhook_supersede_cache_unavailable", error_type=type(exc).__name__)
+                await asyncio.to_thread(
+                    target.control.revoke,
+                    superseded_task_id,
+                    terminate=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "webhook_supersede_revoke_failed",
+                    superseded_task_id=superseded_task_id,
+                    error_type=type(exc).__name__,
+                )
 
+        if lock is not None:
+            record_coro = lock.record_active_task(
+                payload.repo_id,
+                payload.pr_number,
+                head_sha=payload.head_sha,
+                task_id=task_id,
+                ttl_seconds=PR_SUPERSEDE_TTL_SECONDS,
+            )
+            prev_task_id = claim.prev_task_id if claim is not None else None
             if prev_task_id and prev_task_id != task_id:
-                try:
-                    await asyncio.to_thread(
-                        target.control.revoke,
-                        prev_task_id,
-                        terminate=False,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "webhook_supersede_revoke_failed",
-                        superseded_task_id=prev_task_id,
-                        error_type=type(exc).__name__,
-                    )
+                await asyncio.gather(record_coro, _revoke_superseded(prev_task_id))
+            else:
+                await record_coro
 
         return task_id
 
@@ -225,6 +234,26 @@ class _QueuedPRWebhook:
     pr_number: int
     head_sha: str
     base_sha: str | None
+    before_sha: str | None = None
+    updated_at_ms: int | None = None
+
+
+def _parse_iso_timestamp_ms(raw: Any) -> int | None:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = f"{cleaned[:-1]}+00:00"
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    ts_ms = int(dt.timestamp() * 1000)
+    return ts_ms if ts_ms > 0 else None
 
 
 @dataclass(frozen=True)
@@ -393,6 +422,14 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
         base_sha_raw = base_raw.get("sha") if isinstance(base_raw, dict) else None
         head_sha = head_sha_raw.strip() if isinstance(head_sha_raw, str) else ""
         base_sha = base_sha_raw.strip() if isinstance(base_sha_raw, str) else None
+        before_raw = payload.get("before")
+        before_sha_clean = before_raw.strip() if isinstance(before_raw, str) else ""
+        before_sha = (
+            before_sha_clean
+            if before_sha_clean and len(before_sha_clean) <= 64 and before_sha_clean != _ZERO_SHA
+            else None
+        )
+        updated_at_ms = _parse_iso_timestamp_ms(pr_raw.get("updated_at"))
         if (
             not _is_strict_positive_int(pr_number, max_value=_MAX_INT32)
             or not head_sha
@@ -411,6 +448,8 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
             pr_number=pr_number,
             head_sha=head_sha,
             base_sha=base_sha if base_sha and len(base_sha) <= 64 else None,
+            before_sha=before_sha,
+            updated_at_ms=updated_at_ms,
         )
 
     if event_type == "push":
@@ -467,10 +506,14 @@ async def _apply_repo_upsert(
         ).scalar_one_or_none()
         if existing is None:
             return None
-        existing.default_branch = default_branch
-        if installation_id is not None:
-            existing.installation_id = installation_id
-        await session.flush()
+        needs_update = existing.default_branch != default_branch or (
+            installation_id is not None and existing.installation_id != installation_id
+        )
+        if needs_update:
+            existing.default_branch = default_branch
+            if installation_id is not None:
+                existing.installation_id = installation_id
+            await session.flush()
         return existing
 
     rows = list(
@@ -499,11 +542,17 @@ async def _apply_repo_upsert(
             )
             by_name.full_name = _stale_repo_name(by_name.full_name, suffix)
             await session.flush()
-        by_id.full_name = full_name
-        by_id.default_branch = default_branch
-        if installation_id is not None:
-            by_id.installation_id = installation_id
-        await session.flush()
+        needs_update = (
+            by_id.full_name != full_name
+            or by_id.default_branch != default_branch
+            or (installation_id is not None and by_id.installation_id != installation_id)
+        )
+        if needs_update:
+            by_id.full_name = full_name
+            by_id.default_branch = default_branch
+            if installation_id is not None:
+                by_id.installation_id = installation_id
+            await session.flush()
         return by_id
 
     if by_name is not None:
@@ -745,6 +794,7 @@ async def receive_github_webhook(
 
     # Phase 2: Dispatch to Celery outside the DB transaction so workers see committed state
     dispatcher = _get_dispatcher(request)
+    task_id: str | None
     try:
         if isinstance(classified, _QueuedPRWebhook):
             task_id = await dispatcher.dispatch_pull_request(
@@ -758,6 +808,8 @@ async def receive_github_webhook(
                     pr_number=classified.pr_number,
                     head_sha=classified.head_sha,
                     base_sha=classified.base_sha,
+                    before_sha=classified.before_sha,
+                    updated_at_ms=classified.updated_at_ms,
                     action=classified.action,
                 )
             )
@@ -801,13 +853,14 @@ async def receive_github_webhook(
             detail="Background task broker unavailable; please retry delivery.",
         ) from exc
 
-    # Phase 3: Mark event 'queued' after dispatch succeeds (best-effort; 'received' blocks dups)
+    # Phase 3: Mark event 'queued' or 'ignored' (superseded) after dispatch completes
+    target_db_status = "ignored" if task_id is None else "queued"
     try:
         async with session_factory() as complete_session:
             await complete_session.execute(
                 update(WebhookEvent)
                 .where(WebhookEvent.delivery_id == delivery_id)
-                .values(status="queued")
+                .values(status=target_db_status)
             )
             await complete_session.commit()
     except Exception as exc:
@@ -815,6 +868,21 @@ async def receive_github_webhook(
             "webhook_mark_queued_failed",
             delivery_id=delivery_id,
             error_type=type(exc).__name__,
+        )
+
+    if task_id is None:
+        response.status_code = status.HTTP_200_OK
+        logger.info(
+            "webhook_event_superseded",
+            delivery_id=delivery_id,
+            github_event=event_type,
+            action=classified.action,
+        )
+        return WebhookAckResponse(
+            status="superseded",
+            delivery_id=delivery_id,
+            event=event_type,
+            task_id=None,
         )
 
     response.status_code = status.HTTP_202_ACCEPTED
