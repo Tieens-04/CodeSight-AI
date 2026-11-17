@@ -871,7 +871,7 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
     observed_during_dispatch: list[tuple[str | None, str | None]] = []
 
     class _VisibilityCheckingDispatcher:
-        async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
+        async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str | None:
             # Independent connection MUST already see committed Repo + WebhookEvent ('received')
             async with session_factory() as worker_session:
                 repo_row = (
@@ -886,6 +886,8 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
                         evt_row.status if evt_row else None,
                     )
                 )
+            if payload.delivery_id == "deliv-superseded-stale":
+                return None
             return "task-vis-1"
 
         async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str:
@@ -931,7 +933,20 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
             )
             assert r_reuse.status_code == 202
 
-        assert len(observed_during_dispatch) == 2
+            # 3. Stale out-of-order PR delivery (dispatcher returns None) -> 200 status='superseded'
+            r_sup = await _send(
+                "deliv-superseded-stale",
+                _pr_payload(action="synchronize", repo_id=300, full_name="org/beta", pr_number=11),
+            )
+            assert r_sup.status_code == 200
+            assert r_sup.json() == {
+                "status": "superseded",
+                "delivery_id": "deliv-superseded-stale",
+                "event": "pull_request",
+                "task_id": None,
+            }
+
+        assert len(observed_during_dispatch) == 3
         assert all(
             repo_id is not None and evt_status == "received"
             for repo_id, evt_status in observed_during_dispatch
@@ -947,8 +962,10 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
             assert repos[300] == "org/beta"
             evt1 = await check.get(WebhookEvent, "deliv-rename-collision")
             evt2 = await check.get(WebhookEvent, "deliv-slug-reuse")
+            evt3 = await check.get(WebhookEvent, "deliv-superseded-stale")
             assert evt1 is not None and evt1.status == "queued"
             assert evt2 is not None and evt2.status == "queued"
+            assert evt3 is not None and evt3.status == "ignored"
     finally:
         await engine.dispose()
 

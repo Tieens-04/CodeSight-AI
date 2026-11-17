@@ -510,7 +510,7 @@ async def test_offline_out_of_order_guard_and_worker_pre_publish_lock_creation(
             action="synchronize",
         )
     )
-    assert t_stale == "superseded:sha-2"
+    assert t_stale is None
     assert sent_tasks == [("task-1", "sha-2")]
     assert revoked_tasks == []
     assert mem_redis.store[pr_active_sha_key("repo-oo", 8)] == "sha-2"

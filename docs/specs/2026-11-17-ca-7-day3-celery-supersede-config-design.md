@@ -34,6 +34,7 @@
 - **`pr_active_task_key(repo_id: str, pr_number: int) -> str`:** Returns `"pr_active_task:{repo_id}:{pr_number}"`.
 - **`PR_SUPERSEDE_TTL_SECONDS: Final[int] = 86_400`** (`24` hours).
 - **`PR_SYNCHRONIZE_DEBOUNCE_SECONDS: Final[int] = 5`** (`countdown=0` for `opened` and `reopened`; `countdown=5` for `synchronize`).
+- **Stale Delivery Ack Contract:** When an out-of-order stale PR webhook is skipped at dispatch time, `CeleryWebhookDispatcher.dispatch_pull_request()` returns `None` and `POST /api/v1/webhooks/github` returns `HTTP 200` `WebhookAckResponse(status="superseded", task_id=None)` while persisting `webhook_events.status = 'ignored'` (preventing duplicate redeliveries without conflating skipped deliveries with queued tasks).
 - **`PRSupersededError(Exception)`:** Carries `repo_id: str`, `pr_number: int`, `head_sha: str`, `active_head_sha: str`, and `stage: str` (`"entry"`, `"pre_retry"`, `"pre_llm"`, `"pre_publish"`). Treated as a clean cooperative cancellation — never retried.
 
 ### 2.2 Multi-Checkpoint Lifecycle & Atomic Lua CAS Scripts

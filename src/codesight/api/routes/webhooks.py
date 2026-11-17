@@ -76,7 +76,7 @@ class PushWebhookDispatchPayload(BaseModel):
 class WebhookAckResponse(BaseModel):
     """Structured acknowledgment returned by POST /api/v1/webhooks/github."""
 
-    status: Literal["queued", "duplicate", "ignored", "pong"]
+    status: Literal["queued", "superseded", "duplicate", "ignored", "pong"]
     delivery_id: str
     event: str
     task_id: str | None = None
@@ -85,8 +85,8 @@ class WebhookAckResponse(BaseModel):
 class WebhookDispatcher(Protocol):
     """Protocol abstracting background dispatch for test injection."""
 
-    async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
-        """Enqueue a pull_request review job and return its task ID."""
+    async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str | None:
+        """Enqueue a pull_request review job and return its task ID, or None if stale."""
         ...
 
     async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str:
@@ -132,7 +132,7 @@ class CeleryWebhookDispatcher:
             )
         return str(result.id)
 
-    async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
+    async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str | None:
         target = self._app if self._app is not None else celery_app
         countdown = PR_SYNCHRONIZE_DEBOUNCE_SECONDS if payload.action == "synchronize" else 0
         lock = self._lock
@@ -156,7 +156,7 @@ class CeleryWebhookDispatcher:
                 stale_head_sha=payload.head_sha,
                 active_head_sha=claim.prev_sha,
             )
-            return f"superseded:{claim.prev_sha or 'stale'}"
+            return None
 
         try:
             task_id = await self._publish_task(
@@ -794,6 +794,7 @@ async def receive_github_webhook(
 
     # Phase 2: Dispatch to Celery outside the DB transaction so workers see committed state
     dispatcher = _get_dispatcher(request)
+    task_id: str | None
     try:
         if isinstance(classified, _QueuedPRWebhook):
             task_id = await dispatcher.dispatch_pull_request(
@@ -852,13 +853,14 @@ async def receive_github_webhook(
             detail="Background task broker unavailable; please retry delivery.",
         ) from exc
 
-    # Phase 3: Mark event 'queued' after dispatch succeeds (best-effort; 'received' blocks dups)
+    # Phase 3: Mark event 'queued' or 'ignored' (superseded) after dispatch completes
+    target_db_status = "ignored" if task_id is None else "queued"
     try:
         async with session_factory() as complete_session:
             await complete_session.execute(
                 update(WebhookEvent)
                 .where(WebhookEvent.delivery_id == delivery_id)
-                .values(status="queued")
+                .values(status=target_db_status)
             )
             await complete_session.commit()
     except Exception as exc:
@@ -866,6 +868,21 @@ async def receive_github_webhook(
             "webhook_mark_queued_failed",
             delivery_id=delivery_id,
             error_type=type(exc).__name__,
+        )
+
+    if task_id is None:
+        response.status_code = status.HTTP_200_OK
+        logger.info(
+            "webhook_event_superseded",
+            delivery_id=delivery_id,
+            github_event=event_type,
+            action=classified.action,
+        )
+        return WebhookAckResponse(
+            status="superseded",
+            delivery_id=delivery_id,
+            event=event_type,
+            task_id=None,
         )
 
     response.status_code = status.HTTP_202_ACCEPTED
