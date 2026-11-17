@@ -11,7 +11,6 @@ from datetime import timedelta
 from typing import Any, Final, Literal, Protocol, TypeGuard, cast
 
 import redis.asyncio as redis_async
-import redis.exceptions
 import structlog
 from celery import Celery
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -25,11 +24,14 @@ from codesight.core.config import Settings, get_settings
 from codesight.db.models import Repository, WebhookEvent
 from codesight.vcs.github_auth import GitHubAuthConfigError, validate_repo_full_name
 from codesight.worker.celery_app import celery_app
+from codesight.worker.supersede_lock import (
+    PR_SUPERSEDE_TTL_SECONDS,
+    PR_SYNCHRONIZE_DEBOUNCE_SECONDS,
+    AsyncSupersedeLock,
+)
 
 MAX_WEBHOOK_BODY_BYTES: Final[int] = 25 * 1024 * 1024  # 25 MiB ceiling for 512m container
 ACTIONABLE_PR_ACTIONS: Final[frozenset[str]] = frozenset({"opened", "synchronize", "reopened"})
-PR_SYNCHRONIZE_DEBOUNCE_SECONDS: Final[int] = 5
-PR_SUPERSEDE_TTL_SECONDS: Final[int] = 86400
 STALE_RECEIVED_SECONDS: Final[int] = 60
 BROKER_PUBLISH_RETRY_DELAY_SECONDS: Final[float] = 0.05
 _ZERO_SHA: Final[str] = "0" * 40
@@ -90,12 +92,6 @@ class WebhookDispatcher(Protocol):
         ...
 
 
-def _decode_redis_str(raw: object) -> str | None:
-    if isinstance(raw, (bytes, bytearray)):
-        return raw.decode("utf-8") or None
-    return str(raw) if raw else None
-
-
 class CeleryWebhookDispatcher:
     """Dispatches webhook jobs to Celery via asyncio.to_thread to keep ASGI non-blocking."""
 
@@ -136,22 +132,17 @@ class CeleryWebhookDispatcher:
     async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
         target = self._app if self._app is not None else celery_app
         countdown = PR_SYNCHRONIZE_DEBOUNCE_SECONDS if payload.action == "synchronize" else 0
-        sha_key = f"pr_active:{payload.repo_id}:{payload.pr_number}"
-        task_key = f"pr_active_task:{payload.repo_id}:{payload.pr_number}"
-        prev_sha: str | None = None
-        prev_task_id: str | None = None
-        wrote_sha = False
-
-        if self._redis_client is not None:
-            try:
-                prev_sha = _decode_redis_str(await self._redis_client.get(sha_key))
-                prev_task_id = _decode_redis_str(await self._redis_client.get(task_key))
-                await self._redis_client.set(
-                    sha_key, payload.head_sha, ex=PR_SUPERSEDE_TTL_SECONDS
-                )
-                wrote_sha = True
-            except (redis.exceptions.RedisError, OSError) as exc:
-                logger.warning("webhook_supersede_cache_unavailable", error_type=type(exc).__name__)
+        lock = AsyncSupersedeLock(self._redis_client) if self._redis_client is not None else None
+        claim = (
+            await lock.claim_active_sha(
+                payload.repo_id,
+                payload.pr_number,
+                payload.head_sha,
+                ttl_seconds=PR_SUPERSEDE_TTL_SECONDS,
+            )
+            if lock is not None
+            else None
+        )
 
         try:
             task_id = await self._publish_task(
@@ -161,29 +152,25 @@ class CeleryWebhookDispatcher:
                 countdown=countdown,
             )
         except Exception:
-            if wrote_sha and self._redis_client is not None:
-                try:
-                    current_sha = _decode_redis_str(await self._redis_client.get(sha_key))
-                    if current_sha == payload.head_sha:
-                        if prev_sha is not None:
-                            await self._redis_client.set(
-                                sha_key, prev_sha, ex=PR_SUPERSEDE_TTL_SECONDS
-                            )
-                        else:
-                            await self._redis_client.delete(sha_key)
-                except (redis.exceptions.RedisError, OSError) as rollback_exc:
-                    logger.warning(
-                        "webhook_supersede_rollback_failed",
-                        error_type=type(rollback_exc).__name__,
-                    )
+            if lock is not None and claim is not None and claim.claimed:
+                await lock.rollback_active_sha(
+                    payload.repo_id,
+                    payload.pr_number,
+                    attempted_sha=payload.head_sha,
+                    prev_sha=claim.prev_sha,
+                    ttl_seconds=PR_SUPERSEDE_TTL_SECONDS,
+                )
             raise
 
-        if self._redis_client is not None:
-            try:
-                await self._redis_client.set(task_key, task_id, ex=PR_SUPERSEDE_TTL_SECONDS)
-            except (redis.exceptions.RedisError, OSError) as exc:
-                logger.warning("webhook_supersede_cache_unavailable", error_type=type(exc).__name__)
-
+        if lock is not None:
+            await lock.record_active_task(
+                payload.repo_id,
+                payload.pr_number,
+                head_sha=payload.head_sha,
+                task_id=task_id,
+                ttl_seconds=PR_SUPERSEDE_TTL_SECONDS,
+            )
+            prev_task_id = claim.prev_task_id if claim is not None else None
             if prev_task_id and prev_task_id != task_id:
                 try:
                     await asyncio.to_thread(
