@@ -1,15 +1,44 @@
-"""Shared pytest fixtures for isolated temporary PostgreSQL test databases."""
+"""Shared pytest fixtures for isolated temporary PostgreSQL test databases and validators."""
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
 from urllib.parse import quote_plus
 
 import asyncpg
 import pytest
 
 from codesight.core.config import Settings
+
+
+@functools.lru_cache(maxsize=1)
+def load_guard_validator() -> Any:
+    """Load the github-diff-suggestion-guard validator script once per test session."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = (
+        repo_root
+        / ".agents"
+        / "skills"
+        / "github-diff-suggestion-guard"
+        / "scripts"
+        / "validate_diff_and_payload.py"
+    )
+    spec = importlib.util.spec_from_file_location("validate_diff_and_payload", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="session")
+def guard_validator() -> Any:
+    """Session-scoped fixture exposing the github-diff-suggestion-guard oracle."""
+    return load_guard_validator()
 
 
 @pytest.fixture
