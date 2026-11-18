@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,6 +49,7 @@ OUT_OF_HUNK_HEADING: Final[str] = (
     "### Findings Outside Diff Hunks (Out-of-Hunk / File-level Findings)"
 )
 MAX_CHECK_TEXT_CHARS: Final[int] = 65_535
+_MAX_TRACKED_CHECK_RUNS: Final[int] = 1024
 DEFAULT_EMPTY_REVIEW_BODY: Final[str] = "CodeSight-AI review completed with no blocking issues."
 
 _VALID_CONCLUSIONS: Final[frozenset[str]] = frozenset({"success", "neutral", "failure"})
@@ -320,6 +322,19 @@ class GitHubReviewPublisher:
         self._owns_client = http_client is None
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        self._completed_check_runs: OrderedDict[tuple[str, int], None] = OrderedDict()
+
+    def _mark_check_run_completed(self, slug: str, check_run_id: int) -> None:
+        key = (slug, check_run_id)
+        self._completed_check_runs[key] = None
+        self._completed_check_runs.move_to_end(key)
+        while len(self._completed_check_runs) > _MAX_TRACKED_CHECK_RUNS:
+            self._completed_check_runs.popitem(last=False)
+
+    def has_completed_check_run(self, repo_full_name: str, check_run_id: int) -> bool:
+        """Return True if this publisher already observed check_run_id as completed."""
+        slug = validate_repo_full_name(repo_full_name)
+        return (slug, check_run_id) in self._completed_check_runs
 
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is not None and not self._owns_client and self._client.is_closed:
@@ -530,6 +545,7 @@ class GitHubReviewPublisher:
             json_body=payload,
             installation_id=installation_id,
         )
+        self._mark_check_run_completed(slug, valid_id)
         record = CheckRunRecord(
             check_run_id=valid_id,
             name=str(data.get("name") or "CodeSight-AI Review"),
@@ -567,7 +583,9 @@ class GitHubReviewPublisher:
                 stage=stage,
             )
         except PRSupersededError:
-            if check_run_id is not None:
+            if check_run_id is not None and not self.has_completed_check_run(
+                repo_slug, check_run_id
+            ):
                 try:
                     await self.complete_check_run(
                         repo_slug,
@@ -580,7 +598,24 @@ class GitHubReviewPublisher:
                         ),
                         installation_id=installation_id,
                     )
-                except (RetryableTaskError, GitHubPublishError, GitHubAuthError) as cleanup_exc:
+                except GitHubPublishError as pub_exc:
+                    if pub_exc.status_code == 422:
+                        self._mark_check_run_completed(repo_slug, check_run_id)
+                        logger.info(
+                            "github_check_run_already_completed",
+                            repo=repo_slug,
+                            check_run_id=check_run_id,
+                            stage=stage,
+                        )
+                    else:
+                        logger.warning(
+                            "github_check_run_supersede_cleanup_failed",
+                            repo=repo_slug,
+                            check_run_id=check_run_id,
+                            stage=stage,
+                            error_type=type(pub_exc).__name__,
+                        )
+                except (RetryableTaskError, GitHubAuthError) as cleanup_exc:
                     logger.warning(
                         "github_check_run_supersede_cleanup_failed",
                         repo=repo_slug,

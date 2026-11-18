@@ -9,6 +9,7 @@ from codesight.vcs.github_auth import (
     normalize_private_key,
     validate_repo_full_name,
 )
+from codesight.vcs.github_pr_client import FetchedPullRequestDiff, GitHubPullRequestClient
 from codesight.vcs.github_publisher import (
     OUT_OF_HUNK_HEADING,
     AsyncSupersedeLockProtocol,
@@ -31,10 +32,12 @@ __all__ = [
     "CheckConclusion",
     "CheckRunRecord",
     "DowngradedComment",
+    "FetchedPullRequestDiff",
     "GitHubAuthConfigError",
     "GitHubAuthError",
     "GitHubAuthProvider",
     "GitHubPublishError",
+    "GitHubPullRequestClient",
     "GitHubReviewPublisher",
     "PreparedPullRequestReview",
     "PublishedReviewRecord",
