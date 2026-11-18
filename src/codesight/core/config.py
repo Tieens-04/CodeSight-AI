@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # Health probe timeout
     health_timeout_seconds: float = 1.5
 
+    # Week 1 E2E milestone smoke review behavior (set False when LangGraph AI pipeline takes over)
+    week1_smoke_inline_comment: bool = True
+
     # Optional Phase 2+ secrets (kept None until configured)
     github_app_id: str | None = None
     github_private_key: SecretStr | None = None
