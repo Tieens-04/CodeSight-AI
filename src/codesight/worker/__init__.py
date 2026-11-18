@@ -5,14 +5,16 @@ from codesight.worker.celery_app import (
     RETRY_BASE_SECONDS,
     RETRY_CAP_SECONDS,
     CodeSightTask,
-    PRReviewLifecycleContext,
-    classify_retryable_exception,
     compute_retry_countdown,
     create_celery_app,
     execute_pr_review_lifecycle,
     handle_pr_event,
     handle_push_event,
     ping,
+)
+from codesight.worker.lifecycle import (
+    PRReviewLifecycleContext,
+    classify_retryable_exception,
 )
 from codesight.worker.supersede_lock import (
     PR_SUPERSEDE_TTL_SECONDS,

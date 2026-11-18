@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import concurrent.futures
 import contextvars
+import os
 import random
+import threading
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Final, ParamSpec, TypeVar, cast
 
 import httpx
@@ -23,31 +24,30 @@ from celery.signals import (
     task_postrun,
     task_prerun,
     worker_process_init,
+    worker_process_shutdown,
 )
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from codesight.config_reader.repo_config import RepoConfig, RepoConfigLoader
+from codesight.config_reader.repo_config import RepoConfigLoader
 from codesight.core.config import Settings, get_settings
-from codesight.core.ephemeral import async_ephemeral_workspace
-from codesight.core.errors import (
-    RateLimitTaskError,
-    RetryableTaskError,
-    parse_retry_after_header,
-)
 from codesight.core.logging import (
     bind_trace_id,
     clear_trace_context,
     configure_logging,
     get_trace_id,
 )
-from codesight.vcs.github_auth import (
-    GitHubAuthConfigError,
-    GitHubAuthError,
-    GitHubAuthProvider,
+from codesight.db.session import create_db_engine, create_session_factory
+from codesight.worker.lifecycle import (
+    PRReviewLifecycleContext,
+    classify_retryable_exception,
+    extract_pr_coords,
+    has_github_credentials,
 )
-from codesight.worker.supersede_lock import (
-    AsyncSupersedeLock,
-    PRSupersededError,
+from codesight.worker.lifecycle import (
+    execute_pr_review_lifecycle as _execute_pr_review_lifecycle_impl,
 )
+from codesight.worker.pr_review_runner import Week1PRReviewRunner
+from codesight.worker.supersede_lock import AsyncSupersedeLock
 from codesight.worker.supersede_lock import (
     is_pr_event_superseded as _is_pr_superseded_impl,
 )
@@ -79,9 +79,15 @@ def inject_trace_id_header(
 
 
 def on_worker_process_init(**_: Any) -> None:
-    """Configure structured JSON logging when a Celery worker process boots."""
+    """Configure structured JSON logging and reset inherited runtime state on worker boot."""
+    _WORKER_RUNTIME.shutdown()
     settings = get_settings()
     configure_logging(level=settings.log_level, service_name="codesight-worker")
+
+
+def on_worker_process_shutdown(**_: Any) -> None:
+    """Drain and close worker-level async pools and loop thread on shutdown."""
+    _WORKER_RUNTIME.shutdown()
 
 
 def on_task_prerun(
@@ -116,51 +122,6 @@ def is_pr_event_superseded(
         redis_client=redis_client,
         redis_from_url=redis_sync.Redis.from_url,
     )
-
-
-def _classify_http_status_response(resp: httpx.Response) -> tuple[bool, float | None]:
-    code = resp.status_code
-    is_rl_403 = code == 403 and bool(
-        resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-remaining") == "0"
-    )
-    if code == 429 or is_rl_403:
-        return True, parse_retry_after_header(resp.headers)
-    if 500 <= code < 600:
-        return True, None
-    return False, None
-
-
-def classify_retryable_exception(exc: BaseException) -> tuple[bool, float | None]:
-    """Return (is_retryable, optional_retry_after_seconds) for worker exception triage."""
-    if isinstance(exc, (PRSupersededError, GitHubAuthConfigError)):
-        return False, None
-    if isinstance(exc, RateLimitTaskError):
-        return True, exc.retry_after_seconds
-    if isinstance(exc, RetryableTaskError):
-        return True, None
-    if isinstance(exc, GitHubAuthError):
-        cause = exc.__cause__
-        if isinstance(cause, httpx.HTTPStatusError):
-            return _classify_http_status_response(cause.response)
-        code = exc.status_code
-        if code == 429 or (code is not None and 500 <= code < 600):
-            return True, None
-        if code is None and isinstance(cause, httpx.RequestError):
-            return True, None
-        return False, None
-    if isinstance(exc, httpx.HTTPStatusError):
-        return _classify_http_status_response(exc.response)
-    if isinstance(
-        exc,
-        (
-            httpx.TimeoutException,
-            httpx.TransportError,
-            redis.exceptions.ConnectionError,
-            redis.exceptions.TimeoutError,
-        ),
-    ):
-        return True, None
-    return False, None
 
 
 def compute_retry_countdown(
@@ -280,6 +241,7 @@ def _typed_task(
 before_task_publish.connect(inject_trace_id_header, weak=False)
 setup_logging.connect(on_worker_process_init, weak=False)
 worker_process_init.connect(on_worker_process_init, weak=False)
+worker_process_shutdown.connect(on_worker_process_shutdown, weak=False)
 task_prerun.connect(on_task_prerun, weak=False)
 task_postrun.connect(on_task_postrun, weak=False)
 
@@ -294,46 +256,6 @@ def ping() -> dict[str, str]:
     return {"status": "pong", "trace_id": trace_id}
 
 
-@dataclass(frozen=True)
-class PRReviewLifecycleContext:
-    """Execution context passed through worker review and publish stages."""
-
-    payload: Mapping[str, Any]
-    trace_id: str
-    workspace_dir: Path
-    repo_config: RepoConfig
-    supersede_lock: AsyncSupersedeLock | None = None
-
-
-def _has_github_credentials(settings: Settings) -> bool:
-    has_app = bool(
-        settings.github_app_id
-        and settings.github_app_id.strip()
-        and settings.github_private_key is not None
-        and settings.github_private_key.get_secret_value().strip()
-    )
-    has_pat = bool(
-        settings.github_token is not None and settings.github_token.get_secret_value().strip()
-    )
-    return has_app or has_pat
-
-
-def _extract_pr_coords(payload: Mapping[str, Any]) -> tuple[str, int, str] | None:
-    repo_id = payload.get("repo_id")
-    pr_number = payload.get("pr_number")
-    head_sha = payload.get("head_sha")
-    if (
-        isinstance(repo_id, str)
-        and repo_id
-        and isinstance(pr_number, int)
-        and not isinstance(pr_number, bool)
-        and isinstance(head_sha, str)
-        and head_sha
-    ):
-        return repo_id, pr_number, head_sha
-    return None
-
-
 async def execute_pr_review_lifecycle(
     payload: Mapping[str, Any],
     *,
@@ -342,135 +264,305 @@ async def execute_pr_review_lifecycle(
     config_loader: RepoConfigLoader | None = None,
     review_fn: Callable[[PRReviewLifecycleContext], Awaitable[None]] | None = None,
     publish_fn: Callable[[PRReviewLifecycleContext], Awaitable[None]] | None = None,
+    on_superseded_fn: Callable[[PRReviewLifecycleContext], Awaitable[None]] | None = None,
     check_entry_supersede: bool = True,
 ) -> dict[str, str]:
-    """Execute the NFR-3 workspace, .codesight.yaml load, and pre-publish supersede spine."""
-    active_settings = settings if settings is not None else get_settings()
-    trace_id = get_trace_id() or "-"
-    coords = _extract_pr_coords(payload)
-    owned_redis: redis_async.Redis | None = None
-    active_lock = supersede_lock
+    """Delegate lifecycle execution while honoring monkeypatches on celery_app.redis_async."""
+    return await _execute_pr_review_lifecycle_impl(
+        payload,
+        settings=settings,
+        supersede_lock=supersede_lock,
+        config_loader=config_loader,
+        review_fn=review_fn,
+        publish_fn=publish_fn,
+        on_superseded_fn=on_superseded_fn,
+        check_entry_supersede=check_entry_supersede,
+        redis_from_url=redis_async.from_url,
+    )
 
-    if active_lock is None and coords is not None:
-        owned_redis = redis_async.from_url(
-            active_settings.redis_url,
-            decode_responses=True,
-            socket_timeout=0.5,
-        )
-        active_lock = AsyncSupersedeLock(owned_redis)
 
-    try:
-        if check_entry_supersede and active_lock is not None and coords is not None:
-            try:
-                await active_lock.ensure_active(coords[0], coords[1], coords[2], stage="entry")
-            except PRSupersededError:
-                logger.info(
-                    "webhook_pr_superseded",
-                    trace_id=trace_id,
-                    repo=str(payload.get("repo_full_name", "")),
-                    pr_number=coords[1],
-                    head_sha=coords[2],
-                )
-                return {"status": "superseded", "trace_id": trace_id}
+class _WorkerAsyncRuntime:
+    """Fork-safe persistent event loop thread and pooled HTTP/Redis/DB resources per worker."""
 
-        async with async_ephemeral_workspace() as workspace_dir:
-            repo_full_name = payload.get("repo_full_name")
-            default_branch_raw = payload.get("default_branch")
-            default_branch = (
-                default_branch_raw
-                if isinstance(default_branch_raw, str) and default_branch_raw.strip()
-                else "main"
-            )
-            inst_raw = payload.get("installation_id")
-            inst_id = (
-                inst_raw
-                if isinstance(inst_raw, int) and not isinstance(inst_raw, bool)
-                else None
-            )
+    def __init__(self) -> None:
+        self._state_lock = threading.Lock()
+        self._pid: int | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._pool_lock: asyncio.Lock | None = None
+        self._http_client: httpx.AsyncClient | None = None
+        self._redis_client: redis_async.Redis | None = None
+        self._redis_url: str | None = None
+        self._db_engine: AsyncEngine | None = None
+        self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        self._db_dsn: str | None = None
 
-            if config_loader is not None and isinstance(repo_full_name, str) and repo_full_name:
-                repo_config = await config_loader.load(
-                    repo_full_name,
-                    default_branch=default_branch,
-                    installation_id=inst_id,
-                )
-            elif (
-                coords is not None
-                and isinstance(repo_full_name, str)
-                and repo_full_name
-                and _has_github_credentials(active_settings)
+    def _reset_fields(self) -> None:
+        self._pid = None
+        self._loop = None
+        self._thread = None
+        self._pool_lock = None
+        self._http_client = None
+        self._redis_client = None
+        self._redis_url = None
+        self._db_engine = None
+        self._session_factory = None
+        self._db_dsn = None
+
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        with self._state_lock:
+            current_pid = os.getpid()
+            if self._pid is not None and self._pid != current_pid:
+                self._reset_fields()
+
+            if (
+                self._loop is not None
+                and self._thread is not None
+                and self._thread.is_alive()
+                and not self._loop.is_closed()
             ):
-                auth = GitHubAuthProvider(active_settings, redis_client=owned_redis)
-                repo_config = await RepoConfigLoader(auth).load(
-                    repo_full_name,
-                    default_branch=default_branch,
-                    installation_id=inst_id,
-                )
-            else:
-                repo_config = RepoConfig()
+                return self._loop
 
-            ctx = PRReviewLifecycleContext(
-                payload=payload,
-                trace_id=trace_id,
-                workspace_dir=workspace_dir,
-                repo_config=repo_config,
-                supersede_lock=active_lock,
-            )
+            ready = threading.Event()
+            loop_holder: list[asyncio.AbstractEventLoop] = []
 
-            if review_fn is not None:
-                await review_fn(ctx)
-
-            # Mandatory pre-publish Cancel-on-Supersede gate right before posting to GitHub
-            if active_lock is not None and coords is not None:
+            def _loop_thread() -> None:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop_holder.append(loop)
+                ready.set()
                 try:
-                    await active_lock.ensure_active(
-                        coords[0], coords[1], coords[2], stage="pre_publish"
-                    )
-                except PRSupersededError:
-                    logger.info(
-                        "worker_pr_publish_aborted_superseded",
-                        trace_id=trace_id,
-                        repo=str(payload.get("repo_full_name", "")),
-                        pr_number=coords[1],
-                        head_sha=coords[2],
-                    )
-                    return {"status": "superseded", "trace_id": trace_id}
+                    loop.run_forever()
+                finally:
+                    loop.close()
 
-            if publish_fn is not None:
-                await publish_fn(ctx)
+            thread = threading.Thread(
+                target=_loop_thread,
+                name=f"codesight-worker-loop-{current_pid}",
+                daemon=True,
+            )
+            thread.start()
+            ready.wait()
+            self._pid = current_pid
+            self._loop = loop_holder[0]
+            self._thread = thread
+            self._pool_lock = None
+            return self._loop
 
-        logger.info(
-            "webhook_pr_stub_received",
-            trace_id=trace_id,
-            repo=str(payload.get("repo_full_name", "")),
-            pr_number=payload.get("pr_number"),
-            action=payload.get("action"),
-            config_hash=repo_config.config_hash,
-        )
-        return {"status": "accepted", "trace_id": trace_id}
-    finally:
-        if owned_redis is not None:
+    def run_coro[T](self, coro: Coroutine[Any, Any, T]) -> T:
+        loop = self._ensure_loop()
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            coro.close()
+            raise RuntimeError("Cannot call run_coro synchronously from inside worker event loop.")
+
+        ctx = contextvars.copy_context()
+        result_future: concurrent.futures.Future[T] = concurrent.futures.Future()
+
+        def _schedule() -> None:
+            if not result_future.set_running_or_notify_cancel():
+                coro.close()
+                return
+            task = loop.create_task(coro, context=ctx)
+
+            def _on_done(done_task: asyncio.Task[T]) -> None:
+                if done_task.cancelled():
+                    result_future.cancel()
+                    return
+                exc = done_task.exception()
+                if exc is not None:
+                    result_future.set_exception(exc)
+                else:
+                    result_future.set_result(done_task.result())
+
+            task.add_done_callback(_on_done)
+
+        try:
+            loop.call_soon_threadsafe(_schedule)
+        except RuntimeError:
+            coro.close()
+            raise
+        return result_future.result()
+
+    async def _ensure_pools(
+        self, settings: Settings
+    ) -> tuple[httpx.AsyncClient, redis_async.Redis, async_sessionmaker[AsyncSession]]:
+        if self._pool_lock is None:
+            self._pool_lock = asyncio.Lock()
+
+        async with self._pool_lock:
+            if self._http_client is None or self._http_client.is_closed:
+                self._http_client = httpx.AsyncClient(
+                    http2=True,
+                    timeout=15.0,
+                    follow_redirects=False,
+                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                )
+
+            if self._redis_client is None or self._redis_url != settings.redis_url:
+                if self._redis_client is not None:
+                    try:
+                        await self._redis_client.aclose()
+                    except (redis.exceptions.RedisError, OSError):
+                        pass
+                self._redis_client = redis_async.from_url(
+                    settings.redis_url,
+                    decode_responses=True,
+                    socket_timeout=0.5,
+                    max_connections=10,
+                )
+                self._redis_url = settings.redis_url
+
+            dsn = settings.sqlalchemy_async_dsn
+            if self._session_factory is None or self._db_dsn != dsn:
+                if self._db_engine is not None:
+                    try:
+                        await self._db_engine.dispose()
+                    except Exception:
+                        pass
+                self._db_engine = create_db_engine(settings)
+                self._session_factory = create_session_factory(self._db_engine)
+                self._db_dsn = dsn
+
+            return self._http_client, self._redis_client, self._session_factory
+
+    async def _aclose_pools(self) -> None:
+        if self._redis_client is not None:
             try:
-                await owned_redis.aclose()
+                await self._redis_client.aclose()
             except (redis.exceptions.RedisError, OSError):
                 pass
+            self._redis_client = None
+            self._redis_url = None
+        if self._http_client is not None:
+            try:
+                if not self._http_client.is_closed:
+                    await self._http_client.aclose()
+            except (httpx.HTTPError, OSError):
+                pass
+            self._http_client = None
+        if self._db_engine is not None:
+            try:
+                await self._db_engine.dispose()
+            except Exception:
+                pass
+            self._db_engine = None
+            self._session_factory = None
+            self._db_dsn = None
+
+    def shutdown(self) -> None:
+        with self._state_lock:
+            loop = self._loop
+            thread = self._thread
+            pid = self._pid
+            if loop is None or thread is None:
+                self._reset_fields()
+                return
+            if pid != os.getpid():
+                self._reset_fields()
+                return
+
+        if not loop.is_closed() and thread.is_alive():
+            close_done: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+            def _schedule_close() -> None:
+                if not close_done.set_running_or_notify_cancel():
+                    return
+                task = loop.create_task(self._aclose_pools())
+
+                def _after_close(done_task: asyncio.Task[None]) -> None:
+                    exc = done_task.exception() if not done_task.cancelled() else None
+                    if exc is not None:
+                        close_done.set_exception(exc)
+                    else:
+                        close_done.set_result(None)
+                    loop.stop()
+
+                task.add_done_callback(_after_close)
+
+            try:
+                loop.call_soon_threadsafe(_schedule_close)
+                close_done.result(timeout=5.0)
+            except Exception:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
+
+        with self._state_lock:
+            self._reset_fields()
+
+    def run_pr_webhook_task_sync(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        settings: Settings | None = None,
+    ) -> dict[str, str]:
+        async def _dispatch() -> dict[str, str]:
+            active_settings = settings if settings is not None else get_settings()
+            coords = extract_pr_coords(payload)
+            repo_full_name = payload.get("repo_full_name")
+            has_repo_slug = isinstance(repo_full_name, str) and bool(repo_full_name.strip())
+            if coords is not None and has_repo_slug and has_github_credentials(active_settings):
+                http_client, redis_client, session_factory = await self._ensure_pools(
+                    active_settings
+                )
+                return await run_pr_webhook_task(
+                    payload,
+                    settings=active_settings,
+                    http_client=http_client,
+                    session_factory=session_factory,
+                    redis_client=redis_client,
+                )
+            return await run_pr_webhook_task(payload, settings=active_settings)
+
+        return self.run_coro(_dispatch())
+
+
+_WORKER_RUNTIME = _WorkerAsyncRuntime()
+atexit.register(_WORKER_RUNTIME.shutdown)
 
 
 def _run_coro_sync[T](coro: Coroutine[Any, Any, T]) -> T:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
+    return _WORKER_RUNTIME.run_coro(coro)
 
-    ctx = contextvars.copy_context()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(ctx.run, asyncio.run, coro)
-        return future.result()
+
+async def run_pr_webhook_task(
+    payload: Mapping[str, Any],
+    *,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    redis_client: redis_async.Redis | None = None,
+    api_base_url: str = "https://api.github.com",
+) -> dict[str, str]:
+    """Execute live Week 1 PR review flow when configured, else run offline lifecycle stub."""
+    active_settings = settings if settings is not None else get_settings()
+    coords = extract_pr_coords(payload)
+    repo_full_name = payload.get("repo_full_name")
+    has_repo_slug = isinstance(repo_full_name, str) and bool(repo_full_name.strip())
+    if coords is not None and has_repo_slug and has_github_credentials(active_settings):
+        runner = Week1PRReviewRunner(
+            settings=active_settings,
+            http_client=http_client,
+            session_factory=session_factory,
+            redis_client=redis_client,
+            api_base_url=api_base_url,
+        )
+        return await runner.execute(payload)
+
+    return await execute_pr_review_lifecycle(
+        payload,
+        settings=active_settings,
+        check_entry_supersede=False,
+    )
 
 
 @_typed_task(celery_app, name="codesight.webhook.handle_pr_event")
 def handle_pr_event(payload: dict[str, Any]) -> dict[str, str]:
-    """Handle pull_request webhook events through the Day 3 Supersede + Workspace spine."""
+    """Handle pull_request webhook events through the Day 3-6 Supersede + Review spine."""
     trace_id = get_trace_id() or "-"
     if is_pr_event_superseded(payload):
         logger.info(
@@ -481,9 +573,7 @@ def handle_pr_event(payload: dict[str, Any]) -> dict[str, str]:
             head_sha=str(payload.get("head_sha", "")),
         )
         return {"status": "superseded", "trace_id": trace_id}
-    return _run_coro_sync(
-        execute_pr_review_lifecycle(payload, check_entry_supersede=False)
-    )
+    return _WORKER_RUNTIME.run_pr_webhook_task_sync(payload)
 
 
 @_typed_task(celery_app, name="codesight.webhook.handle_push_event")
