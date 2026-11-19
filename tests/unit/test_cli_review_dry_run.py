@@ -486,3 +486,89 @@ async def test_fetch_pull_request_dry_run_falls_back_to_files_api_when_diff_exce
         )
         assert bundle_stream.diff_source == "files_api"
         assert bundle_stream.parsed_diff.get_file("src/core.py") is not None
+
+
+async def test_fetch_pull_request_dry_run_handles_gzip_responses_and_default_branch_config() -> (
+    None
+):
+    import base64
+    import gzip
+
+    raw_diff = (
+        "diff --git a/src/service.py b/src/service.py\n"
+        "--- a/src/service.py\n"
+        "+++ b/src/service.py\n"
+        "@@ -1 +1,2 @@\n"
+        " def ok():\n"
+        "+    return 42\n"
+    )
+    gzipped_diff = gzip.compress(raw_diff.encode("utf-8"))
+    gzipped_406 = gzip.compress(b'{"message": "Diff exceeded maximum lines"}')
+    cfg_b64 = base64.b64encode(b"min_debt_score: 88\n").decode("ascii")
+    seen_config_refs: list[str] = []
+    mode = "gzip_200"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/acme/gz/pulls/14":
+            if "vnd.github.diff" in request.headers.get("accept", ""):
+                if mode == "gzip_200":
+                    return httpx.Response(
+                        200,
+                        headers={"Content-Encoding": "gzip", "Content-Type": "text/plain"},
+                        content=gzipped_diff,
+                    )
+                return httpx.Response(
+                    406,
+                    headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+                    content=gzipped_406,
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "title": "PR targeting non-default feature branch",
+                    "state": "open",
+                    "base": {
+                        "ref": "feat/untrusted-base",
+                        "repo": {"default_branch": "production"},
+                    },
+                    "head": {"ref": "feat/child", "sha": "fedcba987654"},
+                },
+            )
+        if request.url.path == "/repos/acme/gz/contents/.codesight.yaml":
+            seen_config_refs.append(request.url.params.get("ref", ""))
+            return httpx.Response(
+                200,
+                json={"type": "file", "size": 32, "encoding": "base64", "content": cfg_b64},
+            )
+        if request.url.path == "/repos/acme/gz/pulls/14/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "filename": "src/service.py",
+                        "status": "modified",
+                        "sha": "1111222233334444555566667777888899990000",
+                        "changes": 1,
+                        "patch": "@@ -1 +1,2 @@\n def ok():\n+    return 42\n",
+                    }
+                ],
+            )
+        return httpx.Response(404)
+
+    pr_ref = parse_github_pr_url("https://github.com/acme/gz/pull/14")
+    settings = Settings(github_app_id=None, github_private_key=None, github_token=None)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bundle_gz = await fetch_pull_request_dry_run(pr_ref, settings=settings, http_client=client)
+        assert bundle_gz.diff_source == "diff"
+        assert bundle_gz.repo_config.min_debt_score == 88
+        assert seen_config_refs == ["production"]
+        kept = bundle_gz.parsed_diff.get_file("src/service.py")
+        assert kept is not None and kept.valid_commentable_lines == {1, 2}
+
+        mode = "gzip_406"
+        bundle_406 = await fetch_pull_request_dry_run(pr_ref, settings=settings, http_client=client)
+        assert bundle_406.diff_source == "files_api"
+        kept_fb = bundle_406.parsed_diff.get_file("src/service.py")
+        assert kept_fb is not None
+        assert kept_fb.blob_sha == "1111222233334444555566667777888899990000"

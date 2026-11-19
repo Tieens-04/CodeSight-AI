@@ -78,8 +78,10 @@ async def test_engine_pool_kwargs_and_get_db_session_lifecycle() -> None:
             settings.sqlalchemy_async_dsn,
             pool_size=5,
             max_overflow=10,
+            pool_timeout=5.0,
             pool_pre_ping=True,
             pool_recycle=1800,
+            connect_args={"timeout": 5.0, "command_timeout": 15.0},
             echo=False,
         )
 
@@ -95,3 +97,12 @@ async def test_engine_pool_kwargs_and_get_db_session_lifecycle() -> None:
     yielded = [s async for s in get_db_session(fake_request)]  # type: ignore[arg-type]
     assert yielded == [fake_session]
     assert create_session_factory(sentinel_engine) is not None
+
+    from fastapi import HTTPException
+
+    uninitialized_request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(session_factory=None))
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        _ = [s async for s in get_db_session(uninitialized_request)]  # type: ignore[arg-type]
+    assert exc_info.value.status_code == 503

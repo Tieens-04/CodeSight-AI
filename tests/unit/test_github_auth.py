@@ -475,3 +475,64 @@ async def test_repo_installation_id_cached_and_invalidated_on_404() -> None:
         assert cached_502_err.value.status_code == 502
         assert fake_redis.store["gh_repo_inst:org/cached"] == "502"
         assert calls == ["POST /app/installations/502/access_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_auth_single_flight_wrapped_b64_invalid_json_and_401_invalidation() -> None:
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+
+    pem_private, _ = _generate_rsa_keypair()
+    b64_raw = base64.b64encode(pem_private.encode("utf-8")).decode("ascii")
+    # Simulate 76-char line-wrapped Base64 output from `base64 key.pem`
+    wrapped_b64 = "\n".join(b64_raw[i : i + 76] for i in range(0, len(b64_raw), 76))
+    assert normalize_private_key(wrapped_b64).strip() == pem_private.strip()
+
+    settings = Settings(
+        _env_file=None,
+        github_app_id="12345",
+        github_private_key=SecretStr(wrapped_b64),
+    )
+    fake_redis = _FakeAsyncRedis()
+    exchange_calls = 0
+    mode = "single_flight"
+    short_expiry = (datetime.now(UTC) + timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal exchange_calls
+        if mode == "bad_json":
+            return httpx.Response(201, content=b"<html>proxy error</html>")
+        if request.url.path == "/app/installations/77/access_tokens":
+            exchange_calls += 1
+            await asyncio.sleep(0.02)
+            return httpx.Response(
+                201,
+                json={"token": f"ghs_sf_{exchange_calls}", "expires_at": short_expiry},
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
+        provider = GitHubAuthProvider(
+            settings,
+            redis_client=fake_redis,  # type: ignore[arg-type]
+            http_client=client,
+        )
+        tokens = await asyncio.gather(*(provider.get_token(installation_id=77) for _ in range(5)))
+        assert exchange_calls == 1
+        assert all(t.get_secret_value() == "ghs_sf_1" for t in tokens)
+        # expires_at (20m) minus 5m buffer clamps TTL well below 3000s
+        _, _, cached_ttl = fake_redis.set_calls[-1]
+        assert cached_ttl is not None and 600 <= cached_ttl <= 1000
+
+        # Invalidating token evicts cached entry so next call exchanges a fresh token
+        await provider.invalidate_installation_token(77)
+        assert "gh_inst_token:77" not in fake_redis.store
+        refreshed = await provider.get_token(installation_id=77)
+        assert refreshed.get_secret_value() == "ghs_sf_2"
+        assert exchange_calls == 2
+
+        # Non-JSON 201 body wraps cleanly into GitHubAuthError
+        await provider.invalidate_installation_token(77)
+        mode = "bad_json"
+        with pytest.raises(GitHubAuthError, match="invalid JSON"):
+            await provider.get_token(installation_id=77)

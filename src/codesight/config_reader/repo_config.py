@@ -19,9 +19,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from codesight.core.errors import (
     RateLimitTaskError,
     RetryableTaskError,
+    is_rate_limited_403,
     parse_retry_after_header,
 )
 from codesight.diff.file_filter import compile_posix_glob
+from codesight.vcs._http import REDIRECT_STATUSES, origin_tuple, resolve_same_origin_redirect
 from codesight.vcs.github_auth import (
     GitHubAuthError,
     GitHubAuthProvider,
@@ -108,6 +110,15 @@ class RepoConfig(BaseModel):
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+class _NoAliasSafeLoader(yaml.SafeLoader):
+    """YAML SafeLoader rejecting anchors/aliases to prevent Billion Laughs expansion DoS."""
+
+    def compose_node(self, parent: yaml.Node | None, index: Any) -> yaml.Node | None:
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.YAMLError("YAML aliases are disabled for security.")
+        return super().compose_node(parent, index)
+
+
 def parse_repo_config_yaml(
     raw_yaml: str | bytes,
     *,
@@ -130,7 +141,7 @@ def parse_repo_config_yaml(
         text = raw_yaml
 
     try:
-        parsed = yaml.safe_load(text)
+        parsed = yaml.load(text, Loader=_NoAliasSafeLoader)
     except yaml.YAMLError as exc:
         logger.warning(
             "repo_config_invalid_fallback",
@@ -173,8 +184,12 @@ def parse_repo_config_yaml(
             return RepoConfig()
 
 
-def _is_rate_limited_403(headers: httpx.Headers) -> bool:
-    return bool(headers.get("retry-after") or headers.get("x-ratelimit-remaining") == "0")
+class _ConfigRedirectError(RuntimeError):
+    """Internal sentinel raised when a Contents API redirect is malformed or cross-origin."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class RepoConfigLoader:
@@ -199,6 +214,31 @@ class RepoConfigLoader:
         async with httpx.AsyncClient(timeout=10.0) as client:
             yield client
 
+    async def _get_same_origin(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        headers: dict[str, str],
+        max_redirects: int = 3,
+    ) -> httpx.Response | None:
+        expected_origin = origin_tuple(self._base_url)
+        current_url = url
+        for _ in range(max_redirects + 1):
+            resp = await client.get(current_url, headers=headers, follow_redirects=False)
+            if resp.status_code not in REDIRECT_STATUSES:
+                return resp
+            try:
+                current_url = resolve_same_origin_redirect(
+                    current_url,
+                    resp,
+                    expected_origin,
+                    error_factory=_ConfigRedirectError,
+                )
+            except _ConfigRedirectError:
+                return None
+        return None
+
     async def load(
         self,
         repo_full_name: str,
@@ -222,7 +262,7 @@ class RepoConfigLoader:
             for filename in CONFIG_FILENAMES:
                 url = f"{self._base_url}/repos/{slug}/contents/{filename}?ref={encoded_ref}"
                 try:
-                    resp = await client.get(url, headers=headers)
+                    resp = await self._get_same_origin(client, url, headers=headers)
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     logger.warning(
                         "repo_config_transient_error",
@@ -233,11 +273,19 @@ class RepoConfigLoader:
                         f"Transient network failure reading {filename} from '{slug}'."
                     ) from exc
 
+                if resp is None:
+                    logger.warning(
+                        "repo_config_invalid_fallback",
+                        source=filename,
+                        reason="blocked_redirect",
+                    )
+                    return RepoConfig()
+
                 code = resp.status_code
                 if code == 404:
                     continue
 
-                if code == 429 or (code == 403 and _is_rate_limited_403(resp.headers)):
+                if code == 429 or (code == 403 and is_rate_limited_403(resp.headers)):
                     delay = parse_retry_after_header(resp.headers)
                     logger.warning(
                         "repo_config_rate_limited",
@@ -251,6 +299,8 @@ class RepoConfigLoader:
                     )
 
                 if code in {401, 403}:
+                    if code == 401 and installation_id is not None:
+                        await self._auth.invalidate_installation_token(installation_id)
                     logger.error("repo_config_auth_error", repo=slug, status_code=code)
                     raise GitHubAuthError(
                         f"GitHub Contents API returned HTTP {code} for '{slug}'.",

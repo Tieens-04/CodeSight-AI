@@ -10,7 +10,9 @@ from typing import Literal
 import asyncpg
 import httpx
 import redis.asyncio as redis_async
+import sqlalchemy as sa
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from codesight import __version__
 from codesight.core.config import Settings
@@ -97,9 +99,30 @@ async def _execute_probe(
 async def run_health_checks(
     settings: Settings,
     probes: Mapping[str, HealthProbe] | None = None,
+    *,
+    db_engine: AsyncEngine | None = None,
+    redis_client: redis_async.Redis | None = None,
 ) -> HealthResponse:
     """Execute all backing service probes concurrently and aggregate readiness."""
-    active_probes = probes if probes is not None else DEFAULT_PROBES
+    if probes is not None:
+        active_probes: Mapping[str, HealthProbe] = probes
+    else:
+        pooled_probes: dict[str, HealthProbe] = dict(DEFAULT_PROBES)
+        if db_engine is not None:
+
+            async def _pooled_postgres(_: Settings) -> None:
+                async with db_engine.connect() as conn:
+                    await conn.execute(sa.text("SELECT 1"))
+
+            pooled_probes["postgres"] = _pooled_postgres
+        if redis_client is not None:
+
+            async def _pooled_redis(_: Settings) -> None:
+                await redis_client.ping()
+
+            pooled_probes["redis"] = _pooled_redis
+        active_probes = pooled_probes
+
     results = await asyncio.gather(
         *(_execute_probe(name, probe, settings) for name, probe in active_probes.items())
     )

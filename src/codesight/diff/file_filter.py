@@ -190,7 +190,8 @@ class _CharClass:
     def matches(self, ch: str) -> bool:
         candidates = (ch, ch.upper()) if self.ignore_case and ch != ch.upper() else (ch,)
         in_set = any(
-            c in self.chars or any(lo <= ord(c) <= hi for lo, hi in self.ranges) for c in candidates
+            c in self.chars or (len(c) == 1 and any(lo <= ord(c) <= hi for lo, hi in self.ranges))
+            for c in candidates
         )
         return not in_set if self.negated else in_set
 

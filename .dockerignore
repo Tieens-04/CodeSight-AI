@@ -16,4 +16,5 @@ htmlcov
 tests
 docs
 .agents
+.ai-workflow
 .superpowers

@@ -1141,8 +1141,9 @@ async def test_runner_records_audit_via_injected_session_factory_and_tolerates_d
         )
         res_ok = await runner.execute(payload)
         assert res_ok["status"] == "completed"
-        assert len(sessions_created) == 1
-        sess_ok = sessions_created[0]
+        # Session 0 checks delivery idempotency; session 1 commits audit record
+        assert len(sessions_created) == 2
+        sess_ok = sessions_created[-1]
         assert sess_ok.committed is True
         assert len(sess_ok.executed) == 1
         assert len(sess_ok.added) == 1
@@ -1157,3 +1158,231 @@ async def test_runner_records_audit_via_injected_session_factory_and_tolerates_d
         res_db_err = await runner.execute({**payload, "delivery_id": "deliv-audit-db-err"})
         assert res_db_err["status"] == "completed"
         assert "worker_audit_persist_failed" in log_stream.getvalue()
+
+
+async def test_runner_post_publish_patch_503_does_not_duplicate_review_and_final_retry_fails() -> (
+    None
+):
+    import uuid
+
+    from codesight.db.models import PRReview
+
+    repo_uuid = str(uuid.uuid4())
+    raw_diff = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-a = 1\n"
+        "+a = 2\n"
+    )
+
+    class _AuditSession:
+        def __init__(self, *, processed_ids: set[str], added_rows: list[Any]) -> None:
+            self._processed_ids = processed_ids
+            self._added_rows = added_rows
+
+        async def __aenter__(self) -> _AuditSession:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def execute(self, _stmt: Any) -> None:
+            return None
+
+        async def scalar(self, stmt: Any) -> Any:
+            sql = str(stmt)
+            if "webhook_events" in sql:
+                return "processed" if self._processed_ids else "queued"
+            return uuid.UUID(repo_uuid)
+
+        def add(self, obj: Any) -> None:
+            self._added_rows.append(obj)
+
+        async def commit(self) -> None:
+            return None
+
+    # 1. Post-publish PATCH 503 retries once locally, completes audit, never raises retryable error
+    added_1: list[Any] = []
+    patch_attempts = 0
+    review_posts = 0
+
+    def handler_post_patch_503(request: httpx.Request) -> httpx.Response:
+        nonlocal patch_attempts, review_posts
+        if request.url.path.endswith((".codesight.yaml", ".codesight.yml")):
+            return httpx.Response(404)
+        if request.url.path.endswith("/check-runs") and request.method == "POST":
+            return httpx.Response(201, json={"id": 6001, "status": "in_progress"})
+        if request.url.path.endswith("/pulls/22") and request.method == "GET":
+            return httpx.Response(200, text=raw_diff)
+        if request.url.path.endswith("/pulls/22/reviews") and request.method == "POST":
+            review_posts += 1
+            return httpx.Response(200, json={"id": 6002, "state": "COMMENTED"})
+        if request.url.path.endswith("/check-runs/6001") and request.method == "PATCH":
+            patch_attempts += 1
+            return httpx.Response(503, json={"message": "Service Unavailable"})
+        return httpx.Response(404)
+
+    redis_mem = _InMemoryAsyncRedis()
+    redis_mem.store[pr_active_sha_key(repo_uuid, 22)] = "sha-22"
+    settings = Settings(_env_file=None, github_token=SecretStr("ghp_runner_test"))
+    payload = {
+        "delivery_id": "deliv-22",
+        "repo_id": repo_uuid,
+        "repo_full_name": "acme/api",
+        "default_branch": "main",
+        "pr_number": 22,
+        "head_sha": "sha-22",
+    }
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_post_patch_503)) as client:
+        runner = Week1PRReviewRunner(
+            settings=settings,
+            http_client=client,
+            session_factory=lambda: _AuditSession(  # type: ignore[arg-type]
+                processed_ids=set(), added_rows=added_1
+            ),
+            redis_client=redis_mem,  # type: ignore[arg-type]
+        )
+        res = await runner.execute(payload)
+    assert res["status"] == "completed"
+    assert review_posts == 1
+    assert patch_attempts == 2
+    assert len(added_1) == 1 and isinstance(added_1[0], PRReview)
+    assert added_1[0].status == "completed"
+
+    # 2. Already-processed delivery short-circuits with 0 GitHub calls (acks_late crash idempotency)
+    gh_calls_dup: list[str] = []
+
+    def handler_should_not_run(request: httpx.Request) -> httpx.Response:
+        gh_calls_dup.append(str(request.url))
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_should_not_run)) as client:
+        runner_dup = Week1PRReviewRunner(
+            settings=settings,
+            http_client=client,
+            session_factory=lambda: _AuditSession(  # type: ignore[arg-type]
+                processed_ids={"deliv-22"}, added_rows=[]
+            ),
+            redis_client=redis_mem,  # type: ignore[arg-type]
+        )
+        res_dup = await runner_dup.execute(payload)
+    assert res_dup == {"status": "completed", "trace_id": "deliv-22"}
+    assert gh_calls_dup == []
+
+    # 3. Exhausted final retry (is_final_attempt=True) marks Check Run 'failure' & writes DB audit
+    added_fail: list[Any] = []
+    final_patches: list[dict[str, Any]] = []
+
+    def handler_429(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if request.url.path.endswith((".codesight.yaml", ".codesight.yml")):
+            return httpx.Response(404)
+        if request.url.path.endswith("/check-runs") and request.method == "POST":
+            return httpx.Response(201, json={"id": 6003, "status": "in_progress"})
+        if request.url.path.endswith("/pulls/22") and request.method == "GET":
+            return httpx.Response(429, headers={"Retry-After": "5"})
+        if request.url.path.endswith("/check-runs/6003") and request.method == "PATCH":
+            final_patches.append(body)
+            return httpx.Response(200, json={"id": 6003, "status": "completed"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_429)) as client:
+        runner_final = Week1PRReviewRunner(
+            settings=settings,
+            http_client=client,
+            session_factory=lambda: _AuditSession(  # type: ignore[arg-type]
+                processed_ids=set(), added_rows=added_fail
+            ),
+            redis_client=redis_mem,  # type: ignore[arg-type]
+        )
+        with pytest.raises(RateLimitTaskError):
+            await runner_final.execute(payload, is_final_attempt=True)
+
+    assert len(final_patches) == 1
+    assert final_patches[0]["conclusion"] == "failure"
+    assert "Failed" in final_patches[0]["output"]["title"]
+    assert len(added_fail) == 1 and added_fail[0].status == "failed"
+
+    # 4. PAT-only mode degrades gracefully when POST /check-runs returns 403
+    pat_reviews: list[str] = []
+
+    def handler_pat_403(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith((".codesight.yaml", ".codesight.yml")):
+            return httpx.Response(404)
+        if request.url.path.endswith("/check-runs") and request.method == "POST":
+            return httpx.Response(403, json={"message": "Resource not accessible by PAT"})
+        if request.url.path.endswith("/pulls/22") and request.method == "GET":
+            return httpx.Response(200, text=raw_diff)
+        if request.url.path.endswith("/pulls/22/reviews") and request.method == "POST":
+            pat_reviews.append(request.url.path)
+            return httpx.Response(200, json={"id": 6009, "state": "COMMENTED"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_pat_403)) as client:
+        runner_pat = Week1PRReviewRunner(
+            settings=settings,
+            http_client=client,
+            redis_client=redis_mem,  # type: ignore[arg-type]
+        )
+        res_pat = await runner_pat.execute(payload)
+    assert res_pat["status"] == "completed"
+    assert len(pat_reviews) == 1
+
+
+async def test_production_missing_credentials_fails_loud_and_runtime_cancels_on_interrupt() -> None:
+    prod_no_creds = Settings(
+        _env_file=None,
+        app_env="production",
+        postgres_password=SecretStr("strong-prod-password-123"),
+        github_app_id=None,
+        github_private_key=None,
+        github_token=None,
+    )
+    with pytest.raises(GitHubAuthConfigError):
+        await run_pr_webhook_task(
+            {
+                "repo_id": "r-prod",
+                "repo_full_name": "acme/prod",
+                "pr_number": 1,
+                "head_sha": "abc123",
+            },
+            settings=prod_no_creds,
+        )
+
+    # Verify _WorkerAsyncRuntime.run_coro cancels background task cleanly on interruption
+    import threading
+    from concurrent.futures import Future
+
+    from codesight.worker.celery_app import _WorkerAsyncRuntime
+
+    runtime = _WorkerAsyncRuntime()
+    cancelled_evt = threading.Event()
+    started_evt = threading.Event()
+
+    async def _slow_coro() -> None:
+        started_evt.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled_evt.set()
+            raise
+
+    orig_result = Future.result
+
+    def _interrupt_result(self: Any, timeout: float | None = None) -> Any:
+        if started_evt.wait(timeout=2.0):
+            raise KeyboardInterrupt("simulated SoftTimeLimitExceeded")
+        return orig_result(self, timeout=timeout)
+
+    try:
+        from unittest.mock import patch
+
+        with patch.object(Future, "result", _interrupt_result):
+            with pytest.raises(KeyboardInterrupt, match="SoftTimeLimitExceeded"):
+                runtime.run_coro(_slow_coro())
+        assert cancelled_evt.wait(timeout=2.0) is True
+    finally:
+        runtime.shutdown()

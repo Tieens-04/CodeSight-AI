@@ -24,6 +24,7 @@ from codesight.api.routes.webhooks import (
 from codesight.core.config import Settings, get_settings
 from codesight.core.logging import bind_trace_id, clear_trace_context, configure_logging
 from codesight.db.session import create_db_engine, create_session_factory
+from codesight.worker.celery_app import create_celery_app
 
 _TRACE_HEADER_PRIORITY: tuple[bytes, ...] = (
     b"x-trace-id",
@@ -115,18 +116,23 @@ def create_app(
                 active_settings.redis_url,
                 decode_responses=True,
                 socket_timeout=active_settings.health_timeout_seconds,
+                socket_connect_timeout=active_settings.health_timeout_seconds,
             )
+            app_instance.state.redis_client = redis_client
             app_instance.state.webhook_dispatcher = CeleryWebhookDispatcher(
-                redis_client=redis_client
+                app=create_celery_app(active_settings),
+                redis_client=redis_client,
             )
 
         try:
             yield
         finally:
-            if redis_client is not None:
-                await redis_client.aclose()
-            if engine is not None:
-                await engine.dispose()
+            try:
+                if redis_client is not None:
+                    await redis_client.aclose()
+            finally:
+                if engine is not None:
+                    await engine.dispose()
 
     application = FastAPI(
         title="CodeSight-AI Gateway",
@@ -135,6 +141,7 @@ def create_app(
     )
     application.state.settings = active_settings
     application.state.db_engine = None
+    application.state.redis_client = None
     application.state.session_factory = session_factory
     application.state.webhook_dispatcher = (
         webhook_dispatcher if webhook_dispatcher is not None else CeleryWebhookDispatcher()
@@ -144,7 +151,12 @@ def create_app(
 
     @application.get("/health", response_model=HealthResponse)
     async def health_check(response: Response) -> HealthResponse:
-        result = await run_health_checks(active_settings, probes=probes)
+        result = await run_health_checks(
+            active_settings,
+            probes=probes,
+            db_engine=getattr(application.state, "db_engine", None),
+            redis_client=getattr(application.state, "redis_client", None),
+        )
         if result.status != "ok":
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return result

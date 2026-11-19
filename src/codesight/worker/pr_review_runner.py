@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import Mapping
@@ -16,16 +17,18 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from codesight.config_reader.repo_config import RepoConfigLoader
 from codesight.core.config import Settings, get_settings
+from codesight.core.errors import RetryableTaskError
 from codesight.core.logging import bind_trace_id, clear_trace_context, get_trace_id
 from codesight.db.models import PRReview, Repository, WebhookEvent
 from codesight.diff.models import ParsedPullRequestDiff
-from codesight.vcs.github_auth import GitHubAuthProvider
+from codesight.vcs.github_auth import GitHubAuthError, GitHubAuthProvider
 from codesight.vcs.github_pr_client import FetchedPullRequestDiff, GitHubPullRequestClient
 from codesight.vcs.github_publisher import (
     CheckConclusion,
     GitHubPublishError,
     GitHubReviewPublisher,
     ReviewCommentDraft,
+    format_markdown_code_span,
 )
 from codesight.worker.lifecycle import (
     PRReviewLifecycleContext,
@@ -66,9 +69,10 @@ def build_week1_smoke_drafts(
     if target is None:
         return ()
     file_path, target_line = target
+    safe_path = format_markdown_code_span(file_path)
     # NFR-3: never echo customer raw source code inside review comments or logs.
     body = (
-        f"CodeSight-AI Milestone 1 E2E verification anchor on `{file_path}` (L{target_line}).\n"
+        f"CodeSight-AI Milestone 1 E2E verification anchor on {safe_path} (L{target_line}).\n"
         "Multi-agent AST & RAG review findings will appear inline here in Sprint 3."
     )
     return (
@@ -112,8 +116,9 @@ def build_week1_summary_markdown(
         lines.append("")
         lines.append("### Filtered Noise / Excluded Files")
         for skipped in parsed_diff.skipped_files[:20]:
+            safe_skipped = format_markdown_code_span(skipped.file_path)
             lines.append(
-                f"- `{skipped.file_path}` (`{skipped.reason}`, ~{skipped.estimated_tokens} tokens)"
+                f"- {safe_skipped} (`{skipped.reason}`, ~{skipped.estimated_tokens} tokens)"
             )
     return "\n".join(lines)
 
@@ -256,7 +261,63 @@ class Week1PRReviewRunner:
                 error_type=type(exc).__name__,
             )
 
-    async def execute(self, payload: Mapping[str, Any]) -> dict[str, str]:
+    async def _is_delivery_already_processed(
+        self,
+        delivery_id: str | None,
+        *,
+        trace_id: str,
+    ) -> bool:
+        """Guard against duplicate PR review publication on acks_late worker crash redelivery."""
+        if self._session_factory is None or not delivery_id:
+            return False
+        try:
+            async with self._session_factory() as session:
+                evt_status = await session.scalar(
+                    sa.select(WebhookEvent.status).where(WebhookEvent.delivery_id == delivery_id)
+                )
+                return evt_status == "processed"
+        except Exception as exc:
+            logger.warning(
+                "worker_delivery_idempotency_check_failed",
+                trace_id=trace_id,
+                error_type=type(exc).__name__,
+            )
+            return False
+
+    async def record_superseded_audit(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        trace_id: str,
+    ) -> None:
+        """Persist superseded audit state when a task is aborted outside execute()."""
+        raw_delivery = payload.get("delivery_id")
+        delivery_id = raw_delivery if isinstance(raw_delivery, str) and raw_delivery else None
+        repo_id = str(payload.get("repo_id") or "")
+        raw_pr = payload.get("pr_number")
+        pr_number = raw_pr if isinstance(raw_pr, int) and not isinstance(raw_pr, bool) else 0
+        head_sha = str(payload.get("head_sha") or "")
+        if not repo_id or pr_number < 1 or not head_sha:
+            return
+        await self._record_audit(
+            delivery_id=delivery_id,
+            repo_id=repo_id,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            review_status="superseded",
+            webhook_status="processed",
+            info_count=0,
+            tokens_saved_pct=None,
+            latency_ms=0,
+            trace_id=trace_id,
+        )
+
+    async def execute(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        is_final_attempt: bool = False,
+    ) -> dict[str, str]:
         """Run the Week 1 E2E PR review lifecycle for a webhook dispatch payload."""
         repo_id = str(payload["repo_id"])
         repo_full_name = str(payload["repo_full_name"])
@@ -273,6 +334,19 @@ class Week1PRReviewRunner:
         if get_trace_id() is None and delivery_id is not None:
             bind_trace_id(delivery_id)
             bound_here = True
+
+        active_trace_id = get_trace_id() or delivery_id or "-"
+        if await self._is_delivery_already_processed(delivery_id, trace_id=active_trace_id):
+            logger.info(
+                "worker_pr_delivery_already_processed",
+                trace_id=active_trace_id,
+                repo=repo_full_name,
+                pr_number=pr_number,
+                head_sha=head_sha,
+            )
+            if bound_here:
+                clear_trace_context()
+            return {"status": "completed", "trace_id": active_trace_id}
 
         started_perf = time.perf_counter()
         owned_http: httpx.AsyncClient | None = None
@@ -336,16 +410,32 @@ class Week1PRReviewRunner:
                     head_sha,
                     stage="pre_check_run",
                 )
-            created = await publisher.create_check_run(
-                repo_full_name,
-                head_sha=head_sha,
-                status="in_progress",
-                external_id=ctx.trace_id,
-                output_title="CodeSight-AI Analyzing Pull Request",
-                output_summary="Filtering diff noise and mapping hunk coordinates.",
-                installation_id=installation_id,
-            )
-            check_run_id = created.check_run_id
+            try:
+                created = await publisher.create_check_run(
+                    repo_full_name,
+                    head_sha=head_sha,
+                    status="in_progress",
+                    external_id=ctx.trace_id,
+                    output_title="CodeSight-AI Analyzing Pull Request",
+                    output_summary="Filtering diff noise and mapping hunk coordinates.",
+                    installation_id=installation_id,
+                )
+                check_run_id = created.check_run_id
+            except GitHubAuthError as auth_exc:
+                if (
+                    auth_exc.status_code == 403
+                    and not self._settings.has_github_app_credentials
+                    and self._settings.has_github_token
+                ):
+                    logger.warning(
+                        "worker_pr_check_run_skipped_pat_mode",
+                        trace_id=ctx.trace_id,
+                        repo=repo_full_name,
+                        pr_number=pr_number,
+                    )
+                    check_run_id = None
+                else:
+                    raise
             fetched_diff = await pr_client.fetch_pull_request_diff(
                 repo_full_name,
                 pr_number,
@@ -405,21 +495,65 @@ class Week1PRReviewRunner:
 
             latency_ms = max(0, int((time.perf_counter() - started_perf) * 1000))
             if check_run_id is not None:
-                check_run_finalized = True
                 m = fetched_diff.parsed_diff.metrics
-                await publisher.complete_check_run(
-                    repo_full_name,
-                    check_run_id,
-                    conclusion="success",
-                    title="CodeSight-AI Milestone 1 Review Complete",
-                    summary=(
-                        f"Analyzed {m.kept_files}/{m.total_files} files "
-                        f"({m.tokens_saved_pct:.1f}% token reduction); "
-                        f"published {published.inline_count} inline and "
-                        f"{published.downgraded_count} summary findings."
-                    ),
-                    installation_id=installation_id,
+                summary_text = (
+                    f"Analyzed {m.kept_files}/{m.total_files} files "
+                    f"({m.tokens_saved_pct:.1f}% token reduction); "
+                    f"published {published.inline_count} inline and "
+                    f"{published.downgraded_count} summary findings."
                 )
+                # Post-publish PATCH must NOT trigger a full Celery retry (which would duplicate
+                # the already-published PR review). Retry once locally, else warn and finish audit.
+                for patch_attempt in range(2):
+                    try:
+                        await publisher.complete_check_run(
+                            repo_full_name,
+                            check_run_id,
+                            conclusion="success",
+                            title="CodeSight-AI Milestone 1 Review Complete",
+                            summary=summary_text,
+                            installation_id=installation_id,
+                        )
+                        check_run_finalized = True
+                        break
+                    except RetryableTaskError as patch_exc:
+                        if patch_attempt == 0:
+                            await asyncio.sleep(0.5)
+                            continue
+                        logger.warning(
+                            "worker_pr_post_publish_check_run_failed",
+                            trace_id=ctx.trace_id,
+                            repo=repo_full_name,
+                            check_run_id=check_run_id,
+                            error_type=type(patch_exc).__name__,
+                        )
+                    except GitHubPublishError as pub_exc:
+                        if pub_exc.status_code == 422:
+                            check_run_finalized = True
+                            logger.info(
+                                "worker_pr_check_run_already_completed",
+                                trace_id=ctx.trace_id,
+                                repo=repo_full_name,
+                                check_run_id=check_run_id,
+                            )
+                        else:
+                            logger.warning(
+                                "worker_pr_post_publish_check_run_failed",
+                                trace_id=ctx.trace_id,
+                                repo=repo_full_name,
+                                check_run_id=check_run_id,
+                                error_type=type(pub_exc).__name__,
+                            )
+                        break
+                    except Exception as patch_exc:
+                        logger.warning(
+                            "worker_pr_post_publish_check_run_failed",
+                            trace_id=ctx.trace_id,
+                            repo=repo_full_name,
+                            check_run_id=check_run_id,
+                            error_type=type(patch_exc).__name__,
+                        )
+                        break
 
             await self._record_audit(
                 delivery_id=delivery_id,
@@ -504,23 +638,70 @@ class Week1PRReviewRunner:
                     audit_recorded = True
                 return res
             return {"status": "completed", "trace_id": res["trace_id"]}
+        except asyncio.CancelledError:
+            trace_id = get_trace_id() or "-"
+            if check_run_id is not None and not check_run_finalized:
+                check_run_finalized = True
+                await _safe_complete_check_run(
+                    publisher,
+                    repo_full_name=repo_full_name,
+                    check_run_id=check_run_id,
+                    conclusion="failure",
+                    title="CodeSight-AI Review Timed Out",
+                    summary=(
+                        f"Review execution for {head_sha[:12]} was cancelled before completion."
+                    ),
+                    installation_id=installation_id,
+                    trace_id=trace_id,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    failed_event="worker_pr_check_run_error_cleanup_failed",
+                )
+            if not audit_recorded:
+                latency_ms = max(0, int((time.perf_counter() - started_perf) * 1000))
+                tokens_pct = (
+                    fetched_diff.parsed_diff.metrics.tokens_saved_pct
+                    if fetched_diff is not None
+                    else None
+                )
+                await self._record_audit(
+                    delivery_id=delivery_id,
+                    repo_id=repo_id,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    review_status="failed",
+                    webhook_status="failed",
+                    info_count=0,
+                    tokens_saved_pct=tokens_pct,
+                    latency_ms=latency_ms,
+                    trace_id=trace_id,
+                )
+                audit_recorded = True
+            raise
         except Exception as exc:
             trace_id = get_trace_id() or "-"
             is_retryable, _ = classify_retryable_exception(exc)
+            will_retry = is_retryable and not is_final_attempt
             if check_run_id is not None and not check_run_finalized:
                 check_run_finalized = True
-                conclusion: CheckConclusion = "neutral" if is_retryable else "failure"
+                conclusion: CheckConclusion = "neutral" if will_retry else "failure"
                 title = (
                     "CodeSight-AI Review Retry Scheduled"
-                    if is_retryable
+                    if will_retry
                     else "CodeSight-AI Review Failed"
                 )
-                summary = (
-                    f"Transient {type(exc).__name__} encountered while processing {head_sha[:12]}; "
-                    "Celery backoff retry scheduled."
-                    if is_retryable
-                    else f"Review aborted due to non-retryable {type(exc).__name__}."
-                )
+                if will_retry:
+                    summary = (
+                        f"Transient {type(exc).__name__} encountered while processing "
+                        f"{head_sha[:12]}; Celery backoff retry scheduled."
+                    )
+                elif is_retryable:
+                    summary = (
+                        f"Review failed after exhausting retries on {type(exc).__name__} "
+                        f"for {head_sha[:12]}."
+                    )
+                else:
+                    summary = f"Review aborted due to non-retryable {type(exc).__name__}."
                 await _safe_complete_check_run(
                     publisher,
                     repo_full_name=repo_full_name,
@@ -534,7 +715,7 @@ class Week1PRReviewRunner:
                     head_sha=head_sha,
                     failed_event="worker_pr_check_run_error_cleanup_failed",
                 )
-            if not is_retryable and not audit_recorded:
+            if not will_retry and not audit_recorded:
                 latency_ms = max(0, int((time.perf_counter() - started_perf) * 1000))
                 tokens_pct = (
                     fetched_diff.parsed_diff.metrics.tokens_saved_pct

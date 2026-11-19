@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import importlib.util
 import io
 import json
-from pathlib import Path
-from typing import Any
 
 from codesight.config_reader.repo_config import RepoConfig
 from codesight.core.logging import configure_logging
@@ -14,23 +11,7 @@ from codesight.diff.file_filter import FileFilter
 from codesight.diff.hunk_mapper import DiffHunkMapper
 from codesight.diff.models import FilterReason, PatchFileEntry
 from codesight.diff.smart_diff_parser import SmartDiffParser, unquote_git_path
-
-
-def _load_guard_validator() -> Any:
-    repo_root = Path(__file__).resolve().parents[2]
-    script_path = (
-        repo_root
-        / ".agents"
-        / "skills"
-        / "github-diff-suggestion-guard"
-        / "scripts"
-        / "validate_diff_and_payload.py"
-    )
-    spec = importlib.util.spec_from_file_location("validate_diff_and_payload", script_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from tests.conftest import load_guard_validator as _load_guard_validator
 
 
 def test_multi_hunk_mapping_annotated_lines_and_commentability_guards() -> None:
@@ -794,3 +775,40 @@ def test_zero_byte_added_and_deleted_files_clear_missing_side_path() -> None:
     assert empty_add.old_path is None
     assert empty_add.new_path == "src/empty_add.py"
     assert empty_add.valid_commentable_lines == set()
+
+
+def test_patch_truncated_blob_sha_and_changed_right_lines_for_sprint2_ast() -> None:
+    entries = [
+        PatchFileEntry(
+            filename="src/huge_module.py",
+            status="modified",
+            patch=None,
+            changes=4500,
+            blob_sha="aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+        ),
+        PatchFileEntry(
+            filename="src/service.py",
+            status="modified",
+            blob_sha="9999888877776666555544443333222211110000",
+            changes=2,
+            patch=(
+                "@@ -10,3 +10,4 @@ def run():\n"
+                "     ctx_before()\n"
+                "+    added_line()\n"
+                "     ctx_after()\n"
+                "@@ -30,2 +31,0 @@\n"
+                "-    deleted_a()\n"
+                "-    deleted_b()\n"
+            ),
+        ),
+    ]
+    parsed = SmartDiffParser().parse_patch_entries(entries)
+    assert [(r.file_path, r.reason) for r in parsed.skipped_files] == [
+        ("src/huge_module.py", FilterReason.PATCH_TRUNCATED)
+    ]
+    svc = parsed.get_file("src/service.py")
+    assert svc is not None
+    assert svc.blob_sha == "9999888877776666555544443333222211110000"
+    assert svc.valid_commentable_lines == {10, 11, 12}
+    # changed_right_lines excludes context lines 10 & 12, includes added 11 and pure-del anchor 31
+    assert svc.changed_right_lines == {11, 31}

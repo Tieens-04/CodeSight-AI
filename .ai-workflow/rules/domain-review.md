@@ -8,7 +8,7 @@
 
 Khi ticket chạm tới đọc file từ GitHub, AST parsing, embedding, Qdrant, DB, cache hoặc logging:
 - **Cấm lưu mã nguồn thô xuống đĩa hoặc DB/Qdrant**: Không có cột SQL, khóa Redis lâu dài hay trường payload Qdrant nào chứa nội dung code khách hàng (`code`, `raw_code`, `source`, `content`, `body`, `text`, `document`, `snippet`, `docstring` đều bị cấm trong Qdrant payload).
-- **Qdrant Payload Allowlist**: Chỉ cho phép `repo_full_name`, `file_path`, `blob_sha`, `language`, `symbol_name`, `symbol_kind`, `start_line`, `end_line`, `cyclomatic_complexity`, `signature` (chỉ dòng khai báo header `<= 300` ký tự, đã cắt bỏ thân hàm/lớp), `called_symbols`, `imports`.
+- **Qdrant Payload Allowlist**: Chỉ cho phép `repo_id`, `repo_full_name`, `file_path`, `blob_sha`, `chunk_type` (`code` | `architecture_doc`), `language`, `symbol_name`, `symbol_kind`, `start_line`, `end_line`, `cyclomatic_complexity`, `signature` (chỉ dòng khai báo header `<= 300` ký tự, đã cắt bỏ thân hàm/lớp), `called_symbols`, `imports`, `indexed_at`.
 - **Truy xuất trên RAM & Tái sử dụng `core/ephemeral.py`**: Tải blob/diff qua GitHub API trực tiếp vào bộ nhớ (`bytes` / `io.BytesIO`); nếu bắt buộc dùng thư mục tạm cô lập (`/tmp` `128m` `tmpfs` trong Docker), phải dùng đúng `ephemeral_workspace()` / `async_ephemeral_workspace()` và `resolve_safe_subpath()` từ `src/codesight/core/ephemeral.py` (chống path traversal + đảm bảo xóa sạch trong `finally` kể cả trên Windows read-only bits).
 - **Structured Logging (`structlog`)**: Không bao giờ log toàn văn file nguồn, patch lớn chứa bí mật khách hàng, GitHub Installation token hay `Authorization` header.
 
@@ -58,7 +58,7 @@ Khi ticket liên quan phân tích cú pháp Python/TypeScript hoặc truy xuất
 - **Qdrant Collection & UUIDv5**:
   - Kết nối ưu tiên gRPC (`6334`, HTTP `6333`), vector `size=768`, `Distance.COSINE`.
   - Point ID bắt buộc là **UUIDv5** tất định từ `repo:file_path:blob_sha:symbol_name:start_line`.
-  - Đánh đủ Keyword Payload Indexes trên `symbol_name`, `called_symbols`, `blob_sha`, `repo_full_name`, `file_path`.
+  - Collection mặc định **`codesight_ast_index`** (cấu hình qua `QDRANT_COLLECTION_NAME`), đánh đủ Keyword Payload Indexes trên `repo_id`, `repo_full_name`, `file_path`, `symbol_name`, `called_symbols`, `blob_sha`, `chunk_type`.
 - **Bảo vệ hạn mức Google AI Studio Free Tier (`gemini-embedding-001`)**:
   - Dùng SDK chính thức `google-genai` (`from google import genai`), **không dùng** gói cũ `google-generativeai`.
   - Luôn truyền `output_dimensionality=768` cho cả `RETRIEVAL_DOCUMENT` (lúc index) và `RETRIEVAL_QUERY` (lúc tìm kiếm).

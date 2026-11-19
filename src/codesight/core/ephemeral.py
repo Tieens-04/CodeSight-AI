@@ -27,18 +27,54 @@ def _create_workspace_dir(base_dir: Path | str | None, prefix: str) -> Path:
     return ws_path
 
 
-def _on_rmtree_error(func: Callable[..., Any], target_path: str, _exc: BaseException) -> None:
+def _chmod_parent_if_inside_root(target_path: str, ws_root: Path | None) -> None:
+    if ws_root is None:
+        return
+    parent = Path(target_path).parent
+    try:
+        resolved_root = ws_root.resolve()
+        resolved_parent = parent.resolve()
+        if (
+            resolved_parent != resolved_root
+            and resolved_parent.is_relative_to(resolved_root)
+            and not os.path.islink(parent)
+            and os.path.isdir(parent)
+        ):
+            mode_bits = stat.S_IMODE(os.lstat(parent).st_mode)
+            if (mode_bits & stat.S_IRWXU) != stat.S_IRWXU:
+                os.chmod(parent, stat.S_IRWXU)
+    except OSError:
+        pass
+
+
+def _on_rmtree_error(
+    func: Callable[..., Any],
+    target_path: str,
+    _exc: BaseException,
+    *,
+    ws_root: Path | None = None,
+) -> None:
+    _chmod_parent_if_inside_root(target_path, ws_root)
     if not os.path.islink(target_path):
         mode = stat.S_IRWXU if os.path.isdir(target_path) else (stat.S_IWRITE | stat.S_IREAD)
         os.chmod(target_path, mode)
     func(target_path)
 
 
+def _make_rmtree_error_handler(
+    ws_root: Path,
+) -> Callable[[Callable[..., Any], str, BaseException], None]:
+    def _handler(func: Callable[..., Any], target_path: str, exc: BaseException) -> None:
+        _on_rmtree_error(func, target_path, exc, ws_root=ws_root)
+
+    return _handler
+
+
 def _cleanup_workspace_dir(ws_path: Path) -> None:
     if not ws_path.exists():
         return
     try:
-        shutil.rmtree(ws_path, onexc=_on_rmtree_error)
+        shutil.rmtree(ws_path, onexc=_make_rmtree_error_handler(ws_path))
     except OSError as exc:
         logger.error(
             "ephemeral_workspace_cleanup_failed",
@@ -90,9 +126,25 @@ async def async_ephemeral_workspace(
     base_dir: Path | str | None = None,
     prefix: str = DEFAULT_EPHEMERAL_PREFIX,
 ) -> AsyncIterator[Path]:
-    """Async counterpart to ephemeral_workspace() offloading filesystem I/O via to_thread."""
-    ws_path = await asyncio.to_thread(_create_workspace_dir, base_dir, prefix)
+    """Async counterpart to ephemeral_workspace() with cancellation-safe cleanup."""
+    create_task = asyncio.create_task(asyncio.to_thread(_create_workspace_dir, base_dir, prefix))
+    try:
+        ws_path = await asyncio.shield(create_task)
+    except BaseException:
+
+        def _cleanup_late_create(done: asyncio.Task[Path]) -> None:
+            if not done.cancelled() and done.exception() is None:
+                _cleanup_workspace_dir(done.result())
+
+        create_task.add_done_callback(_cleanup_late_create)
+        raise
+
     try:
         yield ws_path
     finally:
-        await asyncio.to_thread(_cleanup_workspace_dir, ws_path)
+        cleanup_task = asyncio.create_task(asyncio.to_thread(_cleanup_workspace_dir, ws_path))
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise

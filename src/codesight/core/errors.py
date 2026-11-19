@@ -29,6 +29,12 @@ def _clamp_delay(seconds: float) -> float:
     return min(MAX_RETRY_AFTER_SECONDS, max(MIN_RETRY_AFTER_SECONDS, seconds))
 
 
+def is_rate_limited_403(headers: Mapping[str, str]) -> bool:
+    """Return True when HTTP 403 response headers signal primary/secondary rate limiting."""
+    lowered = {k.lower(): v.strip() for k, v in headers.items() if isinstance(v, str)}
+    return bool(lowered.get("retry-after") or lowered.get("x-ratelimit-remaining") == "0")
+
+
 def parse_retry_after_header(
     headers: Mapping[str, str],
     *,

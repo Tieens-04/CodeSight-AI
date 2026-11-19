@@ -16,9 +16,11 @@ import urllib.request
 from typing import Any
 
 ALLOWED_KEYS = {
+    "repo_id",
     "repo_full_name",
     "file_path",
     "blob_sha",
+    "chunk_type",
     "language",
     "symbol_name",
     "symbol_kind",
@@ -148,7 +150,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Audit Qdrant Zero-Code Persistence (NFR-3).")
     parser.add_argument("--self-test", action="store_true", help="Run built-in unit assertions")
     parser.add_argument("--url", default="http://localhost:6333", help="Qdrant HTTP URL (default: localhost:6333)")
-    parser.add_argument("--collection", default="codesight_symbols", help="Collection name to inspect")
+    parser.add_argument(
+        "--collection",
+        default="codesight_ast_index",
+        help="Collection name to inspect (default: codesight_ast_index)",
+    )
     parser.add_argument("--limit", type=int, default=200, help="Number of points to sample")
     args = parser.parse_args()
 

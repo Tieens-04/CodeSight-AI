@@ -21,6 +21,7 @@ class FilterReason(StrEnum):
     BUILD_OR_VENDOR = "build_or_vendor"
     MIGRATION = "migration"
     GENERATED = "generated"
+    PATCH_TRUNCATED = "patch_truncated"
     CUSTOM_IGNORE = "custom_ignore"
 
 
@@ -110,6 +111,21 @@ class ParsedFileDiff:
     annotated_diff: str
     valid_commentable_lines: set[int] = field(default_factory=set)
     right_line_to_hunk: dict[int, int] = field(default_factory=dict)
+    blob_sha: str | None = None
+
+    @property
+    def changed_right_lines(self) -> set[int]:
+        """Return strictly added RIGHT lines (plus pure-deletion anchors) for AST symbol lookup."""
+        if self.change_type == "deleted":
+            return set()
+        changed: set[int] = set()
+        for hunk in self.hunks:
+            for diff_line in hunk.lines:
+                if diff_line.kind == "add" and diff_line.right_line is not None:
+                    changed.add(diff_line.right_line)
+            if hunk.new_count == 0 and hunk.new_start >= 1:
+                changed.add(hunk.new_start)
+        return changed
 
     def is_line_commentable(self, line: int) -> bool:
         """Return True if `line` is a valid RIGHT-side diff hunk line."""
@@ -133,6 +149,8 @@ class PatchFileEntry:
     status: str = "modified"
     previous_filename: str | None = None
     is_binary: bool = False
+    blob_sha: str | None = None
+    changes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

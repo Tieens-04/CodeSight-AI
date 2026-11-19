@@ -325,3 +325,11 @@ def test_estimate_tokens_and_filter_metrics_accuracy() -> None:
     assert metrics.tokens_saved_pct == expected_pct
     assert metrics.tokens_saved_pct > 80.0
     assert 0.8 < metrics.token_reduction_ratio <= 1.0
+
+
+def test_char_class_ignore_case_handles_unicode_multi_char_upper() -> None:
+    from codesight.diff.file_filter import compile_posix_glob
+
+    matcher = compile_posix_glob("src/[a-z].py", ignore_case=True)
+    assert matcher.matches("src/A.py") is True
+    assert matcher.matches("src/ß.py") is False
