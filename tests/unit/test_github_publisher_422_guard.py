@@ -611,3 +611,95 @@ async def test_publish_review_supersede_in_422_fallback_completes_check_run() ->
             )
         assert exc_b.value.stage == "pre_422_fallback"
         assert review_post_count == 1
+
+
+async def test_publisher_check_run_completion_idempotency_and_422_already_completed_guard() -> None:
+    class _ToggleRedis:
+        def __init__(self, sha: str) -> None:
+            self.active_sha = sha
+
+        async def get(self, _key: str) -> str:
+            return self.active_sha
+
+    patch_calls: list[dict[str, Any]] = []
+    patch_status = 200
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if request.method == "POST" and request.url.path == "/repos/acme/app/check-runs":
+            return httpx.Response(
+                201,
+                json={"id": 9002, "name": "CodeSight-AI Review", "status": "in_progress"},
+            )
+        if request.method == "PATCH" and request.url.path == "/repos/acme/app/check-runs/9002":
+            patch_calls.append(payload)
+            if patch_status == 422:
+                return httpx.Response(422, json={"message": "Check run is already completed"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": 9002,
+                    "name": "CodeSight-AI Review",
+                    "status": "completed",
+                    "conclusion": payload["conclusion"],
+                },
+            )
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    _, parsed = _make_sample_diff()
+    redis_state = _ToggleRedis("stale_sha_1")
+    lock = AsyncSupersedeLock(redis_state)  # type: ignore[arg-type]
+
+    # Case 1: Duplicate completion guard on same publisher skips second PATCH
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        publisher = GitHubReviewPublisher(_make_auth(client), http_client=client)
+        created = await publisher.create_check_run("acme/app", head_sha="stale_sha_1")
+        await publisher.complete_check_run(
+            "acme/app",
+            created.check_run_id,
+            conclusion="neutral",
+            title="Already Done",
+            summary="Completed before supersede check.",
+        )
+        assert publisher.has_completed_check_run("acme/app", created.check_run_id) is True
+
+        redis_state.active_sha = "newer_sha_2"
+        with pytest.raises(PRSupersededError) as exc_1:
+            await publisher.publish_review(
+                "acme/app",
+                7,
+                head_sha="stale_sha_1",
+                parsed_diff=parsed,
+                drafts=[ReviewCommentDraft(path="src/auth.py", line=10, body="Note")],
+                supersede_lock=lock,
+                repo_id="repo-1",
+                check_run_id=created.check_run_id,
+            )
+        assert exc_1.value.stage == "pre_publish"
+        assert len(patch_calls) == 1
+
+    # Case 2: HTTP 422 from GitHub when check run was already completed externally
+    patch_calls.clear()
+    patch_status = 422
+    stream = io.StringIO()
+    configure_logging(level="INFO", service_name="test-publisher-422-guard", stream=stream)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        publisher_2 = GitHubReviewPublisher(_make_auth(client), http_client=client)
+        with pytest.raises(PRSupersededError) as exc_2:
+            await publisher_2.publish_review(
+                "acme/app",
+                7,
+                head_sha="stale_sha_1",
+                parsed_diff=parsed,
+                drafts=[ReviewCommentDraft(path="src/auth.py", line=10, body="Note")],
+                supersede_lock=lock,
+                repo_id="repo-1",
+                check_run_id=9002,
+            )
+        assert exc_2.value.stage == "pre_publish"
+        assert len(patch_calls) == 1
+        assert publisher_2.has_completed_check_run("acme/app", 9002) is True
+
+    raw_logs = stream.getvalue()
+    assert "github_check_run_already_completed" in raw_logs
+    assert "github_check_run_supersede_cleanup_failed" not in raw_logs
