@@ -18,6 +18,7 @@ from codesight.core.ephemeral import async_ephemeral_workspace
 from codesight.core.errors import (
     RateLimitTaskError,
     RetryableTaskError,
+    is_rate_limited_403,
     parse_retry_after_header,
 )
 from codesight.core.logging import get_trace_id
@@ -45,16 +46,7 @@ class PRReviewLifecycleContext:
 
 def has_github_credentials(settings: Settings) -> bool:
     """Return True when either GitHub App or PAT credentials are configured."""
-    has_app = bool(
-        settings.github_app_id
-        and settings.github_app_id.strip()
-        and settings.github_private_key is not None
-        and settings.github_private_key.get_secret_value().strip()
-    )
-    has_pat = bool(
-        settings.github_token is not None and settings.github_token.get_secret_value().strip()
-    )
-    return has_app or has_pat
+    return settings.has_github_credentials
 
 
 def extract_pr_coords(payload: Mapping[str, Any]) -> tuple[str, int, str] | None:
@@ -76,10 +68,7 @@ def extract_pr_coords(payload: Mapping[str, Any]) -> tuple[str, int, str] | None
 
 def _classify_http_status_response(resp: httpx.Response) -> tuple[bool, float | None]:
     code = resp.status_code
-    is_rl_403 = code == 403 and bool(
-        resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-remaining") == "0"
-    )
-    if code == 429 or is_rl_403:
+    if code == 429 or (code == 403 and is_rate_limited_403(resp.headers)):
         return True, parse_retry_after_header(resp.headers)
     if 500 <= code < 600:
         return True, None

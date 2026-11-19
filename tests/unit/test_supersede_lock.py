@@ -183,6 +183,30 @@ async def test_live_redis_lua_cas_claim_rollback_and_superseded_detection() -> N
             prev_ts_ms=c_fb_4.prev_ts_ms,
         )
         assert await async_client.get(pr_active_sha_key(repo_id, oo_pr)) == "sha-3"
+
+        # 6. Transitive ancestry preserved on stale reject within same 1s timestamp
+        tr_pr = pr_num + 2
+        try:
+            c_tr3 = await lock.claim_active_sha(
+                repo_id, tr_pr, "tr-sha-3", before_sha="tr-sha-2", event_ts_ms=5_000_000
+            )
+            assert c_tr3.claimed is True
+            c_tr2_stale = await lock.claim_active_sha(
+                repo_id, tr_pr, "tr-sha-2", before_sha="tr-sha-1", event_ts_ms=5_000_000
+            )
+            assert c_tr2_stale.claimed is False and c_tr2_stale.stale is True
+            c_tr1_stale = await lock.claim_active_sha(
+                repo_id, tr_pr, "tr-sha-1", before_sha=None, event_ts_ms=5_000_000
+            )
+            assert c_tr1_stale.claimed is False and c_tr1_stale.stale is True
+            assert await async_client.get(pr_active_sha_key(repo_id, tr_pr)) == "tr-sha-3"
+        finally:
+            await async_client.delete(
+                pr_active_sha_key(repo_id, tr_pr),
+                pr_active_task_key(repo_id, tr_pr),
+                pr_active_ancestors_key(repo_id, tr_pr),
+                pr_active_ts_key(repo_id, tr_pr),
+            )
     finally:
         await async_client.delete(
             pr_active_sha_key(repo_id, pr_num),
@@ -566,6 +590,17 @@ async def test_offline_out_of_order_guard_and_worker_pre_publish_lock_creation(
     )
     assert "sha-2" in mem_redis.sets[pr_active_ancestors_key("repo-oo", 8)]
     assert "sha-1" not in mem_redis.sets[pr_active_ancestors_key("repo-oo", 8)]
+
+    # Fallback rejects known ancestor even with before_sha=None and event_ts_ms=None (Lua parity)
+    c_fb_no_meta = await fb_lock.claim_active_sha(
+        "repo-oo", 8, "sha-2", before_sha=None, event_ts_ms=None
+    )
+    assert c_fb_no_meta.claimed is False and c_fb_no_meta.stale is True
+    assert mem_redis.store[pr_active_sha_key("repo-oo", 8)] == "sha-1"
+
+    # Fallback record_active_task refuses orphaned task writes when sha_key is absent
+    await fb_lock.record_active_task("repo-empty", 99, head_sha="sha-x", task_id="orphan-task")
+    assert pr_active_task_key("repo-empty", 99) not in mem_redis.store
 
     # 3. Worker spine creates AsyncSupersedeLock even without publish_fn / entry check
     worker_redis = _OfflineAsyncRedis()

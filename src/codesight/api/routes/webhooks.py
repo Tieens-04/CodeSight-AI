@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final, Literal, Protocol, TypeGuard, cast
@@ -34,9 +35,11 @@ MAX_WEBHOOK_BODY_BYTES: Final[int] = 25 * 1024 * 1024  # 25 MiB ceiling for 512m
 ACTIONABLE_PR_ACTIONS: Final[frozenset[str]] = frozenset({"opened", "synchronize", "reopened"})
 STALE_RECEIVED_SECONDS: Final[int] = 60
 BROKER_PUBLISH_RETRY_DELAY_SECONDS: Final[float] = 0.05
+REVOKE_TIMEOUT_SECONDS: Final[float] = 0.5
 _ZERO_SHA: Final[str] = "0" * 40
 _MAX_INT32: Final[int] = (1 << 31) - 1
 _MAX_INT64: Final[int] = (1 << 63) - 1
+_SIGNATURE_HEADER_RE: Final[re.Pattern[str]] = re.compile(r"^sha256=[0-9a-fA-F]{64}$")
 
 logger = structlog.get_logger("codesight.api.webhooks")
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
@@ -181,10 +184,13 @@ class CeleryWebhookDispatcher:
 
         async def _revoke_superseded(superseded_task_id: str) -> None:
             try:
-                await asyncio.to_thread(
-                    target.control.revoke,
-                    superseded_task_id,
-                    terminate=False,
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        target.control.revoke,
+                        superseded_task_id,
+                        terminate=False,
+                    ),
+                    timeout=REVOKE_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
                 logger.warning(
@@ -289,31 +295,40 @@ def verify_github_signature(
     return hmac.compare_digest(expected, signature_header)
 
 
+def _validate_content_length(
+    request: Request,
+    *,
+    max_bytes: int = MAX_WEBHOOK_BODY_BYTES,
+) -> None:
+    content_length_raw = request.headers.get("content-length")
+    if content_length_raw is None:
+        return
+    try:
+        declared_length = int(content_length_raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Content-Length header.",
+        ) from exc
+    if declared_length < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Content-Length header.",
+        )
+    if declared_length > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="Webhook payload exceeds maximum allowed size.",
+        )
+
+
 async def read_bounded_body(
     request: Request,
     *,
     max_bytes: int = MAX_WEBHOOK_BODY_BYTES,
 ) -> bytes:
     """Read request body up to max_bytes, aborting oversize streams with HTTP 413."""
-    content_length_raw = request.headers.get("content-length")
-    if content_length_raw is not None:
-        try:
-            declared_length = int(content_length_raw)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid Content-Length header.",
-            ) from exc
-        if declared_length < 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid Content-Length header.",
-            )
-        if declared_length > max_bytes:
-            raise HTTPException(
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                detail="Webhook payload exceeds maximum allowed size.",
-            )
+    _validate_content_length(request, max_bytes=max_bytes)
 
     chunks: list[bytes] = []
     total = 0
@@ -479,7 +494,11 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
                 default_branch=default_branch,
                 installation_id=inst_id,
                 ref=ref,
-                before_sha=before_sha if before_sha and len(before_sha) <= 64 else None,
+                before_sha=(
+                    before_sha
+                    if before_sha and len(before_sha) <= 64 and before_sha != _ZERO_SHA
+                    else None
+                ),
                 after_sha=after_sha,
             )
         return _IgnoredWebhook(ack_status="ignored", action=action)
@@ -578,25 +597,25 @@ async def _upsert_repository(
     default_branch: str,
     installation_id: int | None,
 ) -> Repository:
-    for _ in range(2):
-        updated = await _apply_repo_upsert(
-            session,
-            github_repo_id=github_repo_id,
-            full_name=full_name,
-            default_branch=default_branch,
-            installation_id=installation_id,
-        )
-        if updated is not None:
-            return updated
-
-        repo = Repository(
-            github_repo_id=github_repo_id,
-            full_name=full_name,
-            default_branch=default_branch,
-            installation_id=installation_id,
-        )
+    for _ in range(3):
         try:
             async with session.begin_nested():
+                updated = await _apply_repo_upsert(
+                    session,
+                    github_repo_id=github_repo_id,
+                    full_name=full_name,
+                    default_branch=default_branch,
+                    installation_id=installation_id,
+                )
+                if updated is not None:
+                    return updated
+
+                repo = Repository(
+                    github_repo_id=github_repo_id,
+                    full_name=full_name,
+                    default_branch=default_branch,
+                    installation_id=installation_id,
+                )
                 session.add(repo)
                 await session.flush()
                 return repo
@@ -658,9 +677,19 @@ async def receive_github_webhook(
             detail="GitHub webhook secret is not configured.",
         )
 
-    raw_body = await read_bounded_body(request)
+    # Fast-reject oversize Content-Length and missing/malformed signatures BEFORE buffering chunks
+    _validate_content_length(request)
 
     sig_header = request.headers.get("x-hub-signature-256")
+    if not sig_header or not _SIGNATURE_HEADER_RE.fullmatch(sig_header):
+        logger.warning("webhook_signature_invalid")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid GitHub webhook signature.",
+        )
+
+    raw_body = await read_bounded_body(request)
+
     if not verify_github_signature(raw_body, sig_header, secret):
         logger.warning("webhook_signature_invalid")
         raise HTTPException(
@@ -832,7 +861,10 @@ async def receive_github_webhook(
             async with session_factory() as fail_session:
                 await fail_session.execute(
                     update(WebhookEvent)
-                    .where(WebhookEvent.delivery_id == delivery_id)
+                    .where(
+                        WebhookEvent.delivery_id == delivery_id,
+                        WebhookEvent.status == "received",
+                    )
                     .values(status="failed")
                 )
                 await fail_session.commit()
@@ -853,13 +885,16 @@ async def receive_github_webhook(
             detail="Background task broker unavailable; please retry delivery.",
         ) from exc
 
-    # Phase 3: Mark event 'queued' or 'ignored' (superseded) after dispatch completes
+    # Phase 3: Mark event 'queued' or 'ignored' (superseded) only if still 'received'
     target_db_status = "ignored" if task_id is None else "queued"
     try:
         async with session_factory() as complete_session:
             await complete_session.execute(
                 update(WebhookEvent)
-                .where(WebhookEvent.delivery_id == delivery_id)
+                .where(
+                    WebhookEvent.delivery_id == delivery_id,
+                    WebhookEvent.status == "received",
+                )
                 .values(status=target_db_status)
             )
             await complete_session.commit()

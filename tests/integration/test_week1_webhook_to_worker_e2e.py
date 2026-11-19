@@ -42,7 +42,7 @@ E2E_WEBHOOK_SECRET = "e2e-webhook-secret-ca10"
 def _make_alembic_config(dsn: str) -> Config:
     cfg = Config(str(REPO_ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(REPO_ROOT / "alembic"))
-    cfg.set_main_option("sqlalchemy.url", dsn)
+    cfg.set_main_option("sqlalchemy.url", dsn.replace("%", "%%"))
     cfg.attributes["configure_logger"] = False
     return cfg
 

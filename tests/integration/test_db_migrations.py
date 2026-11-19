@@ -8,11 +8,13 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.autogenerate import compare_metadata
 from alembic.config import Config
+from alembic.migration import MigrationContext
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from codesight.db.models import PRReview, Repository, ReviewFinding, WebhookEvent
+from codesight.db.models import Base, PRReview, Repository, ReviewFinding, WebhookEvent
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -20,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def _make_alembic_config(dsn: str) -> Config:
     cfg = Config(str(REPO_ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(REPO_ROOT / "alembic"))
-    cfg.set_main_option("sqlalchemy.url", dsn)
+    cfg.set_main_option("sqlalchemy.url", dsn.replace("%", "%%"))
     cfg.attributes["configure_logger"] = False
     return cfg
 
@@ -56,8 +58,15 @@ async def test_alembic_upgrade_constraints_cascade_and_downgrade(
         async with engine.connect() as conn:
             info = await conn.run_sync(_inspect_schema)
             version = await conn.scalar(sa.text("SELECT version_num FROM alembic_version"))
+            drift = await conn.run_sync(
+                lambda sync_conn: compare_metadata(
+                    MigrationContext.configure(sync_conn, opts={"compare_type": True}),
+                    Base.metadata,
+                )
+            )
 
         assert version == "0001_initial_schema"
+        assert drift == [], f"ORM models drifted from Alembic head migration: {drift}"
         assert {
             "repositories",
             "webhook_events",

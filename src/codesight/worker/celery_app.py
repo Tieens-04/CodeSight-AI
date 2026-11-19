@@ -37,6 +37,7 @@ from codesight.core.logging import (
     get_trace_id,
 )
 from codesight.db.session import create_db_engine, create_session_factory
+from codesight.vcs.github_auth import GitHubAuthConfigError
 from codesight.worker.lifecycle import (
     PRReviewLifecycleContext,
     classify_retryable_exception,
@@ -178,6 +179,7 @@ class CodeSightTask(Task):  # type: ignore[misc]
                     task_name=self.name,
                     trace_id=trace_id,
                 )
+                _WORKER_RUNTIME.record_superseded_audit_sync(payload_arg, trace_id=trace_id)
                 return {"status": "superseded", "trace_id": trace_id}
 
             countdown = compute_retry_countdown(
@@ -214,6 +216,14 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
         timezone="UTC",
         enable_utc=True,
         broker_connection_retry_on_startup=True,
+        broker_connection_timeout=2.0,
+        broker_transport_options={
+            "socket_connect_timeout": 1.0,
+            "socket_timeout": 1.0,
+            "retry_on_timeout": False,
+        },
+        task_publish_retry=False,
+        result_expires=300,
         worker_hijack_root_logger=False,
         worker_redirect_stdouts=False,
         task_acks_late=True,
@@ -361,12 +371,14 @@ class _WorkerAsyncRuntime:
 
         ctx = contextvars.copy_context()
         result_future: concurrent.futures.Future[T] = concurrent.futures.Future()
+        task_holder: list[asyncio.Task[T]] = []
 
         def _schedule() -> None:
             if not result_future.set_running_or_notify_cancel():
                 coro.close()
                 return
             task = loop.create_task(coro, context=ctx)
+            task_holder.append(task)
 
             def _on_done(done_task: asyncio.Task[T]) -> None:
                 if done_task.cancelled():
@@ -385,7 +397,24 @@ class _WorkerAsyncRuntime:
         except RuntimeError:
             coro.close()
             raise
-        return result_future.result()
+
+        try:
+            return result_future.result()
+        except BaseException:
+
+            def _cancel_running() -> None:
+                if task_holder and not task_holder[0].done():
+                    task_holder[0].cancel()
+                else:
+                    result_future.cancel()
+
+            if not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(_cancel_running)
+                    concurrent.futures.wait((result_future,), timeout=3.0)
+                except Exception:
+                    pass
+            raise
 
     async def _ensure_pools(
         self, settings: Settings
@@ -494,11 +523,41 @@ class _WorkerAsyncRuntime:
         with self._state_lock:
             self._reset_fields()
 
+    def record_superseded_audit_sync(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        trace_id: str,
+        settings: Settings | None = None,
+    ) -> None:
+        """Best-effort DB audit persistence when retry is aborted due to supersede."""
+        active_settings = settings if settings is not None else get_settings()
+        if not has_github_credentials(active_settings) or extract_pr_coords(payload) is None:
+            return
+
+        async def _persist() -> None:
+            _, _, session_factory = await self._ensure_pools(active_settings)
+            runner = Week1PRReviewRunner(
+                settings=active_settings,
+                session_factory=session_factory,
+            )
+            await runner.record_superseded_audit(payload, trace_id=trace_id)
+
+        try:
+            self.run_coro(_persist())
+        except Exception as exc:
+            logger.warning(
+                "worker_superseded_audit_dispatch_failed",
+                trace_id=trace_id,
+                error_type=type(exc).__name__,
+            )
+
     def run_pr_webhook_task_sync(
         self,
         payload: Mapping[str, Any],
         *,
         settings: Settings | None = None,
+        is_final_attempt: bool = False,
     ) -> dict[str, str]:
         async def _dispatch() -> dict[str, str]:
             active_settings = settings if settings is not None else get_settings()
@@ -515,18 +574,19 @@ class _WorkerAsyncRuntime:
                     http_client=http_client,
                     session_factory=session_factory,
                     redis_client=redis_client,
+                    is_final_attempt=is_final_attempt,
                 )
-            return await run_pr_webhook_task(payload, settings=active_settings)
+            return await run_pr_webhook_task(
+                payload,
+                settings=active_settings,
+                is_final_attempt=is_final_attempt,
+            )
 
         return self.run_coro(_dispatch())
 
 
 _WORKER_RUNTIME = _WorkerAsyncRuntime()
 atexit.register(_WORKER_RUNTIME.shutdown)
-
-
-def _run_coro_sync[T](coro: Coroutine[Any, Any, T]) -> T:
-    return _WORKER_RUNTIME.run_coro(coro)
 
 
 async def run_pr_webhook_task(
@@ -537,6 +597,7 @@ async def run_pr_webhook_task(
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     redis_client: redis_async.Redis | None = None,
     api_base_url: str = "https://api.github.com",
+    is_final_attempt: bool = False,
 ) -> dict[str, str]:
     """Execute live Week 1 PR review flow when configured, else run offline lifecycle stub."""
     active_settings = settings if settings is not None else get_settings()
@@ -551,7 +612,17 @@ async def run_pr_webhook_task(
             redis_client=redis_client,
             api_base_url=api_base_url,
         )
-        return await runner.execute(payload)
+        return await runner.execute(payload, is_final_attempt=is_final_attempt)
+
+    if (
+        coords is not None
+        and has_repo_slug
+        and active_settings.app_env == "production"
+        and not has_github_credentials(active_settings)
+    ):
+        raise GitHubAuthConfigError(
+            "GitHub App credentials are required in production worker mode."
+        )
 
     return await execute_pr_review_lifecycle(
         payload,
@@ -564,6 +635,26 @@ async def run_pr_webhook_task(
 def handle_pr_event(payload: dict[str, Any]) -> dict[str, str]:
     """Handle pull_request webhook events through the Day 3-6 Supersede + Review spine."""
     trace_id = get_trace_id() or "-"
+    active_settings = get_settings()
+    coords = extract_pr_coords(payload)
+    repo_full_name = payload.get("repo_full_name")
+    has_repo_slug = isinstance(repo_full_name, str) and bool(repo_full_name.strip())
+
+    # In configured live mode, delegate entry-supersede to pooled async runner so DB audit
+    # ('superseded' / 'processed') is recorded without opening per-task sync Redis sockets.
+    if coords is not None and has_repo_slug and has_github_credentials(active_settings):
+        req = getattr(handle_pr_event, "request", None)
+        is_worker_delivery = not bool(getattr(req, "called_directly", True)) and bool(
+            getattr(req, "id", None)
+        )
+        current_retries = int(getattr(req, "retries", 0) or 0)
+        is_final_attempt = (not is_worker_delivery) or (current_retries >= MAX_TASK_RETRIES)
+        return _WORKER_RUNTIME.run_pr_webhook_task_sync(
+            payload,
+            settings=active_settings,
+            is_final_attempt=is_final_attempt,
+        )
+
     if is_pr_event_superseded(payload):
         logger.info(
             "webhook_pr_superseded",
@@ -573,7 +664,7 @@ def handle_pr_event(payload: dict[str, Any]) -> dict[str, str]:
             head_sha=str(payload.get("head_sha", "")),
         )
         return {"status": "superseded", "trace_id": trace_id}
-    return _WORKER_RUNTIME.run_pr_webhook_task_sync(payload)
+    return _WORKER_RUNTIME.run_pr_webhook_task_sync(payload, settings=active_settings)
 
 
 @_typed_task(celery_app, name="codesight.webhook.handle_push_event")

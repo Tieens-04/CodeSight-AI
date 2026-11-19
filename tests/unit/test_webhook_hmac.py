@@ -212,7 +212,22 @@ async def test_webhook_rejects_missing_secret_bad_hmac_bad_headers_and_oversize_
             headers={"Content-Length": str(MAX_WEBHOOK_BODY_BYTES + 1)},
         )
 
-        # Streaming chunked body >25 MiB without Content-Length header
+        # Unauthenticated chunked stream without signature must be rejected (401) before buffering
+        unauth_chunks_read = 0
+
+        async def _unauth_oversize_chunks() -> AsyncIterator[bytes]:
+            nonlocal unauth_chunks_read
+            chunk = b"x" * (1024 * 1024)
+            for _ in range(26):
+                unauth_chunks_read += 1
+                yield chunk
+
+        r_unauth_stream_401 = await client.post(
+            "/api/v1/webhooks/github",
+            content=_unauth_oversize_chunks(),
+        )
+
+        # Streaming chunked body >25 MiB with syntactically valid signature header -> 413
         async def _oversize_chunks() -> AsyncIterator[bytes]:
             chunk = b"x" * (1024 * 1024)
             for _ in range(26):
@@ -221,6 +236,7 @@ async def test_webhook_rejects_missing_secret_bad_hmac_bad_headers_and_oversize_
         r_stream_413 = await client.post(
             "/api/v1/webhooks/github",
             content=_oversize_chunks(),
+            headers={"X-Hub-Signature-256": "sha256=" + ("0" * 64)},
         )
 
     assert r_missing_sig.status_code == 401
@@ -229,6 +245,8 @@ async def test_webhook_rejects_missing_secret_bad_hmac_bad_headers_and_oversize_
     assert r_bad_headers.status_code == 400
     assert r_bad_json.status_code == 400
     assert r_content_length_413.status_code == 413
+    assert r_unauth_stream_401.status_code == 401
+    assert unauth_chunks_read == 0
     assert r_stream_413.status_code == 413
 
 
@@ -339,8 +357,14 @@ async def test_webhook_idempotency_filtering_cli_upsert_and_broker_rollback(
             assert r_closed.json()["status"] == "ignored"
             assert len(spy.pr_calls) == 3
 
-            # 5. push filtering: default branch -> 202; feature branch or deleted -> 200 ignored
+            # 5. push filtering: default branch -> 202; zero before_sha normalized to None;
+            #    feature branch or deleted -> 200 ignored
             r_push_main = await _send("push", "deliv-push-main", _push_payload(repo_id=777))
+            r_push_init = await _send(
+                "push",
+                "deliv-push-init",
+                _push_payload(before="0" * 40, after="abc123456789", repo_id=777),
+            )
             r_push_feat = await _send(
                 "push",
                 "deliv-push-feat",
@@ -352,9 +376,11 @@ async def test_webhook_idempotency_filtering_cli_upsert_and_broker_rollback(
                 _push_payload(deleted=True, after="0" * 40, repo_id=777),
             )
             assert r_push_main.status_code == 202
+            assert r_push_init.status_code == 202
             assert r_push_feat.status_code == 200 and r_push_feat.json()["status"] == "ignored"
             assert r_push_del.status_code == 200 and r_push_del.json()["status"] == "ignored"
-            assert len(spy.push_calls) == 1
+            assert len(spy.push_calls) == 2
+            assert spy.push_calls[1].before_sha is None
 
             # 6. Broker outage -> rollback DB & 503, then retry same delivery_id -> 202!
             spy.fail_next = True
@@ -1306,5 +1332,49 @@ async def test_webhook_stale_received_reclaim_null_repo_id_and_concurrent_upsert
             assert resolved.github_repo_id == 8888
             assert resolved.default_branch == "trunk"
             assert resolved.installation_id == 99
+
+        # 5. Phase-3 status update never clobbers worker 'processed'/'failed' back to 'queued'
+        class _FastWorkerDispatcher:
+            async def dispatch_pull_request(self, payload: PRWebhookDispatchPayload) -> str:
+                async with session_factory() as worker_session:
+                    await worker_session.execute(
+                        sa.update(WebhookEvent)
+                        .where(WebhookEvent.delivery_id == payload.delivery_id)
+                        .values(status="processed")
+                    )
+                    await worker_session.commit()
+                return "fast-worker-task-1"
+
+            async def dispatch_push(self, payload: PushWebhookDispatchPayload) -> str:
+                return "fast-push-1"
+
+        race_app = create_app(
+            settings=Settings(
+                _env_file=None,
+                github_webhook_secret=SecretStr(TEST_WEBHOOK_SECRET),
+            ),
+            session_factory=session_factory,
+            webhook_dispatcher=_FastWorkerDispatcher(),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=race_app),
+            base_url="http://test",
+        ) as race_client:
+            raw_fast = json.dumps(_pr_payload(pr_number=202, head_sha="fastsha202")).encode("utf-8")
+            r_fast = await race_client.post(
+                "/api/v1/webhooks/github",
+                content=raw_fast,
+                headers={
+                    "X-GitHub-Event": "pull_request",
+                    "X-GitHub-Delivery": "deliv-fast-worker-202",
+                    "X-Hub-Signature-256": _sign_body(raw_fast),
+                },
+            )
+            assert r_fast.status_code == 202
+
+        async with session_factory() as verify_fast:
+            fast_evt = await verify_fast.get(WebhookEvent, "deliv-fast-worker-202")
+            assert fast_evt is not None
+            assert fast_evt.status == "processed"
     finally:
         await engine.dispose()

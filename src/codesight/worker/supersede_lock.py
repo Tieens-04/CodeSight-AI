@@ -27,10 +27,13 @@ local event_ts = tonumber(ARGV[4]) or 0
 local is_direct_successor = (p_sha and p_sha ~= '' and before_sha ~= '' and before_sha == p_sha)
 
 if p_sha and p_sha ~= '' and p_sha ~= head_sha and not is_direct_successor then
-    if redis.call('SISMEMBER', KEYS[3], head_sha) == 1 then
-        return {p_sha, p_task or '', '0', tostring(p_ts), '', ''}
-    end
-    if event_ts > 0 and p_ts > 0 and event_ts < p_ts then
+    local is_known_anc = (redis.call('SISMEMBER', KEYS[3], head_sha) == 1)
+    local is_older_ts = (event_ts > 0 and p_ts > 0 and event_ts < p_ts)
+    if is_known_anc or is_older_ts then
+        if before_sha ~= '' and before_sha ~= p_sha and before_sha ~= head_sha then
+            redis.call('SADD', KEYS[3], before_sha)
+            redis.call('EXPIRE', KEYS[3], ttl)
+        end
         return {p_sha, p_task or '', '0', tostring(p_ts), '', ''}
     end
 end
@@ -243,11 +246,11 @@ class AsyncSupersedeLock:
 
             prev_sha = _decode_redis_str(await self._client.get(sha_key))
             prev_task = _decode_redis_str(await self._client.get(task_key))
-            track_causal = bool(clean_before) or norm_ts > 0
+            supports_sets = callable(getattr(self._client, "sismember", None))
             prev_ts_ms = None
             added_ancestor = None
             removed_ancestor = None
-            if track_causal:
+            if supports_sets:
                 prev_ts_ms = _parse_int_str(await self._client.get(ts_key))
                 is_direct_successor = bool(
                     prev_sha and clean_before and clean_before == prev_sha
@@ -259,6 +262,9 @@ class AsyncSupersedeLock:
                     if is_known_ancestor or (
                         norm_ts > 0 and prev_ts_ms is not None and norm_ts < prev_ts_ms
                     ):
+                        if clean_before and clean_before != prev_sha and clean_before != head_sha:
+                            await self._client.sadd(ancestors_key, clean_before)
+                            await self._client.expire(ancestors_key, ttl_seconds)
                         return SupersedeClaim(
                             prev_sha=prev_sha,
                             prev_task_id=prev_task,
@@ -390,7 +396,7 @@ class AsyncSupersedeLock:
                 return
 
             current = _decode_redis_str(await self._client.get(sha_key))
-            if current is None or current == head_sha:
+            if current == head_sha:
                 await self._client.set(task_key, task_id, ex=ttl_seconds)
         except (redis.exceptions.RedisError, OSError) as exc:
             logger.warning(
