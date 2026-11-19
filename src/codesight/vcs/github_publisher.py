@@ -16,10 +16,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from codesight.core.errors import (
     RateLimitTaskError,
     RetryableTaskError,
+    is_rate_limited_403,
     parse_retry_after_header,
 )
 from codesight.diff.file_filter import normalize_diff_path
 from codesight.diff.models import ParsedFileDiff, ParsedPullRequestDiff
+from codesight.vcs._http import (
+    METHOD_PRESERVING_REDIRECT_STATUSES,
+    origin_tuple,
+    resolve_same_origin_redirect,
+    validate_positive_int,
+)
 from codesight.vcs.github_auth import (
     GitHubAuthError,
     GitHubAuthProvider,
@@ -49,15 +56,23 @@ OUT_OF_HUNK_HEADING: Final[str] = (
     "### Findings Outside Diff Hunks (Out-of-Hunk / File-level Findings)"
 )
 MAX_CHECK_TEXT_CHARS: Final[int] = 65_535
+MAX_REVIEW_BODY_CHARS: Final[int] = 65_535
 _MAX_TRACKED_CHECK_RUNS: Final[int] = 1024
 DEFAULT_EMPTY_REVIEW_BODY: Final[str] = "CodeSight-AI review completed with no blocking issues."
+DEFAULT_REQUEST_CHANGES_BODY: Final[str] = (
+    "CodeSight-AI requested changes based on inline review findings."
+)
+_TRUNCATION_FOOTER: Final[str] = "\n\n*(truncated to fit GitHub API length limit)*"
 
 _VALID_CONCLUSIONS: Final[frozenset[str]] = frozenset({"success", "neutral", "failure"})
 _VALID_REVIEW_EVENTS: Final[frozenset[str]] = frozenset({"COMMENT", "APPROVE", "REQUEST_CHANGES"})
 _SUGGESTION_FENCE_RE: Final[re.Pattern[str]] = re.compile(
-    r"^([ \t]*(?:`{3,}|~{3,}))suggestion\b",
+    r"^([ \t]*(?:`{3,}|~{3,}))[ \t]*suggestion\b",
     re.MULTILINE | re.IGNORECASE,
 )
+_CODE_FENCE_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^[ \t]*(`{3,}|~{3,})", re.MULTILINE)
+_BACKTICK_RUN_RE: Final[re.Pattern[str]] = re.compile(r"`+")
+_CONTROL_CHAR_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
 
 logger = structlog.get_logger("codesight.vcs.publisher")
 
@@ -142,6 +157,71 @@ class PublishedReviewRecord:
     used_422_fallback: bool = False
 
 
+def format_markdown_code_span(raw_text: str) -> str:
+    """Wrap an untrusted filename/identifier in a CommonMark-safe inline code span."""
+    sanitized = _CONTROL_CHAR_RE.sub("", raw_text)
+    max_ticks = max((len(m.group(0)) for m in _BACKTICK_RUN_RE.finditer(sanitized)), default=0)
+    fence = "`" * (max_ticks + 1)
+    if sanitized.startswith(("`", " ")) or sanitized.endswith(("`", " ")):
+        return f"{fence} {sanitized} {fence}"
+    return f"{fence}{sanitized}{fence}"
+
+
+def truncate_markdown_body(text: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
+    """Truncate Markdown text to <= limit chars while closing any dangling code fence."""
+    if len(text) <= limit:
+        return text
+
+    open_fence_reserve = 8  # room for "\n```\n" if a code fence is left unclosed
+    budget = max(0, limit - len(_TRUNCATION_FOOTER) - open_fence_reserve)
+    prefix = text[:budget].rstrip()
+
+    open_fence: str | None = None
+    for match in _CODE_FENCE_LINE_RE.finditer(prefix):
+        marker = match.group(1)
+        if open_fence is None:
+            open_fence = marker
+        elif marker[0] == open_fence[0] and len(marker) >= len(open_fence):
+            open_fence = None
+
+    if open_fence is not None:
+        closing = f"\n{open_fence[0] * min(len(open_fence), 3)}"
+        candidate = f"{prefix}{closing}{_TRUNCATION_FOOTER}"
+    else:
+        candidate = f"{prefix}{_TRUNCATION_FOOTER}"
+
+    return candidate[:limit]
+
+
+def _extract_github_error_meta(resp: httpx.Response) -> dict[str, Any]:
+    """Extract NFR-3-safe structural GitHub API error fields (no raw code or request echo)."""
+    try:
+        parsed = resp.json()
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    meta: dict[str, Any] = {}
+    msg = parsed.get("message")
+    if isinstance(msg, str) and msg.strip():
+        meta["github_message"] = msg.strip()[:200]
+    raw_errors = parsed.get("errors")
+    if isinstance(raw_errors, list):
+        compact: list[dict[str, str]] = []
+        for entry in raw_errors[:5]:
+            if isinstance(entry, dict):
+                item: dict[str, str] = {}
+                for field_key in ("resource", "field", "code"):
+                    val = entry.get(field_key)
+                    if isinstance(val, str) and val.strip():
+                        item[field_key] = val.strip()[:64]
+                if item:
+                    compact.append(item)
+        if compact:
+            meta["github_errors"] = compact
+    return meta
+
+
 def _neutralize_suggestion_fences(text: str) -> str:
     return _SUGGESTION_FENCE_RE.sub(r"\1", text)
 
@@ -157,8 +237,9 @@ def _format_location_label(draft: ReviewCommentDraft) -> str:
 def _format_downgraded_bullet(item: DowngradedComment) -> str:
     severity_tag = f"**[{item.draft.severity}]** " if item.draft.severity else ""
     loc = _format_location_label(item.draft)
+    safe_path = format_markdown_code_span(item.draft.path)
     safe_body = _neutralize_suggestion_fences(item.draft.body)
-    return f"- {severity_tag}`{item.draft.path}` ({loc}) `[{item.reason}]`:\n\n{safe_body}"
+    return f"- {severity_tag}{safe_path} ({loc}) `[{item.reason}]`:\n\n{safe_body}"
 
 
 def _lookup_parsed_file(
@@ -178,16 +259,6 @@ def _truncate_check_field(text: str, limit: int = MAX_CHECK_TEXT_CHARS) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
-
-
-def _is_rate_limited_403(headers: httpx.Headers) -> bool:
-    return bool(headers.get("retry-after") or headers.get("x-ratelimit-remaining") == "0")
-
-
-def _validate_positive_int(value: int, *, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer.")
-    return value
 
 
 def partition_review_comments(
@@ -222,7 +293,7 @@ def partition_review_comments(
                         "path": parsed_file.file_path,
                         "line": draft.line,
                         "side": "RIGHT",
-                        "body": draft.body,
+                        "body": truncate_markdown_body(draft.body),
                     }
                 )
                 inline_drafts.append(draft.model_copy(update={"path": parsed_file.file_path}))
@@ -242,7 +313,7 @@ def partition_review_comments(
                     "start_side": "RIGHT",
                     "line": draft.line,
                     "side": "RIGHT",
-                    "body": draft.body,
+                    "body": truncate_markdown_body(draft.body),
                 }
             )
             inline_drafts.append(draft.model_copy(update={"path": parsed_file.file_path}))
@@ -266,6 +337,7 @@ def partition_review_comments(
     merged_body = "\n\n".join(sections).strip()
     if not merged_body and not inline_comments:
         merged_body = DEFAULT_EMPTY_REVIEW_BODY
+    merged_body = truncate_markdown_body(merged_body)
 
     return PreparedPullRequestReview(
         body=merged_body,
@@ -300,10 +372,12 @@ def _fold_remaining_into_summary(
     joined_bullets = "\n\n".join(fallback_bullets)
     base = existing_body.strip()
     if OUT_OF_HUNK_HEADING in base:
-        return f"{base}\n\n{joined_bullets}".strip()
-    if base:
-        return f"{base}\n\n{OUT_OF_HUNK_HEADING}\n\n{joined_bullets}".strip()
-    return f"{OUT_OF_HUNK_HEADING}\n\n{joined_bullets}".strip()
+        merged = f"{base}\n\n{joined_bullets}".strip()
+    elif base:
+        merged = f"{base}\n\n{OUT_OF_HUNK_HEADING}\n\n{joined_bullets}".strip()
+    else:
+        merged = f"{OUT_OF_HUNK_HEADING}\n\n{joined_bullets}".strip()
+    return truncate_markdown_body(merged)
 
 
 class GitHubReviewPublisher:
@@ -368,30 +442,55 @@ class GitHubReviewPublisher:
         json_body: dict[str, Any],
         installation_id: int | None,
         allow_422: bool = False,
+        max_redirects: int = 3,
     ) -> tuple[int, dict[str, Any]]:
         headers = await self._auth.get_auth_headers(
             installation_id=installation_id,
             repo_full_name=slug,
         )
-        url = f"{self._base_url}{path}"
+        current_url = f"{self._base_url}{path}"
+        expected_origin = origin_tuple(self._base_url)
         client = self._ensure_client()
 
-        try:
-            # NFR-3: never log json_body or auth headers; emit structural metadata only.
-            resp = await client.request(method, url, headers=headers, json=json_body)
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            logger.warning(
-                "github_publisher_transport_error",
-                repo=slug,
-                method=method,
-                error_type=type(exc).__name__,
+        resp: httpx.Response | None = None
+        for _ in range(max_redirects + 1):
+            try:
+                # NFR-3: never log json_body or auth headers; emit structural metadata only.
+                resp = await client.request(
+                    method,
+                    current_url,
+                    headers=headers,
+                    json=json_body,
+                    follow_redirects=False,
+                )
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                logger.warning(
+                    "github_publisher_transport_error",
+                    repo=slug,
+                    method=method,
+                    error_type=type(exc).__name__,
+                )
+                raise RetryableTaskError(
+                    f"Transient network failure calling GitHub {method} {path}."
+                ) from exc
+
+            if resp.status_code in METHOD_PRESERVING_REDIRECT_STATUSES:
+                current_url = resolve_same_origin_redirect(
+                    current_url,
+                    resp,
+                    expected_origin,
+                    error_factory=lambda msg, sc: GitHubPublishError(msg, status_code=sc),
+                )
+                continue
+            break
+        else:
+            raise GitHubPublishError(
+                f"Exceeded maximum same-origin redirects calling GitHub {method} {path}.",
+                status_code=resp.status_code if resp is not None else None,
             )
-            raise RetryableTaskError(
-                f"Transient network failure calling GitHub {method} {path}."
-            ) from exc
 
         code = resp.status_code
-        if code == 429 or (code == 403 and _is_rate_limited_403(resp.headers)):
+        if code == 429 or (code == 403 and is_rate_limited_403(resp.headers)):
             delay = parse_retry_after_header(resp.headers)
             logger.warning(
                 "github_publisher_rate_limited",
@@ -405,6 +504,8 @@ class GitHubReviewPublisher:
             )
 
         if code in {401, 403}:
+            if code == 401 and installation_id is not None:
+                await self._auth.invalidate_installation_token(installation_id)
             logger.error("github_publisher_auth_error", repo=slug, status_code=code)
             raise GitHubAuthError(
                 f"GitHub API returned HTTP {code} on {method} {path}.",
@@ -416,10 +517,16 @@ class GitHubReviewPublisher:
             raise RetryableTaskError(f"GitHub API returned HTTP {code} on {method} {path}.")
 
         if code == 422 and allow_422:
-            return code, {}
+            return code, _extract_github_error_meta(resp)
 
-        if code >= 400:
-            logger.error("github_publisher_client_error", repo=slug, status_code=code)
+        if not (200 <= code < 300):
+            err_meta = _extract_github_error_meta(resp)
+            logger.error(
+                "github_publisher_client_error",
+                repo=slug,
+                status_code=code,
+                **err_meta,
+            )
             raise GitHubPublishError(
                 f"GitHub API rejected {method} {path} with HTTP {code}.",
                 status_code=code,
@@ -515,7 +622,7 @@ class GitHubReviewPublisher:
     ) -> CheckRunRecord:
         """Finalize an existing GitHub Check Run with success, neutral, or failure conclusion."""
         slug = validate_repo_full_name(repo_full_name)
-        valid_id = _validate_positive_int(check_run_id, name="check_run_id")
+        valid_id = validate_positive_int(check_run_id, name="check_run_id")
         if conclusion not in _VALID_CONCLUSIONS:
             raise ValueError(
                 f"Invalid check run conclusion {conclusion!r}; "
@@ -642,9 +749,9 @@ class GitHubReviewPublisher:
     ) -> PublishedReviewRecord:
         """Publish all review findings in one batch POST while guarding against HTTP 422."""
         slug = validate_repo_full_name(repo_full_name)
-        valid_pr = _validate_positive_int(pull_number, name="pull_number")
+        valid_pr = validate_positive_int(pull_number, name="pull_number")
         valid_check_run_id = (
-            _validate_positive_int(check_run_id, name="check_run_id")
+            validate_positive_int(check_run_id, name="check_run_id")
             if check_run_id is not None
             else None
         )
@@ -681,10 +788,14 @@ class GitHubReviewPublisher:
                 installation_id=installation_id,
             )
 
+        review_body = prepared.body
+        if event == "REQUEST_CHANGES" and not review_body:
+            review_body = DEFAULT_REQUEST_CHANGES_BODY
+
         endpoint = f"/repos/{slug}/pulls/{valid_pr}/reviews"
         payload: dict[str, Any] = {
             "commit_id": clean_sha,
-            "body": prepared.body,
+            "body": review_body,
             "event": event,
             "comments": list(prepared.inline_comments),
         }
@@ -709,6 +820,7 @@ class GitHubReviewPublisher:
                 repo=slug,
                 pull_number=valid_pr,
                 downgraded_count=inline_count,
+                **data,
             )
             if supersede_lock is not None:
                 await self._ensure_not_superseded(
@@ -724,7 +836,7 @@ class GitHubReviewPublisher:
             fallback_payload = {
                 "commit_id": clean_sha,
                 "body": _fold_remaining_into_summary(
-                    prepared.body,
+                    review_body,
                     prepared.inline_drafts or prepared.inline_comments,
                 ),
                 "event": event,

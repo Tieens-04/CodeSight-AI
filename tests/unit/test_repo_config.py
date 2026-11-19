@@ -276,3 +276,39 @@ def test_invalid_glob_syntax_in_ignore_paths_rejected_and_salvages_siblings(
         and entry["invalid_fields"] == ["ignore_paths"]
         for entry in logs
     )
+
+
+@pytest.mark.asyncio
+async def test_yaml_alias_bomb_rejected_and_same_origin_redirect_handled() -> None:
+    billion_laughs = (
+        "a: &a ['x', 'x', 'x', 'x']\n"
+        "b: &b [*a, *a, *a, *a]\n"
+        "ignore_paths: *b\n"
+    )
+    cfg = parse_repo_config_yaml(billion_laughs, source=".codesight.yaml")
+    assert cfg == RepoConfig()
+
+    ok_b64 = base64.b64encode(b"min_debt_score: 91\n").decode("ascii")
+
+    def _redirect_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/org/moved/contents/.codesight.yaml":
+            return httpx.Response(
+                301,
+                headers={"Location": "/repositories/55/contents/.codesight.yaml?ref=main"},
+            )
+        if request.url.path == "/repositories/55/contents/.codesight.yaml":
+            return httpx.Response(
+                200,
+                json={"type": "file", "size": 32, "encoding": "base64", "content": ok_b64},
+            )
+        if request.url.path == "/repos/org/evil/contents/.codesight.yaml":
+            return httpx.Response(302, headers={"Location": "https://evil.example/cfg"})
+        return httpx.Response(404)
+
+    settings = Settings(_env_file=None, github_token=SecretStr("ghp_test_token"))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_redirect_handler)) as http:
+        loader = RepoConfigLoader(GitHubAuthProvider(settings, http_client=http), http_client=http)
+        moved_cfg = await loader.load("org/moved")
+        assert moved_cfg.min_debt_score == 91
+        evil_cfg = await loader.load("org/evil")
+        assert evil_cfg == RepoConfig()

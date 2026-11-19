@@ -10,7 +10,7 @@ import time
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Literal, cast
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 import structlog
@@ -28,9 +28,18 @@ from codesight.config_reader.repo_config import (
     parse_repo_config_yaml,
 )
 from codesight.core.config import Settings, get_settings
+from codesight.core.errors import is_rate_limited_403
 from codesight.diff.file_filter import FileFilter
 from codesight.diff.models import ParsedPullRequestDiff, PatchFileEntry
 from codesight.diff.smart_diff_parser import SmartDiffParser
+from codesight.vcs._http import (
+    REDIRECT_STATUSES,
+    BoundedStreamResult,
+    origin_tuple,
+    parse_github_files_page,
+    resolve_same_origin_redirect,
+    stream_same_origin_bounded,
+)
 from codesight.vcs.github_auth import (
     GITHUB_ACCEPT_HEADER,
     GITHUB_API_VERSION,
@@ -154,17 +163,8 @@ def _public_headers(accept: str = GITHUB_ACCEPT_HEADER) -> dict[str, str]:
     }
 
 
-def _has_configured_credentials(settings: Settings) -> bool:
-    has_app = bool(
-        settings.github_app_id
-        and settings.github_app_id.strip()
-        and settings.github_private_key is not None
-        and settings.github_private_key.get_secret_value().strip()
-    )
-    has_pat = bool(
-        settings.github_token is not None and settings.github_token.get_secret_value().strip()
-    )
-    return has_app or has_pat
+def _make_cli_error(message: str, _status_code: int | None) -> CLIReviewError:
+    return CLIReviewError(message)
 
 
 async def _resolve_cli_headers(
@@ -172,11 +172,12 @@ async def _resolve_cli_headers(
     *,
     repo_full_name: str,
     http_client: httpx.AsyncClient,
+    api_base: str = "https://api.github.com",
 ) -> dict[str, str]:
-    if not _has_configured_credentials(settings):
+    if not settings.has_github_credentials:
         return _public_headers()
 
-    provider = GitHubAuthProvider(settings, http_client=http_client)
+    provider = GitHubAuthProvider(settings, http_client=http_client, base_url=api_base)
     try:
         headers = await provider.get_auth_headers(repo_full_name=repo_full_name)
     except GitHubAuthConfigError as exc:
@@ -190,34 +191,6 @@ async def _resolve_cli_headers(
     }
 
 
-def _origin_tuple(url: str) -> tuple[str, str, int | None]:
-    parts = urlsplit(url)
-    scheme = parts.scheme.lower()
-    host = (parts.hostname or "").lower()
-    port = parts.port
-    if port is None:
-        port = 443 if scheme == "https" else (80 if scheme == "http" else None)
-    return scheme, host, port
-
-
-_REDIRECT_STATUSES: Final[frozenset[int]] = frozenset({301, 302, 303, 307, 308})
-
-
-def _resolve_same_origin_redirect(
-    current_url: str,
-    resp: httpx.Response,
-    expected_origin: tuple[str, str, int | None],
-) -> str:
-    location = resp.headers.get("location")
-    if not isinstance(location, str) or not location:
-        raise CLIReviewError("GitHub API returned redirect without Location header.")
-    # urljoin handles relative, protocol-relative, and absolute Location headers.
-    next_url = urljoin(current_url, location)
-    if _origin_tuple(next_url) != expected_origin:
-        raise CLIReviewError("Blocked cross-origin redirect while contacting GitHub API.")
-    return next_url
-
-
 async def _get_same_origin(
     client: httpx.AsyncClient,
     url: str,
@@ -226,13 +199,18 @@ async def _get_same_origin(
     api_base: str,
     max_redirects: int = 3,
 ) -> httpx.Response:
-    expected_origin = _origin_tuple(api_base)
+    expected_origin = origin_tuple(api_base)
     current_url = url
     for _ in range(max_redirects + 1):
         resp = await client.get(current_url, headers=headers, follow_redirects=False)
-        if resp.status_code not in _REDIRECT_STATUSES:
+        if resp.status_code not in REDIRECT_STATUSES:
             return resp
-        current_url = _resolve_same_origin_redirect(current_url, resp, expected_origin)
+        current_url = resolve_same_origin_redirect(
+            current_url,
+            resp,
+            expected_origin,
+            error_factory=_make_cli_error,
+        )
     raise CLIReviewError("Exceeded maximum same-origin redirects contacting GitHub API.")
 
 
@@ -244,64 +222,25 @@ async def _get_same_origin_bounded_diff(
     api_base: str,
     max_bytes: int,
     max_redirects: int = 3,
-) -> httpx.Response | None:
-    expected_origin = _origin_tuple(api_base)
-    current_url = url
-    for _ in range(max_redirects + 1):
-        async with client.stream(
-            "GET",
-            current_url,
-            headers=headers,
-            follow_redirects=False,
-        ) as resp:
-            if resp.status_code in _REDIRECT_STATUSES:
-                current_url = _resolve_same_origin_redirect(current_url, resp, expected_origin)
-                continue
-
-            if resp.status_code != 200:
-                body = await resp.aread()
-                return httpx.Response(
-                    status_code=resp.status_code,
-                    headers=resp.headers,
-                    content=body,
-                    request=resp.request,
-                )
-
-            raw_len = resp.headers.get("content-length")
-            if raw_len is not None:
-                try:
-                    declared_len = int(raw_len.strip())
-                except ValueError:
-                    declared_len = -1
-                if declared_len > max_bytes:
-                    logger.warning(
-                        "cli_review_diff_exceeded_max_bytes",
-                        declared_bytes=declared_len,
-                        max_bytes=max_bytes,
-                    )
-                    return None
-
-            chunks: list[bytes] = []
-            total_bytes = 0
-            async for chunk in resp.aiter_bytes():
-                total_bytes += len(chunk)
-                if total_bytes > max_bytes:
-                    logger.warning(
-                        "cli_review_diff_exceeded_max_bytes",
-                        received_bytes=total_bytes,
-                        max_bytes=max_bytes,
-                    )
-                    return None
-                chunks.append(chunk)
-
-            return httpx.Response(
-                status_code=200,
-                headers=resp.headers,
-                content=b"".join(chunks),
-                request=resp.request,
-            )
-
-    raise CLIReviewError("Exceeded maximum same-origin redirects contacting GitHub API.")
+) -> BoundedStreamResult:
+    result = await stream_same_origin_bounded(
+        client,
+        url,
+        headers=headers,
+        api_base=api_base,
+        max_bytes=max_bytes,
+        error_factory=_make_cli_error,
+        max_redirects=max_redirects,
+        early_return_statuses=frozenset({406, 422}),
+    )
+    if result.exceeded_limit:
+        logger.warning(
+            "cli_review_diff_exceeded_max_bytes",
+            declared_bytes=result.declared_bytes,
+            received_bytes=result.received_bytes,
+            max_bytes=max_bytes,
+        )
+    return result
 
 
 async def _gather_or_cancel[T](*coros: Coroutine[Any, Any, T]) -> list[T]:
@@ -319,7 +258,7 @@ async def _gather_or_cancel[T](*coros: Coroutine[Any, Any, T]) -> list[T]:
             if current is not None and current.cancelling() > 0:
                 raise
             raise CLIReviewError("Network error contacting GitHub API: CancelledError.") from exc
-        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        if isinstance(exc, httpx.HTTPError):
             raise CLIReviewError(
                 f"Network error contacting GitHub API: {type(exc).__name__}."
             ) from exc
@@ -337,28 +276,26 @@ async def _gather_pair_or_cancel[A, B](
     return cast(A, results[0]), cast(B, results[1])
 
 
-def _raise_for_github_status(resp: httpx.Response, *, context: str) -> None:
-    code = resp.status_code
-    if code == 200:
+def _raise_for_github_status(
+    status_code: int,
+    headers: httpx.Headers,
+    *,
+    context: str,
+) -> None:
+    if status_code == 200:
         return
-    if code == 404:
+    if status_code == 404:
         raise CLIReviewError(f"{context} not found on GitHub (HTTP 404).")
-    is_rate_limited = code == 429 or (
-        code == 403
-        and bool(
-            resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-remaining") == "0"
-        )
-    )
-    if is_rate_limited:
+    if status_code == 429 or (status_code == 403 and is_rate_limited_403(headers)):
         raise CLIReviewError(
-            f"GitHub API rate limit reached (HTTP {code}) while fetching {context}. "
+            f"GitHub API rate limit reached (HTTP {status_code}) while fetching {context}. "
             "Set GITHUB_TOKEN or retry later."
         )
-    if code in {401, 403}:
+    if status_code in {401, 403}:
         raise CLIReviewError(
-            f"GitHub API authentication/permission failure (HTTP {code}) for {context}."
+            f"GitHub API authentication/permission failure (HTTP {status_code}) for {context}."
         )
-    raise CLIReviewError(f"GitHub API returned unexpected HTTP {code} for {context}.")
+    raise CLIReviewError(f"GitHub API returned unexpected HTTP {status_code} for {context}.")
 
 
 def _decode_repo_config_response(resp: httpx.Response, *, filename: str) -> RepoConfig | None:
@@ -423,10 +360,14 @@ async def _fetch_paginated_files(
         url = f"{api_base}/repos/{slug}/pulls/{pull_number}/files?per_page=100&page={page}"
         try:
             resp = await _get_same_origin(client, url, headers=headers, api_base=api_base)
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
+        except httpx.HTTPError as exc:
             raise CLIReviewError(f"Network error fetching PR files: {type(exc).__name__}.") from exc
 
-        _raise_for_github_status(resp, context=f"PR {slug}#{pull_number} files")
+        _raise_for_github_status(
+            resp.status_code,
+            resp.headers,
+            context=f"PR {slug}#{pull_number} files",
+        )
         try:
             items = resp.json()
         except ValueError as exc:
@@ -435,24 +376,7 @@ async def _fetch_paginated_files(
         if not isinstance(items, list):
             raise CLIReviewError("GitHub PR files endpoint returned non-list payload.")
 
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            filename = item.get("filename")
-            if not isinstance(filename, str) or not filename:
-                continue
-            raw_patch = item.get("patch")
-            patch_str = raw_patch if isinstance(raw_patch, str) else None
-            raw_prev = item.get("previous_filename")
-            prev_str = raw_prev if isinstance(raw_prev, str) else None
-            entries.append(
-                PatchFileEntry(
-                    filename=filename,
-                    status=str(item.get("status") or "modified"),
-                    previous_filename=prev_str,
-                    patch=patch_str,
-                )
-            )
+        entries.extend(parse_github_files_page(items))
 
         if len(items) < 100:
             break
@@ -489,11 +413,12 @@ async def fetch_pull_request_dry_run(
             active_settings,
             repo_full_name=slug,
             http_client=client,
+            api_base=api_base,
         )
         diff_headers = {**json_headers, "Accept": GITHUB_DIFF_ACCEPT_HEADER}
         pr_url = f"{api_base}/repos/{slug}/pulls/{pr_ref.pull_number}"
 
-        meta_resp, diff_resp = await _gather_pair_or_cancel(
+        meta_resp, diff_res = await _gather_pair_or_cancel(
             _get_same_origin(client, pr_url, headers=json_headers, api_base=api_base),
             _get_same_origin_bounded_diff(
                 client,
@@ -504,7 +429,11 @@ async def fetch_pull_request_dry_run(
             ),
         )
 
-        _raise_for_github_status(meta_resp, context=f"Pull Request {slug}#{pr_ref.pull_number}")
+        _raise_for_github_status(
+            meta_resp.status_code,
+            meta_resp.headers,
+            context=f"Pull Request {slug}#{pr_ref.pull_number}",
+        )
         try:
             meta_json = meta_resp.json()
         except ValueError as exc:
@@ -515,6 +444,12 @@ async def fetch_pull_request_dry_run(
         base_obj = meta_json.get("base")
         head_obj = meta_json.get("head")
         base_ref = str(base_obj.get("ref") or "main") if isinstance(base_obj, dict) else "main"
+        base_repo = base_obj.get("repo") if isinstance(base_obj, dict) else None
+        config_ref = (
+            str(base_repo.get("default_branch") or base_ref)
+            if isinstance(base_repo, dict)
+            else base_ref
+        )
         head_ref = str(head_obj.get("ref") or "HEAD") if isinstance(head_obj, dict) else "HEAD"
         head_sha = str(head_obj.get("sha") or "") if isinstance(head_obj, dict) else ""
 
@@ -525,13 +460,13 @@ async def fetch_pull_request_dry_run(
                 client,
                 api_base=api_base,
                 slug=slug,
-                base_ref=base_ref,
+                base_ref=config_ref,
                 headers=json_headers,
             )
 
         parser = SmartDiffParser(file_filter=FileFilter.from_repo_config(repo_config))
         diff_source: Literal["diff", "files_api"]
-        if diff_resp is None or diff_resp.status_code in {406, 422}:
+        if diff_res.exceeded_limit or diff_res.status_code in {406, 422}:
             diff_source = "files_api"
             entries = await _fetch_paginated_files(
                 client,
@@ -541,15 +476,17 @@ async def fetch_pull_request_dry_run(
                 headers=json_headers,
             )
             parsed_diff = parser.parse_patch_entries(entries)
-        elif diff_resp.status_code == 200:
+        elif diff_res.status_code == 200 and diff_res.body_bytes is not None:
             diff_source = "diff"
-            raw_diff_text = diff_resp.text
-            del diff_resp
+            raw_diff_text = diff_res.body_bytes.decode("utf-8", errors="replace")
+            del diff_res
             parsed_diff = parser.parse_diff(raw_diff_text)
             del raw_diff_text
         else:
             _raise_for_github_status(
-                diff_resp, context=f"Pull Request {slug}#{pr_ref.pull_number} diff"
+                diff_res.status_code,
+                diff_res.headers,
+                context=f"Pull Request {slug}#{pr_ref.pull_number} diff",
             )
             raise CLIReviewError("Unexpected diff fetch error.")  # pragma: no cover
 

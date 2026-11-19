@@ -703,3 +703,124 @@ async def test_publisher_check_run_completion_idempotency_and_422_already_comple
     raw_logs = stream.getvalue()
     assert "github_check_run_already_completed" in raw_logs
     assert "github_check_run_supersede_cleanup_failed" not in raw_logs
+
+
+async def test_publisher_rejects_3xx_truncates_oversize_body_and_guards_request_changes() -> None:
+    from codesight.vcs.github_publisher import (
+        DEFAULT_REQUEST_CHANGES_BODY,
+        MAX_REVIEW_BODY_CHARS,
+        format_markdown_code_span,
+        truncate_markdown_body,
+    )
+
+    # 1. Markdown injection via backticks/newlines & spaced suggestion fence neutralization
+    hostile_path = "src/`[click](https://evil.test)`\n# Heading.py"
+    span = format_markdown_code_span(hostile_path)
+    assert "\n" not in span
+    assert span.startswith("``") and span.endswith("``")
+
+    _, parsed = _make_sample_diff()
+    prepared_spaced = partition_review_comments(
+        parsed,
+        [
+            ReviewCommentDraft(
+                path=hostile_path,
+                line=1,
+                body="Advice:\n``` suggestion\nbad()\n```",
+                severity="WARNING",
+            )
+        ],
+        summary_body="x" * 70_000,
+    )
+    assert len(prepared_spaced.body) <= MAX_REVIEW_BODY_CHARS
+    assert "``` suggestion" not in prepared_spaced.body.lower()
+    assert "```suggestion" not in prepared_spaced.body.lower()
+
+    # Dangling code fence closed cleanly when truncated
+    fenced_huge = "Intro\n```python\n" + ("a = 1\n" * 15_000) + "```\n"
+    truncated = truncate_markdown_body(fenced_huge, limit=500)
+    assert len(truncated) <= 500
+    assert truncated.count("```") == 2
+
+    # 2. HTTP 3xx handling (301/cross-origin 307 rejected; same-origin 307 followed)
+    #    + REQUEST_CHANGES with empty summary gets non-empty default body
+    #    + reactive 422 fallback stays <= 65,535 chars & logs structural error metadata
+    posted_bodies: list[dict[str, Any]] = []
+    mode = "redirect_301"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if mode == "redirect_301":
+            return httpx.Response(301, json={"message": "Moved Permanently"})
+        if mode == "cross_307":
+            return httpx.Response(
+                307,
+                headers={"Location": "https://evil.example/steal"},
+                json={"message": "Temporary Redirect"},
+            )
+        if mode == "same_307":
+            if request.url.path == "/repos/acme/app/pulls/7/reviews":
+                return httpx.Response(
+                    307,
+                    headers={"Location": "/repositories/77/pulls/7/reviews"},
+                    json={"message": "Temporary Redirect"},
+                )
+            if request.url.path == "/repositories/77/pulls/7/reviews":
+                posted_bodies.append(payload)
+                return httpx.Response(200, json={"id": 999, "state": "CHANGES_REQUESTED"})
+        if mode == "oversize_422_fallback":
+            posted_bodies.append(payload)
+            if payload.get("comments"):
+                return httpx.Response(
+                    422,
+                    json={
+                        "message": "Unprocessable Entity",
+                        "errors": [
+                            {"resource": "PullRequestReview", "field": "line", "code": "invalid"}
+                        ],
+                    },
+                )
+            return httpx.Response(200, json={"id": 1000, "state": "COMMENTED"})
+        return httpx.Response(404)
+
+    log_stream = io.StringIO()
+    configure_logging(level="WARNING", service_name="test-pub-hardening", stream=log_stream)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        pub = GitHubReviewPublisher(_make_auth(client), http_client=client)
+
+        with pytest.raises(GitHubPublishError) as e301:
+            await pub.publish_review("acme/app", 7, head_sha="abc", parsed_diff=parsed)
+        assert e301.value.status_code == 301
+
+        mode = "cross_307"
+        with pytest.raises(GitHubPublishError) as e_cross:
+            await pub.publish_review("acme/app", 7, head_sha="abc", parsed_diff=parsed)
+        assert e_cross.value.status_code == 307
+
+        mode = "same_307"
+        res_rc = await pub.publish_review(
+            "acme/app",
+            7,
+            head_sha="abc",
+            parsed_diff=parsed,
+            drafts=[ReviewCommentDraft(path="src/auth.py", line=10, body="Fix auth.")],
+            summary_body="",
+            event="REQUEST_CHANGES",
+        )
+        assert res_rc.review_id == 999
+        assert posted_bodies[-1]["body"] == DEFAULT_REQUEST_CHANGES_BODY
+
+        mode = "oversize_422_fallback"
+        posted_bodies.clear()
+        res_big = await pub.publish_review(
+            "acme/app",
+            7,
+            head_sha="abc",
+            parsed_diff=parsed,
+            drafts=[ReviewCommentDraft(path="src/auth.py", line=10, body="Note " + ("z" * 5_000))],
+            summary_body="S" * 70_000,
+            event="COMMENT",
+        )
+        assert res_big.used_422_fallback is True
+        assert all(len(p["body"]) <= MAX_REVIEW_BODY_CHARS for p in posted_bodies)
+        assert "Unprocessable Entity" in log_stream.getvalue()

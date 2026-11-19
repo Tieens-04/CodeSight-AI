@@ -74,6 +74,7 @@ class DiffHunkMapper:
         old_path: str | None = None,
         new_path: str | None = None,
         change_type: FileChangeType = "modified",
+        blob_sha: str | None = None,
     ) -> ParsedFileDiff:
         """Parse hunk lines and build GitHub RIGHT-side commentability metadata."""
         is_deleted_file = change_type == "deleted"
@@ -216,4 +217,5 @@ class DiffHunkMapper:
             annotated_diff=annotated_diff,
             valid_commentable_lines=valid_commentable_lines,
             right_line_to_hunk=right_line_to_hunk,
+            blob_sha=blob_sha,
         )

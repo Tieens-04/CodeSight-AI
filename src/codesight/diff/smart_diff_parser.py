@@ -411,12 +411,20 @@ class SmartDiffParser:
                 not decision.should_skip
                 and entry.patch is None
                 and change_type not in {"renamed", "copied", "deleted"}
+                and entry.status.strip().lower() != "unchanged"
             ):
-                decision = FilterDecision(
-                    should_skip=True,
-                    reason=FilterReason.BINARY,
-                    matched_pattern="<binary>",
-                )
+                if entry.changes is not None and entry.changes > 0 and not entry.is_binary:
+                    decision = FilterDecision(
+                        should_skip=True,
+                        reason=FilterReason.PATCH_TRUNCATED,
+                        matched_pattern="<patch_truncated>",
+                    )
+                else:
+                    decision = FilterDecision(
+                        should_skip=True,
+                        reason=FilterReason.BINARY,
+                        matched_pattern="<binary>",
+                    )
             if decision.should_skip:
                 skipped_records.append(
                     self._file_filter.build_skipped_record(
@@ -433,6 +441,7 @@ class SmartDiffParser:
                 old_path=old_p,
                 new_path=new_p,
                 change_type=change_type,
+                blob_sha=entry.blob_sha,
             )
             kept_files.append(parsed_file)
             kept_raw_patches.append(patch_text)

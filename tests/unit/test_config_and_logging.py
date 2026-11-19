@@ -35,15 +35,15 @@ def test_settings_canonical_host_defaults(monkeypatch: pytest.MonkeyPatch) -> No
         monkeypatch.delenv(key, raising=False)
 
     s = Settings(_env_file=None)
-    assert s.postgres_host == "localhost"
+    assert s.postgres_host == "127.0.0.1"
     assert s.postgres_port == 5433
-    assert s.redis_host == "localhost"
+    assert s.redis_host == "127.0.0.1"
     assert s.redis_port == 6381
-    assert s.redis_url == "redis://localhost:6381/0"
+    assert s.redis_url == "redis://127.0.0.1:6381/0"
     assert s.qdrant_http_port == 6333
     assert s.qdrant_grpc_port == 6334
     assert s.api_port == 8082
-    assert s.qdrant_http_url == "http://localhost:6333"
+    assert s.qdrant_http_url == "http://127.0.0.1:6333"
     assert s.github_webhook_secret is None
     assert s.gemini_api_key is None
 
@@ -149,3 +149,22 @@ def test_configure_logging_quiets_httpx_info_unless_debug() -> None:
     debug_lines = [json.loads(line) for line in buf_debug.getvalue().strip().splitlines()]
     assert len(debug_lines) == 1
     assert "HTTP Request" in debug_lines[0]["event"]
+
+
+def test_settings_rejects_dev_password_in_production_and_invalid_ports() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="POSTGRES_PASSWORD"):
+        Settings(_env_file=None, app_env="production")
+
+    prod_ok = Settings(
+        _env_file=None,
+        app_env="production",
+        postgres_password=SecretStr("non-default-prod-secret"),
+    )
+    assert prod_ok.qdrant_collection_name == "codesight_ast_index"
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, api_port=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, health_timeout_seconds=-1.0)

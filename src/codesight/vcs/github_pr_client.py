@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal, Self
-from urllib.parse import urljoin, urlsplit
 
 import httpx
 import structlog
@@ -12,11 +11,20 @@ import structlog
 from codesight.core.errors import (
     RateLimitTaskError,
     RetryableTaskError,
+    is_rate_limited_403,
     parse_retry_after_header,
 )
 from codesight.diff.file_filter import FileFilter
 from codesight.diff.models import ParsedPullRequestDiff, PatchFileEntry
 from codesight.diff.smart_diff_parser import SmartDiffParser
+from codesight.vcs._http import (
+    REDIRECT_STATUSES,
+    origin_tuple,
+    parse_github_files_page,
+    resolve_same_origin_redirect,
+    stream_same_origin_bounded,
+    validate_positive_int,
+)
 from codesight.vcs.github_auth import (
     GitHubAuthError,
     GitHubAuthProvider,
@@ -30,7 +38,6 @@ if TYPE_CHECKING:
 GITHUB_DIFF_ACCEPT_HEADER: Final[str] = "application/vnd.github.diff"
 MAX_DIFF_BYTES: Final[int] = 20 * 1024 * 1024
 MAX_FILE_PAGES: Final[int] = 30
-_REDIRECT_STATUSES: Final[frozenset[int]] = frozenset({301, 302, 303, 307, 308})
 
 logger = structlog.get_logger("codesight.vcs.pr_client")
 
@@ -43,75 +50,46 @@ class FetchedPullRequestDiff:
     diff_source: Literal["diff", "files_api"]
 
 
-def _validate_positive_int(value: int, *, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer.")
-    return value
+def _make_publish_error(message: str, status_code: int | None) -> GitHubPublishError:
+    return GitHubPublishError(message, status_code=status_code)
 
 
-def _origin_tuple(url: str) -> tuple[str, str, int | None]:
-    parts = urlsplit(url)
-    scheme = parts.scheme.lower()
-    host = (parts.hostname or "").lower()
-    port = parts.port
-    if port is None:
-        port = 443 if scheme == "https" else (80 if scheme == "http" else None)
-    return scheme, host, port
-
-
-def _resolve_same_origin_redirect(
-    current_url: str,
-    resp: httpx.Response,
-    expected_origin: tuple[str, str, int | None],
-) -> str:
-    location = resp.headers.get("location")
-    if not isinstance(location, str) or not location:
-        raise GitHubPublishError(
-            "GitHub API returned redirect without Location header.",
-            status_code=resp.status_code,
-        )
-    next_url = urljoin(current_url, location)
-    if _origin_tuple(next_url) != expected_origin:
-        raise GitHubPublishError(
-            "Blocked cross-origin redirect while contacting GitHub API.",
-            status_code=resp.status_code,
-        )
-    return next_url
-
-
-def _is_rate_limited_403(headers: httpx.Headers) -> bool:
-    return bool(headers.get("retry-after") or headers.get("x-ratelimit-remaining") == "0")
-
-
-def _raise_for_github_status(resp: httpx.Response, *, slug: str, context: str) -> None:
-    code = resp.status_code
-    if code == 200:
+def _raise_for_github_status(
+    status_code: int,
+    headers: httpx.Headers,
+    *,
+    slug: str,
+    context: str,
+) -> None:
+    if status_code == 200:
         return
-    if code == 429 or (code == 403 and _is_rate_limited_403(resp.headers)):
-        delay = parse_retry_after_header(resp.headers)
+    if status_code == 429 or (status_code == 403 and is_rate_limited_403(headers)):
+        delay = parse_retry_after_header(headers)
         logger.warning(
             "github_pr_client_rate_limited",
             repo=slug,
-            status_code=code,
+            status_code=status_code,
             retry_after_seconds=delay,
         )
         raise RateLimitTaskError(
-            f"GitHub rate limit ({code}) while fetching {context}.",
+            f"GitHub rate limit ({status_code}) while fetching {context}.",
             retry_after_seconds=delay,
         )
-    if code in {401, 403}:
-        logger.error("github_pr_client_auth_error", repo=slug, status_code=code)
+    if status_code in {401, 403}:
+        logger.error("github_pr_client_auth_error", repo=slug, status_code=status_code)
         raise GitHubAuthError(
-            f"GitHub API returned HTTP {code} while fetching {context}.",
-            status_code=code,
+            f"GitHub API returned HTTP {status_code} while fetching {context}.",
+            status_code=status_code,
         )
-    if 500 <= code < 600:
-        logger.warning("github_pr_client_server_error", repo=slug, status_code=code)
-        raise RetryableTaskError(f"GitHub API returned HTTP {code} while fetching {context}.")
-    logger.error("github_pr_client_http_error", repo=slug, status_code=code)
+    if 500 <= status_code < 600:
+        logger.warning("github_pr_client_server_error", repo=slug, status_code=status_code)
+        raise RetryableTaskError(
+            f"GitHub API returned HTTP {status_code} while fetching {context}."
+        )
+    logger.error("github_pr_client_http_error", repo=slug, status_code=status_code)
     raise GitHubPublishError(
-        f"GitHub API rejected fetch for {context} with HTTP {code}.",
-        status_code=code,
+        f"GitHub API rejected fetch for {context} with HTTP {status_code}.",
+        status_code=status_code,
     )
 
 
@@ -167,7 +145,7 @@ class GitHubPullRequestClient:
         max_redirects: int = 3,
     ) -> httpx.Response:
         client = self._ensure_client()
-        expected_origin = _origin_tuple(self._base_url)
+        expected_origin = origin_tuple(self._base_url)
         current_url = url
         for _ in range(max_redirects + 1):
             try:
@@ -182,9 +160,14 @@ class GitHubPullRequestClient:
                     f"Transient network failure calling GitHub GET {url}."
                 ) from exc
 
-            if resp.status_code not in _REDIRECT_STATUSES:
+            if resp.status_code not in REDIRECT_STATUSES:
                 return resp
-            current_url = _resolve_same_origin_redirect(current_url, resp, expected_origin)
+            current_url = resolve_same_origin_redirect(
+                current_url,
+                resp,
+                expected_origin,
+                error_factory=_make_publish_error,
+            )
         raise GitHubPublishError("Exceeded maximum same-origin redirects contacting GitHub API.")
 
     async def _fetch_bounded_raw_diff(
@@ -194,85 +177,63 @@ class GitHubPullRequestClient:
         slug: str,
         pull_number: int,
         headers: dict[str, str],
+        installation_id: int | None = None,
         max_redirects: int = 3,
     ) -> str | None:
         client = self._ensure_client()
-        expected_origin = _origin_tuple(self._base_url)
-        current_url = url
-        for _ in range(max_redirects + 1):
-            try:
-                async with client.stream(
-                    "GET",
-                    current_url,
-                    headers=headers,
-                    follow_redirects=False,
-                ) as resp:
-                    if resp.status_code in _REDIRECT_STATUSES:
-                        current_url = _resolve_same_origin_redirect(
-                            current_url, resp, expected_origin
-                        )
-                        continue
+        try:
+            stream_res = await stream_same_origin_bounded(
+                client,
+                url,
+                headers=headers,
+                api_base=self._base_url,
+                max_bytes=self._max_diff_bytes,
+                error_factory=_make_publish_error,
+                max_redirects=max_redirects,
+                early_return_statuses=frozenset({406, 422}),
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            logger.warning(
+                "github_pr_client_transport_error",
+                repo=slug,
+                error_type=type(exc).__name__,
+            )
+            raise RetryableTaskError(
+                f"Transient network failure streaming diff for {slug}#{pull_number}."
+            ) from exc
 
-                    if resp.status_code in {406, 422}:
-                        logger.info(
-                            "github_pr_diff_fallback_to_files_api",
-                            repo=slug,
-                            pr_number=pull_number,
-                            status_code=resp.status_code,
-                        )
-                        return None
+        if stream_res.status_code in {406, 422}:
+            logger.info(
+                "github_pr_diff_fallback_to_files_api",
+                repo=slug,
+                pr_number=pull_number,
+                status_code=stream_res.status_code,
+            )
+            return None
 
-                    if resp.status_code != 200:
-                        await resp.aread()
-                        _raise_for_github_status(
-                            resp,
-                            slug=slug,
-                            context=f"PR {slug}#{pull_number} diff",
-                        )
+        if stream_res.status_code == 401 and installation_id is not None:
+            await self._auth.invalidate_installation_token(installation_id)
 
-                    raw_len = resp.headers.get("content-length")
-                    if raw_len is not None:
-                        try:
-                            declared_len = int(raw_len.strip())
-                        except ValueError:
-                            declared_len = -1
-                        if declared_len > self._max_diff_bytes:
-                            logger.warning(
-                                "github_pr_diff_exceeded_max_bytes",
-                                repo=slug,
-                                pr_number=pull_number,
-                                declared_bytes=declared_len,
-                                max_bytes=self._max_diff_bytes,
-                            )
-                            return None
+        if stream_res.status_code != 200:
+            _raise_for_github_status(
+                stream_res.status_code,
+                stream_res.headers,
+                slug=slug,
+                context=f"PR {slug}#{pull_number} diff",
+            )
 
-                    chunks: list[bytes] = []
-                    total_bytes = 0
-                    async for chunk in resp.aiter_bytes():
-                        total_bytes += len(chunk)
-                        if total_bytes > self._max_diff_bytes:
-                            logger.warning(
-                                "github_pr_diff_exceeded_max_bytes",
-                                repo=slug,
-                                pr_number=pull_number,
-                                received_bytes=total_bytes,
-                                max_bytes=self._max_diff_bytes,
-                            )
-                            return None
-                        chunks.append(chunk)
+        if stream_res.exceeded_limit or stream_res.body_bytes is None:
+            logger.warning(
+                "github_pr_diff_exceeded_max_bytes",
+                repo=slug,
+                pr_number=pull_number,
+                declared_bytes=stream_res.declared_bytes,
+                received_bytes=stream_res.received_bytes,
+                max_bytes=self._max_diff_bytes,
+            )
+            return None
 
-                    return b"".join(chunks).decode("utf-8", errors="replace")
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                logger.warning(
-                    "github_pr_client_transport_error",
-                    repo=slug,
-                    error_type=type(exc).__name__,
-                )
-                raise RetryableTaskError(
-                    f"Transient network failure streaming diff for {slug}#{pull_number}."
-                ) from exc
-
-        raise GitHubPublishError("Exceeded maximum same-origin redirects contacting GitHub API.")
+        return stream_res.body_bytes.decode("utf-8", errors="replace")
 
     async def _fetch_paginated_files(
         self,
@@ -280,6 +241,7 @@ class GitHubPullRequestClient:
         slug: str,
         pull_number: int,
         headers: dict[str, str],
+        installation_id: int | None = None,
     ) -> list[PatchFileEntry]:
         entries: list[PatchFileEntry] = []
         for page in range(1, MAX_FILE_PAGES + 1):
@@ -287,7 +249,14 @@ class GitHubPullRequestClient:
                 f"{self._base_url}/repos/{slug}/pulls/{pull_number}/files?per_page=100&page={page}"
             )
             resp = await self._get_same_origin(url, slug=slug, headers=headers)
-            _raise_for_github_status(resp, slug=slug, context=f"PR {slug}#{pull_number} files")
+            if resp.status_code == 401 and installation_id is not None:
+                await self._auth.invalidate_installation_token(installation_id)
+            _raise_for_github_status(
+                resp.status_code,
+                resp.headers,
+                slug=slug,
+                context=f"PR {slug}#{pull_number} files",
+            )
             try:
                 items = resp.json()
             except ValueError as exc:
@@ -302,27 +271,18 @@ class GitHubPullRequestClient:
                     status_code=resp.status_code,
                 )
 
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                filename = item.get("filename")
-                if not isinstance(filename, str) or not filename:
-                    continue
-                raw_patch = item.get("patch")
-                patch_str = raw_patch if isinstance(raw_patch, str) else None
-                raw_prev = item.get("previous_filename")
-                prev_str = raw_prev if isinstance(raw_prev, str) else None
-                entries.append(
-                    PatchFileEntry(
-                        filename=filename,
-                        status=str(item.get("status") or "modified"),
-                        previous_filename=prev_str,
-                        patch=patch_str,
-                    )
-                )
+            entries.extend(parse_github_files_page(items))
 
             if len(items) < 100:
                 break
+            if page == MAX_FILE_PAGES:
+                logger.warning(
+                    "github_pr_files_pagination_cap_reached",
+                    repo=slug,
+                    pr_number=pull_number,
+                    max_pages=MAX_FILE_PAGES,
+                    fetched_files=len(entries),
+                )
 
         return entries
 
@@ -336,7 +296,7 @@ class GitHubPullRequestClient:
     ) -> FetchedPullRequestDiff:
         """Fetch PR unified diff in RAM, falling back to /pulls/{pr}/files when needed."""
         slug = validate_repo_full_name(repo_full_name)
-        valid_pr = _validate_positive_int(pull_number, name="pull_number")
+        valid_pr = validate_positive_int(pull_number, name="pull_number")
         file_filter = (
             FileFilter.from_repo_config(repo_config) if repo_config is not None else FileFilter()
         )
@@ -353,6 +313,7 @@ class GitHubPullRequestClient:
             slug=slug,
             pull_number=valid_pr,
             headers=diff_headers,
+            installation_id=installation_id,
         )
 
         parser = SmartDiffParser(file_filter=file_filter)
@@ -363,6 +324,7 @@ class GitHubPullRequestClient:
                 slug=slug,
                 pull_number=valid_pr,
                 headers=json_headers,
+                installation_id=installation_id,
             )
             parsed_diff = parser.parse_patch_entries(entries)
         else:

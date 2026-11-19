@@ -118,6 +118,25 @@ def test_rmtree_onexc_grants_dir_exec_bit_and_skips_chmod_on_symlinks(tmp_path: 
         assert chmod_calls == []
         retry_fn.assert_called_once_with(str(tmp_path / "sym"))
 
+        # Handler bound to ws_root also restores read-only parent directory inside ws_root
+        from codesight.core.ephemeral import _make_rmtree_error_handler
+
+        ws_root = tmp_path / "ws_bound"
+        inner_dir = ws_root / "locked_parent"
+        inner_file = inner_dir / "child.txt"
+        inner_dir.mkdir(parents=True)
+        inner_file.write_text("x", encoding="utf-8")
+
+        chmod_calls.clear()
+        retry_fn.reset_mock()
+        bound_handler = _make_rmtree_error_handler(ws_root)
+        fake_stat = os.stat_result((stat.S_IFDIR | 0o500, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        with patch("codesight.core.ephemeral.os.lstat", return_value=fake_stat):
+            bound_handler(retry_fn, str(inner_file), PermissionError("denied"))
+        assert chmod_calls[0] == (str(inner_dir), stat.S_IRWXU)
+        assert chmod_calls[1][0] == str(inner_file)
+        retry_fn.assert_called_once_with(str(inner_file))
+
 
 def test_parse_retry_after_clamps_delta_http_date_and_ratelimit_reset() -> None:
     assert parse_retry_after_header({"Retry-After": "12"}) == 12.0
