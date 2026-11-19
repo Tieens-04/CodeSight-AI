@@ -11,18 +11,20 @@ Enforces **Zero-Code Persistence (`NFR-3`)**, deterministic Qdrant gRPC indexing
 
 ## Qdrant Collection & Payload Contract (`NFR-3`)
 
+- **Collection:** `codesight_ast_index` (configurable via `QDRANT_COLLECTION_NAME`).
 - **Connection:** Host port `6333` (HTTP) / `6334` (gRPC, `prefer_grpc=True`).
 - **Vector Config:** `size=768`, `distance=Distance.COSINE` (paired with `output_dimensionality=768`).
 - **Deterministic Point ID:** Qdrant rejects arbitrary strings. Always use UUIDv5:
   `str(uuid.uuid5(uuid.NAMESPACE_URL, f"{repo}:{file_path}:{blob_sha}:{symbol_name}:{start_line}"))`
-- **Mandatory Keyword Indexes (`PayloadSchemaType.KEYWORD`):** `symbol_name`, `called_symbols`, `blob_sha`, `repo_full_name`, `file_path`.
+- **Mandatory Keyword Indexes (`PayloadSchemaType.KEYWORD`):** `repo_id`, `repo_full_name`, `file_path`, `symbol_name`, `called_symbols`, `blob_sha`, `chunk_type`.
 
 ### Strict Payload Allowlist
 
 | Allowed Key | Type | Constraint |
 | :--- | :--- | :--- |
-| `repo_full_name`, `file_path`, `blob_sha`, `language` | `str` | Repo-relative POSIX path; Git blob SHA |
-| `symbol_name`, `symbol_kind` | `str` | `function`, `method`, `class`, `interface` |
+| `repo_id`, `repo_full_name`, `file_path`, `blob_sha` | `str` | Canonical repo UUID & slug; repo-relative POSIX path; Git blob SHA |
+| `chunk_type`, `language` | `str` | `chunk_type` in `{"code", "architecture_doc"}`; `language` (`python`, `typescript`, `tsx`, `markdown`) |
+| `symbol_name`, `symbol_kind` | `str` | `function`, `method`, `class`, `interface`, `section` |
 | `start_line`, `end_line`, `cyclomatic_complexity` | `int` | 1-based inclusive AST node range |
 | `signature` | `str` | Header ONLY (strip `block` / `statement_block`), single-line `<= 300` chars |
 | `called_symbols`, `imports` | `list[str]` | Outgoing call identifiers and imported module/symbol names |
@@ -63,7 +65,7 @@ async def embed_transient_chunks(client: genai.Client, texts: list[str]) -> list
 Run before closing any `CA-13`..`CA-16` ticket to prove zero raw code leaked into Qdrant:
 
 ```powershell
-python .agents/skills/zerocode-ast-rag/scripts/audit_qdrant_zerocode.py --collection codesight_symbols
+python .agents/skills/zerocode-ast-rag/scripts/audit_qdrant_zerocode.py --collection codesight_ast_index
 python .agents/skills/zerocode-ast-rag/scripts/audit_qdrant_zerocode.py --self-test
 ```
 

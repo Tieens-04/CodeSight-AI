@@ -20,7 +20,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-codesight_dev_password}
       POSTGRES_DB: ${POSTGRES_DB:-codesight}
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
       - codesight-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -46,7 +46,7 @@ services:
       - --maxmemory-policy
       - volatile-lru
     ports:
-      - "${REDIS_PORT:-6381}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6381}:6379"
     volumes:
       - codesight-redisdata:/data
     healthcheck:
@@ -59,13 +59,13 @@ services:
       - codesight-net
 
   codesight-qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.20.1
     container_name: codesight-qdrant
     restart: unless-stopped
     mem_limit: 1g
     ports:
-      - "${QDRANT_HTTP_PORT:-6333}:6333"
-      - "${QDRANT_GRPC_PORT:-6334}:6334"
+      - "127.0.0.1:${QDRANT_HTTP_PORT:-6333}:6333"
+      - "127.0.0.1:${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
       - codesight-qdrantdata:/qdrant/storage
     healthcheck:
@@ -127,7 +127,10 @@ services:
       QDRANT_HTTP_PORT: 6333
       QDRANT_GRPC_PORT: 6334
     ports:
-      - "${API_PORT:-8082}:8000"
+      - "127.0.0.1:${API_PORT:-8082}:8000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp:size=128m,mode=1777
     depends_on:
@@ -180,6 +183,9 @@ services:
       QDRANT_HOST: codesight-qdrant
       QDRANT_HTTP_PORT: 6333
       QDRANT_GRPC_PORT: 6334
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp:size=128m,mode=1777
     depends_on:
