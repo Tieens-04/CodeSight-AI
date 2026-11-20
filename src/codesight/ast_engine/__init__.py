@@ -25,6 +25,7 @@ from codesight.ast_engine.models import (
     PRFileContext,
     SymbolKind,
     TestCompanionReport,
+    build_deterministic_point_id,
     sanitize_signature,
 )
 from codesight.ast_engine.python_parser import PythonASTParser
@@ -54,6 +55,7 @@ __all__ = [
     "TestCompanionReport",
     "TypeScriptASTParser",
     "TypeScriptComplexityAnalyzer",
+    "build_deterministic_point_id",
     "compute_complexity_delta",
     "detect_missing_test_companion",
     "sanitize_signature",
