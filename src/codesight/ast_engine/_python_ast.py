@@ -9,6 +9,8 @@ from typing import Final, Literal
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node
 
+from codesight.ast_engine._ast_utils import node_text
+
 PYTHON_LANGUAGE: Final[Language] = Language(tspython.language())
 
 NESTED_SCOPE_TYPES: Final[frozenset[str]] = frozenset(
@@ -32,34 +34,6 @@ class PythonDefinitionEvent:
     decorators: tuple[str, ...]
     body_node: Node | None
     is_async: bool
-
-
-def to_utf8_bytes(source: str | bytes) -> bytes:
-    """Convert Python source text or bytes into UTF-8 bytes without touching disk."""
-    if isinstance(source, bytes):
-        return source
-    return source.encode("utf-8")
-
-
-def node_text(node: Node, source_bytes: bytes) -> str:
-    """Decode a tree-sitter AST node span directly from UTF-8 byte offsets."""
-    return source_bytes[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
-
-
-def node_line_span(node: Node, source_bytes: bytes) -> tuple[int, int]:
-    """Return 1-based inclusive `(start_line, end_line)` for an AST node."""
-    start_line = node.start_point[0] + 1
-    end_row, end_col = node.end_point
-    if (
-        end_col == 0
-        and end_row > node.start_point[0]
-        and node.end_byte > node.start_byte
-        and source_bytes[node.end_byte - 1] == 0x0A
-    ):
-        end_line = end_row
-    else:
-        end_line = end_row + 1
-    return start_line, max(start_line, end_line)
 
 
 def extract_decorator_texts(decorated_node: Node | None, source_bytes: bytes) -> tuple[str, ...]:
