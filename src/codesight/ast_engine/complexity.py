@@ -1,9 +1,8 @@
-"""Static Python AST complexity analysis, delta CC calculation, and P_untested detector."""
+"""Static Python & TypeScript/TSX AST complexity analysis, delta CC, and P_untested detector."""
 
 from __future__ import annotations
 
 import re
-from bisect import bisect_left
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from pathlib import Path
@@ -11,15 +10,27 @@ from typing import Final, Literal
 
 from tree_sitter import Node, Parser
 
+from codesight.ast_engine._ast_utils import (
+    is_ambient_declaration_path,
+    node_line_span,
+    node_text,
+    resolve_ast_language,
+    span_touches_deletion_anchors,
+    span_touches_sorted_lines,
+    to_utf8_bytes,
+)
 from codesight.ast_engine._python_ast import (
     NESTED_SCOPE_TYPES,
     PYTHON_LANGUAGE,
     iter_python_definitions,
-    node_line_span,
-    node_text,
-    to_utf8_bytes,
+)
+from codesight.ast_engine._typescript_ast import (
+    get_typescript_grammar,
+    is_ts_scope_boundary,
+    iter_typescript_definitions,
 )
 from codesight.ast_engine.models import (
+    ASTLanguage,
     ComplexityDelta,
     ComplexityDiffSummary,
     FunctionComplexity,
@@ -38,6 +49,31 @@ _CC_BRANCH_TYPES: Final[frozenset[str]] = frozenset(
         "except_clause",
         "boolean_operator",
         "for_in_clause",
+    }
+)
+_TS_CC_BRANCH_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "if_statement",
+        "ternary_expression",
+        "switch_case",
+        "for_statement",
+        "for_in_statement",
+        "while_statement",
+        "do_statement",
+        "catch_clause",
+    }
+)
+_TS_LOGICAL_BINARY_OPS: Final[frozenset[str]] = frozenset({"&&", "||", "??"})
+_TS_LOGICAL_ASSIGN_OPS: Final[frozenset[str]] = frozenset({"&&=", "||=", "??="})
+_TS_NESTING_BLOCK_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "if_statement",
+        "for_statement",
+        "for_in_statement",
+        "while_statement",
+        "do_statement",
+        "switch_statement",
+        "try_statement",
     }
 )
 _COMPREHENSION_PARENTS: Final[frozenset[str]] = frozenset(
@@ -243,6 +279,49 @@ def count_python_parameters(
     return len(params)
 
 
+def _analyze_python_tree(
+    root: Node,
+    source_bytes: bytes,
+) -> tuple[tuple[FunctionComplexity, ...], bool]:
+    results: list[FunctionComplexity] = []
+    for event in iter_python_definitions(root, source_bytes):
+        if event.definition.type != "function_definition":
+            continue
+        if _is_overload_stub(event.definition, event.decorators, source_bytes):
+            continue
+
+        is_method = event.enclosing_kind == "class"
+        symbol_kind: Literal["function", "method"] = "method" if is_method else "function"
+        start_line, end_line = node_line_span(event.outer_node, source_bytes)
+        line_count = max(1, end_line - start_line + 1)
+        body_nodes: list[Node] = [event.body_node] if event.body_node is not None else []
+        cc = compute_python_nodes_cc(body_nodes, source_bytes)
+        nesting = compute_max_nesting_depth(event.body_node)
+        param_count = count_python_parameters(
+            event.definition,
+            source_bytes,
+            is_method=is_method,
+            decorators=event.decorators,
+        )
+
+        results.append(
+            FunctionComplexity(
+                symbol_name=event.symbol_name,
+                qualified_name=".".join(event.scope_stack),
+                symbol_kind=symbol_kind,
+                start_line=start_line,
+                end_line=end_line,
+                line_count=line_count,
+                cyclomatic_complexity=cc,
+                max_nesting_depth=nesting,
+                parameter_count=param_count,
+                is_async=event.is_async,
+                has_syntax_error=event.outer_node.has_error,
+            )
+        )
+    return tuple(results), root.has_error
+
+
 class PythonComplexityAnalyzer:
     """Compute McCabe Cyclomatic Complexity, nesting depth, parameter count, and line counts."""
 
@@ -260,45 +339,209 @@ class PythonComplexityAnalyzer:
 
         parser = Parser(PYTHON_LANGUAGE)
         tree = parser.parse(source_bytes)
-        root = tree.root_node
-        results: list[FunctionComplexity] = []
+        return _analyze_python_tree(tree.root_node, source_bytes)
 
-        for event in iter_python_definitions(root, source_bytes):
-            if event.definition.type != "function_definition":
+
+def compute_typescript_nodes_cc(
+    nodes: Sequence[Node],
+    source_bytes: bytes,
+    *,
+    line_range: tuple[int, int] | None = None,
+) -> int:
+    """Compute McCabe/ESLint Cyclomatic Complexity over TypeScript/TSX AST nodes.
+
+    Counts base 1 plus ``if``/``else if``, ``?:``, ``switch`` ``case`` (excluding
+    ``default``), ``for``/``for..in``/``for..of``/``while``/``do..while``, ``catch``,
+    logical ``&&``/``||``/``??`` and logical assignments ``&&=``/``||=``/``??=``.
+    Optional chaining (``?.``) is intentionally excluded.
+    """
+    cc = 1
+    stack: list[Node] = list(reversed(nodes))
+    while stack:
+        current = stack.pop()
+        in_range = line_range is None or (
+            line_range[0] <= current.start_point[0] + 1 <= line_range[1]
+        )
+        if in_range:
+            node_type = current.type
+            if node_type in _TS_CC_BRANCH_TYPES:
+                cc += 1
+            elif node_type == "binary_expression":
+                op = current.child_by_field_name("operator")
+                if op is not None and op.type in _TS_LOGICAL_BINARY_OPS:
+                    cc += 1
+            elif node_type == "augmented_assignment_expression":
+                op = current.child_by_field_name("operator")
+                if op is not None and op.type in _TS_LOGICAL_ASSIGN_OPS:
+                    cc += 1
+
+        for child in reversed(current.children):
+            if is_ts_scope_boundary(child, source_bytes):
                 continue
-            if _is_overload_stub(event.definition, event.decorators, source_bytes):
+            stack.append(child)
+    return cc
+
+
+def compute_typescript_max_nesting_depth(
+    body_node: Node | None,
+    source_bytes: bytes,
+) -> int:
+    """Compute maximum control-flow block nesting depth inside a TypeScript/TSX body."""
+    if body_node is None:
+        return 0
+
+    max_depth = 0
+    stack: list[tuple[Node, int]] = [(body_node, 0)]
+    while stack:
+        current, depth = stack.pop()
+        for child in reversed(current.children):
+            if is_ts_scope_boundary(child, source_bytes):
                 continue
+            if child.type == "if_statement" and current.type == "else_clause":
+                child_depth = depth
+            elif child.type in _TS_NESTING_BLOCK_TYPES:
+                child_depth = depth + 1
+            else:
+                child_depth = depth
+            if child_depth > max_depth:
+                max_depth = child_depth
+            stack.append((child, child_depth))
+    return max_depth
 
-            is_method = event.enclosing_kind == "class"
-            symbol_kind: Literal["function", "method"] = "method" if is_method else "function"
-            start_line, end_line = node_line_span(event.outer_node, source_bytes)
-            line_count = max(1, end_line - start_line + 1)
-            body_nodes: list[Node] = [event.body_node] if event.body_node is not None else []
-            cc = compute_python_nodes_cc(body_nodes, source_bytes)
-            nesting = compute_max_nesting_depth(event.body_node)
-            param_count = count_python_parameters(
-                event.definition,
-                source_bytes,
-                is_method=is_method,
-                decorators=event.decorators,
-            )
 
-            results.append(
-                FunctionComplexity(
-                    symbol_name=event.symbol_name,
-                    qualified_name=".".join(event.scope_stack),
-                    symbol_kind=symbol_kind,
-                    start_line=start_line,
-                    end_line=end_line,
-                    line_count=line_count,
-                    cyclomatic_complexity=cc,
-                    max_nesting_depth=nesting,
-                    parameter_count=param_count,
-                    is_async=event.is_async,
-                    has_syntax_error=event.outer_node.has_error,
-                )
+def count_typescript_parameters(callable_node: Node | None, source_bytes: bytes) -> int:
+    """Count declared TypeScript/TSX parameters, excluding the fake `this: Type` parameter."""
+    if callable_node is None:
+        return 0
+
+    formal_params = callable_node.child_by_field_name("parameters")
+    if formal_params is not None:
+        params = [child for child in formal_params.named_children if child.type != "comment"]
+        if not params:
+            return 0
+        first_pattern = params[0].child_by_field_name("pattern")
+        if first_pattern is not None and (
+            first_pattern.type == "this" or node_text(first_pattern, source_bytes) == "this"
+        ):
+            return len(params) - 1
+        return len(params)
+
+    single_param = callable_node.child_by_field_name("parameter")
+    return 1 if single_param is not None else 0
+
+
+def _analyze_typescript_tree(
+    root: Node,
+    source_bytes: bytes,
+) -> tuple[tuple[FunctionComplexity, ...], bool]:
+    results: list[FunctionComplexity] = []
+    for event in iter_typescript_definitions(root, source_bytes):
+        if not event.is_callable:
+            continue
+
+        symbol_kind: Literal["function", "method"] = (
+            "method" if event.symbol_kind == "method" else "function"
+        )
+        start_line, _ = node_line_span(event.start_node, source_bytes)
+        _, end_line = node_line_span(event.outer_node, source_bytes)
+        end_line = max(start_line, end_line)
+        line_count = max(1, end_line - start_line + 1)
+        body_nodes: list[Node] = [event.body_node] if event.body_node is not None else []
+        cc = compute_typescript_nodes_cc(body_nodes, source_bytes)
+        nesting = compute_typescript_max_nesting_depth(event.body_node, source_bytes)
+        param_count = count_typescript_parameters(event.callable_node, source_bytes)
+
+        results.append(
+            FunctionComplexity(
+                symbol_name=event.symbol_name,
+                qualified_name=".".join(event.scope_stack),
+                symbol_kind=symbol_kind,
+                start_line=start_line,
+                end_line=end_line,
+                line_count=line_count,
+                cyclomatic_complexity=cc,
+                max_nesting_depth=nesting,
+                parameter_count=param_count,
+                is_async=event.is_async,
+                has_syntax_error=event.outer_node.has_error,
             )
-        return tuple(results), root.has_error
+        )
+    return tuple(results), root.has_error
+
+
+class TypeScriptComplexityAnalyzer:
+    """Compute Cyclomatic Complexity, nesting depth, parameter count, and LOC for TS/TSX."""
+
+    def __init__(self, *, language: Literal["typescript", "tsx"] = "typescript") -> None:
+        self._language: Literal["typescript", "tsx"] = language
+
+    def analyze_source(self, source: str | bytes) -> tuple[FunctionComplexity, ...]:
+        """Analyze every callable function, arrow, component, and method in `source`."""
+        metrics, _ = self._analyze_with_status(source)
+        return metrics
+
+    def _analyze_with_status(
+        self,
+        source: str | bytes,
+    ) -> tuple[tuple[FunctionComplexity, ...], bool]:
+        source_bytes = to_utf8_bytes(source)
+        if not source_bytes.strip():
+            return (), False
+
+        parser = Parser(get_typescript_grammar(self._language))
+        tree = parser.parse(source_bytes)
+        return _analyze_typescript_tree(tree.root_node, source_bytes)
+
+
+class ComplexityAnalyzer:
+    """Unified multi-language static complexity facade for Python, TypeScript, and TSX."""
+
+    def __init__(self) -> None:
+        self._py_analyzer = PythonComplexityAnalyzer()
+        self._ts_analyzer = TypeScriptComplexityAnalyzer(language="typescript")
+        self._tsx_analyzer = TypeScriptComplexityAnalyzer(language="tsx")
+
+    def _resolve_language(
+        self,
+        *,
+        language: ASTLanguage | None,
+        file_path: str | None,
+    ) -> ASTLanguage | None:
+        if language is not None:
+            return language
+        if file_path is not None:
+            return resolve_ast_language(file_path)
+        return "python"
+
+    def analyze_source(
+        self,
+        source: str | bytes,
+        *,
+        language: ASTLanguage | None = None,
+        file_path: str | None = None,
+    ) -> tuple[FunctionComplexity, ...]:
+        """Analyze functions/methods for the resolved language, or return `()` if unsupported."""
+        metrics, _ = self._analyze_with_status(source, language=language, file_path=file_path)
+        return metrics
+
+    def _analyze_with_status(
+        self,
+        source: str | bytes,
+        *,
+        language: ASTLanguage | None = None,
+        file_path: str | None = None,
+    ) -> tuple[tuple[FunctionComplexity, ...], bool]:
+        resolved = self._resolve_language(language=language, file_path=file_path)
+        if resolved is None:
+            return (), False
+        if resolved == "python":
+            return self._py_analyzer._analyze_with_status(source)
+        if resolved == "tsx":
+            return self._tsx_analyzer._analyze_with_status(source)
+        return self._ts_analyzer._analyze_with_status(source)
+
+
+_DEFAULT_COMPLEXITY_ANALYZER: Final[ComplexityAnalyzer] = ComplexityAnalyzer()
 
 
 def _index_by_occurrence(
@@ -316,28 +559,26 @@ def _index_by_occurrence(
 def _touches_changed_lines(
     fn: FunctionComplexity,
     sorted_changed_lines: Sequence[int],
+    deletion_anchors: Sequence[tuple[int | None, int | None]] = (),
 ) -> bool:
-    idx = bisect_left(sorted_changed_lines, fn.start_line)
-    return idx < len(sorted_changed_lines) and sorted_changed_lines[idx] <= fn.end_line
+    return span_touches_sorted_lines(
+        fn.start_line, fn.end_line, sorted_changed_lines
+    ) or span_touches_deletion_anchors(fn.start_line, fn.end_line, deletion_anchors)
 
 
-def compute_complexity_delta(
-    before_source: str | bytes | None,
-    after_source: str | bytes | None,
+def _compute_complexity_delta_from_metrics(
+    before_list: Sequence[FunctionComplexity],
+    before_has_error: bool,
+    after_list: Sequence[FunctionComplexity],
+    after_has_error: bool,
     *,
     changed_right_lines: AbstractSet[int] | None = None,
+    deletion_anchors: Sequence[tuple[int | None, int | None]] = (),
     high_cc_threshold: int = 10,
 ) -> ComplexityDiffSummary:
-    """Compute per-function Cyclomatic Complexity deltas between before and after revisions."""
     if isinstance(high_cc_threshold, bool) or high_cc_threshold < 0:
         raise ValueError("high_cc_threshold must be a non-negative integer.")
-    analyzer = PythonComplexityAnalyzer()
-    before_list, before_has_error = (
-        analyzer._analyze_with_status(before_source) if before_source is not None else ((), False)
-    )
-    after_list, after_has_error = (
-        analyzer._analyze_with_status(after_source) if after_source is not None else ((), False)
-    )
+
     has_syntax_error = before_has_error or after_has_error
     sorted_changed_lines = sorted(changed_right_lines) if changed_right_lines is not None else None
 
@@ -361,7 +602,7 @@ def compute_complexity_delta(
 
         if before_fn is None and after_fn is not None:
             if sorted_changed_lines is None or _touches_changed_lines(
-                after_fn, sorted_changed_lines
+                after_fn, sorted_changed_lines, deletion_anchors
             ):
                 deltas.append(
                     ComplexityDelta(
@@ -393,7 +634,7 @@ def compute_complexity_delta(
         elif before_fn is not None and after_fn is not None:
             cc_changed = before_fn.cyclomatic_complexity != after_fn.cyclomatic_complexity
             touched = sorted_changed_lines is not None and _touches_changed_lines(
-                after_fn, sorted_changed_lines
+                after_fn, sorted_changed_lines, deletion_anchors
             )
             if cc_changed or touched:
                 deltas.append(
@@ -413,7 +654,10 @@ def compute_complexity_delta(
         fn
         for fn in after_list
         if not fn.has_syntax_error
-        and (sorted_changed_lines is None or _touches_changed_lines(fn, sorted_changed_lines))
+        and (
+            sorted_changed_lines is None
+            or _touches_changed_lines(fn, sorted_changed_lines, deletion_anchors)
+        )
     ]
     net_delta = sum(d.delta_cc for d in deltas)
     max_delta = max((d.delta_cc for d in deltas), default=0)
@@ -426,6 +670,42 @@ def compute_complexity_delta(
         max_after_cc=max_after,
         high_complexity_functions=high_cc,
         has_syntax_error=has_syntax_error,
+    )
+
+
+def compute_complexity_delta(
+    before_source: str | bytes | None,
+    after_source: str | bytes | None,
+    *,
+    language: ASTLanguage | None = None,
+    file_path: str | None = None,
+    changed_right_lines: AbstractSet[int] | None = None,
+    high_cc_threshold: int = 10,
+) -> ComplexityDiffSummary:
+    """Compute per-function Cyclomatic Complexity deltas between before and after revisions."""
+    if isinstance(high_cc_threshold, bool) or high_cc_threshold < 0:
+        raise ValueError("high_cc_threshold must be a non-negative integer.")
+    before_list, before_has_error = (
+        _DEFAULT_COMPLEXITY_ANALYZER._analyze_with_status(
+            before_source, language=language, file_path=file_path
+        )
+        if before_source is not None
+        else ((), False)
+    )
+    after_list, after_has_error = (
+        _DEFAULT_COMPLEXITY_ANALYZER._analyze_with_status(
+            after_source, language=language, file_path=file_path
+        )
+        if after_source is not None
+        else ((), False)
+    )
+    return _compute_complexity_delta_from_metrics(
+        before_list,
+        before_has_error,
+        after_list,
+        after_has_error,
+        changed_right_lines=changed_right_lines,
+        high_cc_threshold=high_cc_threshold,
     )
 
 
@@ -629,6 +909,14 @@ def _count_added_logic_lines(file_diff: ParsedFileDiff, normalized_path: str) ->
                     in_block_comment = True
                 continue
 
+            if use_c_comments and stripped.startswith("{/*"):
+                if "*/}" not in stripped[3:]:
+                    in_block_comment = True
+                    continue
+                after_jsx_comment = stripped.split("*/}", 1)[1].strip()
+                if not after_jsx_comment:
+                    continue
+
             if is_python:
                 doc_match = _DOCSTRING_OPEN_RE.match(stripped)
                 if doc_match is not None:
@@ -683,7 +971,9 @@ def detect_missing_test_companion(
         if _matches_any(norm_path, test_matchers):
             added_test_logic += logic_lines
             test_files.append(norm_path)
-        elif _matches_any(norm_path, source_matchers):
+        elif not is_ambient_declaration_path(norm_path) and _matches_any(
+            norm_path, source_matchers
+        ):
             added_source_logic += logic_lines
             source_files.append(norm_path)
 
