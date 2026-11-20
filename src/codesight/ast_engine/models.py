@@ -11,6 +11,12 @@ from codesight.diff.file_filter import normalize_diff_path
 type ASTLanguage = Literal["python", "typescript", "tsx"]
 type SymbolKind = Literal["function", "method", "class", "interface", "type_alias", "section"]
 type ComplexityChangeKind = Literal["added", "modified", "removed"]
+type FallbackReason = Literal[
+    "unsupported_extension",
+    "missing_source",
+    "deleted_file",
+    "parse_failure",
+]
 
 MAX_SIGNATURE_CHARS: Final[int] = 300
 
@@ -175,3 +181,29 @@ class TestCompanionReport:
     is_untested: bool
     source_files: tuple[str, ...] = ()
     test_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HunkContextSlice:
+    """Transient RAM-only diff hunk fallback slice (never persisted to Qdrant, NFR-3)."""
+
+    file_path: str
+    hunk_id: int
+    start_line: int
+    end_line: int
+    section_header: str
+    annotated_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class PRFileContext:
+    """Unified AST or Hunk-fallback context produced by ASTParserRegistry for a PR file."""
+
+    file_path: str
+    mode: Literal["ast", "hunk_fallback"]
+    language: ASTLanguage | None = None
+    parsed_file: ParsedASTFile | None = None
+    touched_chunks: tuple[CodeSymbolChunk, ...] = ()
+    complexity: ComplexityDiffSummary | None = None
+    hunk_slices: tuple[HunkContextSlice, ...] = ()
+    fallback_reason: FallbackReason | None = None

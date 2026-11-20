@@ -9,13 +9,21 @@ from typing import Final
 import structlog
 from tree_sitter import Node, Parser
 
+from codesight.ast_engine._ast_utils import (
+    DEFAULT_MAX_CHUNK_LINES,
+    MIN_CHUNK_LINES,
+    append_unique,
+    collect_splittable_spans,
+    node_line_span,
+    node_text,
+    pack_spans_into_ranges,
+    strip_comments_in_span,
+    to_utf8_bytes,
+)
 from codesight.ast_engine._python_ast import (
     NESTED_SCOPE_TYPES,
     PYTHON_LANGUAGE,
     iter_python_definitions,
-    node_line_span,
-    node_text,
-    to_utf8_bytes,
 )
 from codesight.ast_engine.complexity import compute_python_nodes_cc
 from codesight.ast_engine.models import (
@@ -27,10 +35,6 @@ from codesight.ast_engine.models import (
 from codesight.diff.file_filter import normalize_diff_path
 
 logger = structlog.get_logger("codesight.ast_engine")
-
-DEFAULT_MAX_CHUNK_LINES: Final[int] = 150
-_MIN_CHUNK_LINES: Final[int] = 10
-_MAX_SPLIT_DEPTH: Final[int] = 32
 
 _IMPORT_NODE_TYPES: Final[frozenset[str]] = frozenset(
     {
@@ -55,12 +59,6 @@ _COMPOUND_SPLITTABLE_TYPES: Final[frozenset[str]] = frozenset(
     }
 )
 _ALLOWED_DOCSTRING_PREFIX_CHARS: Final[frozenset[str]] = frozenset({"r", "u"})
-
-
-def _append_unique(target: list[str], seen: set[str], value: str) -> None:
-    if value and value not in seen:
-        seen.add(value)
-        target.append(value)
 
 
 def _qualify_import(module_prefix: str, symbol: str) -> str:
@@ -121,7 +119,7 @@ def _collect_imports_from_node(
         current = stack.pop()
         if current.type in _IMPORT_NODE_TYPES:
             for item in _extract_import_names(current, source_bytes):
-                _append_unique(collected, seen, item)
+                append_unique(collected, seen, item)
             continue
 
         for child in reversed(current.children):
@@ -216,7 +214,7 @@ def _extract_called_symbols(
     called: list[str] = []
     seen: set[str] = set()
     for _, name in matches:
-        _append_unique(called, seen, name)
+        append_unique(called, seen, name)
     return tuple(called)
 
 
@@ -252,156 +250,47 @@ def _extract_signature(definition: Node, body_node: Node | None, source_bytes: b
     else:
         header_end = definition.end_byte
 
-    comment_spans: list[tuple[int, int]] = []
-    stack: list[Node] = [
-        child
-        for child in reversed(definition.children)
-        if child is not body_node and child.start_byte < header_end
-    ]
-    while stack:
-        current = stack.pop()
-        if current.type == "comment":
-            comment_spans.append((current.start_byte, min(current.end_byte, header_end)))
-            continue
-        for child in reversed(current.children):
-            if child.start_byte < header_end:
-                stack.append(child)
-
-    if not comment_spans:
-        raw_header = source_bytes[definition.start_byte : header_end].decode(
-            "utf-8", errors="replace"
-        )
-        return sanitize_signature(raw_header)
-
-    parts: list[bytes] = []
-    cursor = definition.start_byte
-    for c_start, c_end in comment_spans:
-        if c_start > cursor:
-            parts.append(source_bytes[cursor:c_start])
-        cursor = max(cursor, c_end)
-    if cursor < header_end:
-        parts.append(source_bytes[cursor:header_end])
-    return sanitize_signature(b"".join(parts).decode("utf-8", errors="replace"))
-
-
-def _collect_child_blocks(compound_node: Node) -> list[Node]:
-    blocks: list[Node] = []
-    stack: list[Node] = [compound_node]
-    while stack:
-        current = stack.pop()
-        for child in reversed(current.children):
-            if child.type == "block":
-                blocks.append(child)
-            elif child.type in _COMPOUND_SPLITTABLE_TYPES:
-                stack.append(child)
-    return blocks
-
-
-def _collect_splittable_spans(
-    block_node: Node,
-    source_bytes: bytes,
-    max_lines: int,
-    *,
-    _depth: int = 0,
-) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    for stmt in block_node.named_children:
-        if stmt.type == "comment":
-            continue
-        s_start, s_end = node_line_span(stmt, source_bytes)
-        if s_end - s_start + 1 <= max_lines:
-            spans.append((s_start, s_end))
-            continue
-
-        if _depth < _MAX_SPLIT_DEPTH:
-            sub_blocks = _collect_child_blocks(stmt)
-            if sub_blocks:
-                sub_spans: list[tuple[int, int]] = []
-                for sub_block in sub_blocks:
-                    sub_spans.extend(
-                        _collect_splittable_spans(
-                            sub_block,
-                            source_bytes,
-                            max_lines,
-                            _depth=_depth + 1,
-                        )
-                    )
-                if sub_spans:
-                    spans.extend(sub_spans)
-                    continue
-
-        spans.append((s_start, s_end))
-    return spans
-
-
-def _pack_spans_into_ranges(
-    spans: Sequence[tuple[int, int]],
-    *,
-    outer_start_line: int,
-    outer_end_line: int,
-    max_lines: int,
-) -> list[tuple[int, int]]:
-    """Partition `[outer_start_line, outer_end_line]` contiguously respecting AST spans."""
-    packed: list[tuple[int, int]] = []
-    chunk_start = outer_start_line
-    chunk_end = outer_start_line
-    has_content = False
-
-    for s_start, s_end in spans:
-        if s_end < chunk_start:
-            continue
-        candidate_end = max(chunk_end, s_end)
-        if candidate_end - chunk_start + 1 <= max_lines:
-            chunk_end = candidate_end
-            has_content = True
-            continue
-
-        span_len = s_end - s_start + 1
-        current_len = chunk_end - chunk_start + 1
-        if has_content and (span_len <= max_lines or current_len >= _MIN_CHUNK_LINES):
-            packed.append((chunk_start, chunk_end))
-            chunk_start = chunk_end + 1
-            chunk_end = chunk_start
-            has_content = False
-
-        while s_end - chunk_start + 1 > max_lines:
-            win_end = chunk_start + max_lines - 1
-            packed.append((chunk_start, win_end))
-            chunk_start = win_end + 1
-
-        chunk_end = max(chunk_start, s_end)
-        has_content = True
-
-    final_end = max(chunk_end, outer_end_line)
-    while final_end - chunk_start + 1 > max_lines:
-        win_end = chunk_start + max_lines - 1
-        packed.append((chunk_start, win_end))
-        chunk_start = win_end + 1
-    if chunk_start <= final_end:
-        packed.append((chunk_start, final_end))
-    return packed
+    raw_header = strip_comments_in_span(
+        definition,
+        definition.start_byte,
+        header_end,
+        source_bytes,
+        skip_node=body_node,
+    )
+    return sanitize_signature(raw_header)
 
 
 class PythonASTParser:
     """Parse Python source in RAM via `tree-sitter-python` into NFR-3 CodeSymbolChunks."""
 
     def __init__(self, *, max_chunk_lines: int = DEFAULT_MAX_CHUNK_LINES) -> None:
-        if isinstance(max_chunk_lines, bool) or max_chunk_lines < _MIN_CHUNK_LINES:
-            raise ValueError(f"max_chunk_lines must be an integer >= {_MIN_CHUNK_LINES}.")
+        if isinstance(max_chunk_lines, bool) or max_chunk_lines < MIN_CHUNK_LINES:
+            raise ValueError(f"max_chunk_lines must be an integer >= {MIN_CHUNK_LINES}.")
         self._max_chunk_lines = max_chunk_lines
 
     def parse(self, source: str | bytes, *, file_path: str = "<memory>") -> ParsedASTFile:
         """Extract module imports and scope-isolated symbol chunks from Python source."""
+        parsed, _, _ = self._parse_tree(source, file_path=file_path)
+        return parsed
+
+    def _parse_tree(
+        self,
+        source: str | bytes,
+        *,
+        file_path: str = "<memory>",
+    ) -> tuple[ParsedASTFile, Node | None, bytes]:
+        """Parse once and return `(ParsedASTFile, root_node, source_bytes)` for reuse."""
         norm_path = normalize_diff_path(file_path).rstrip("/") or "<memory>"
         source_bytes = to_utf8_bytes(source)
         if not source_bytes.strip():
-            return ParsedASTFile(
+            empty = ParsedASTFile(
                 file_path=norm_path,
                 language="python",
                 imports=(),
                 chunks=(),
                 has_syntax_error=False,
             )
+            return empty, None, source_bytes
 
         parser = Parser(PYTHON_LANGUAGE)
         tree = parser.parse(source_bytes)
@@ -433,7 +322,7 @@ class PythonASTParser:
                     descend_into_definitions=False,
                 )
                 for item in local_imports:
-                    _append_unique(merged_imports, seen_imports, item)
+                    append_unique(merged_imports, seen_imports, item)
             imports_tuple = tuple(merged_imports)
             scope_imports[event.scope_stack] = imports_tuple
 
@@ -496,12 +385,14 @@ class PythonASTParser:
                     )
                 )
             else:
-                spans = _collect_splittable_spans(
+                spans = collect_splittable_spans(
                     event.body_node,
                     source_bytes,
                     self._max_chunk_lines,
+                    block_type="block",
+                    compound_splittable_types=_COMPOUND_SPLITTABLE_TYPES,
                 )
-                ranges = _pack_spans_into_ranges(
+                ranges = pack_spans_into_ranges(
                     spans,
                     outer_start_line=start_line,
                     outer_end_line=end_line,
@@ -537,10 +428,11 @@ class PythonASTParser:
                         )
                     )
 
-        return ParsedASTFile(
+        parsed = ParsedASTFile(
             file_path=norm_path,
             language="python",
             imports=module_imports,
             chunks=tuple(chunks),
             has_syntax_error=has_syntax_error,
         )
+        return parsed, root, source_bytes
