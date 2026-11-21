@@ -6,6 +6,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import os
 import random
 import threading
@@ -37,6 +38,8 @@ from codesight.core.logging import (
     get_trace_id,
 )
 from codesight.db.session import create_db_engine, create_session_factory
+from codesight.rag.embedder import GeminiEmbedder
+from codesight.rag.qdrant_store import QdrantZeroCodeStore
 from codesight.vcs.github_auth import GitHubAuthConfigError
 from codesight.worker.lifecycle import (
     PRReviewLifecycleContext,
@@ -51,6 +54,11 @@ from codesight.worker.pr_review_runner import Week1PRReviewRunner
 from codesight.worker.supersede_lock import AsyncSupersedeLock
 from codesight.worker.supersede_lock import (
     is_pr_event_superseded as _is_pr_superseded_impl,
+)
+from codesight.worker.tasks.indexing_tasks import (
+    extract_push_coords,
+    has_indexing_credentials,
+    run_push_webhook_task,
 )
 
 MAX_TASK_RETRIES: Final[int] = 3
@@ -306,6 +314,10 @@ class _WorkerAsyncRuntime:
         self._db_engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
         self._db_dsn: str | None = None
+        self._qdrant_store: QdrantZeroCodeStore | None = None
+        self._qdrant_key: tuple[str, int, int, str] | None = None
+        self._embedder: GeminiEmbedder | None = None
+        self._embedder_key_hash: str | None = None
 
     def _reset_fields(self) -> None:
         self._pid = None
@@ -318,6 +330,10 @@ class _WorkerAsyncRuntime:
         self._db_engine = None
         self._session_factory = None
         self._db_dsn = None
+        self._qdrant_store = None
+        self._qdrant_key = None
+        self._embedder = None
+        self._embedder_key_hash = None
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         with self._state_lock:
@@ -458,7 +474,60 @@ class _WorkerAsyncRuntime:
 
             return self._http_client, self._redis_client, self._session_factory
 
+    async def _ensure_rag_pools(
+        self, settings: Settings
+    ) -> tuple[QdrantZeroCodeStore, GeminiEmbedder]:
+        if self._pool_lock is None:
+            self._pool_lock = asyncio.Lock()
+
+        async with self._pool_lock:
+            q_key = (
+                settings.qdrant_host,
+                settings.qdrant_http_port,
+                settings.qdrant_grpc_port,
+                settings.qdrant_collection_name,
+            )
+            if self._qdrant_store is None or self._qdrant_key != q_key:
+                if self._qdrant_store is not None:
+                    try:
+                        await self._qdrant_store.aclose()
+                    except Exception:
+                        pass
+                self._qdrant_store = QdrantZeroCodeStore(settings=settings)
+                self._qdrant_key = q_key
+
+            raw_gemini = (
+                settings.gemini_api_key.get_secret_value().strip()
+                if settings.gemini_api_key is not None
+                else ""
+            )
+            key_hash = hashlib.sha256(raw_gemini.encode("utf-8")).hexdigest()
+            if self._embedder is None or self._embedder_key_hash != key_hash:
+                if self._embedder is not None:
+                    try:
+                        await self._embedder.aclose()
+                    except Exception:
+                        pass
+                self._embedder = GeminiEmbedder(settings=settings)
+                self._embedder_key_hash = key_hash
+
+            return self._qdrant_store, self._embedder
+
     async def _aclose_pools(self) -> None:
+        if self._embedder is not None:
+            try:
+                await self._embedder.aclose()
+            except Exception:
+                pass
+            self._embedder = None
+            self._embedder_key_hash = None
+        if self._qdrant_store is not None:
+            try:
+                await self._qdrant_store.aclose()
+            except Exception:
+                pass
+            self._qdrant_store = None
+            self._qdrant_key = None
         if self._redis_client is not None:
             try:
                 await self._redis_client.aclose()
@@ -584,6 +653,43 @@ class _WorkerAsyncRuntime:
 
         return self.run_coro(_dispatch())
 
+    def run_push_webhook_task_sync(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        settings: Settings | None = None,
+        is_final_attempt: bool = False,
+    ) -> dict[str, str]:
+        async def _dispatch() -> dict[str, str]:
+            active_settings = settings if settings is not None else get_settings()
+            coords = extract_push_coords(payload)
+            has_creds = has_indexing_credentials(active_settings)
+            if coords is not None and (has_creds or active_settings.app_env == "production"):
+                http_client, redis_client, session_factory = await self._ensure_pools(
+                    active_settings
+                )
+                store: QdrantZeroCodeStore | None = None
+                embedder: GeminiEmbedder | None = None
+                if has_creds:
+                    store, embedder = await self._ensure_rag_pools(active_settings)
+                return await run_push_webhook_task(
+                    payload,
+                    settings=active_settings,
+                    http_client=http_client,
+                    session_factory=session_factory,
+                    redis_client=redis_client,
+                    store=store,
+                    embedder=embedder,
+                    is_final_attempt=is_final_attempt,
+                )
+            return await run_push_webhook_task(
+                payload,
+                settings=active_settings,
+                is_final_attempt=is_final_attempt,
+            )
+
+        return self.run_coro(_dispatch())
+
 
 _WORKER_RUNTIME = _WorkerAsyncRuntime()
 atexit.register(_WORKER_RUNTIME.shutdown)
@@ -667,10 +773,25 @@ def handle_pr_event(payload: dict[str, Any]) -> dict[str, str]:
     return _WORKER_RUNTIME.run_pr_webhook_task_sync(payload, settings=active_settings)
 
 
-@_typed_task(celery_app, name="codesight.webhook.handle_push_event")
-def handle_push_event(payload: dict[str, Any]) -> dict[str, str]:
-    """Handle default-branch push webhook events (stub wired to syncer in CA-14)."""
+def _dispatch_push_task(task_obj: Any, payload: dict[str, Any]) -> dict[str, str]:
     trace_id = get_trace_id() or "-"
+    active_settings = get_settings()
+    coords = extract_push_coords(payload)
+    if coords is not None and (
+        has_indexing_credentials(active_settings) or active_settings.app_env == "production"
+    ):
+        req = getattr(task_obj, "request", None)
+        is_worker_delivery = not bool(getattr(req, "called_directly", True)) and bool(
+            getattr(req, "id", None)
+        )
+        current_retries = int(getattr(req, "retries", 0) or 0)
+        is_final_attempt = (not is_worker_delivery) or (current_retries >= MAX_TASK_RETRIES)
+        return _WORKER_RUNTIME.run_push_webhook_task_sync(
+            payload,
+            settings=active_settings,
+            is_final_attempt=is_final_attempt,
+        )
+
     logger.info(
         "webhook_push_stub_received",
         trace_id=trace_id,
@@ -678,3 +799,15 @@ def handle_push_event(payload: dict[str, Any]) -> dict[str, str]:
         ref=str(payload.get("ref", "")),
     )
     return {"status": "accepted", "trace_id": trace_id}
+
+
+@_typed_task(celery_app, name="codesight.webhook.handle_push_event")
+def handle_push_event(payload: dict[str, Any]) -> dict[str, str]:
+    """Handle default-branch push webhook events via FR-07 IncrementalBranchSyncer."""
+    return _dispatch_push_task(handle_push_event, payload)
+
+
+@_typed_task(celery_app, name="codesight.indexing.sync_default_branch")
+def sync_default_branch(payload: dict[str, Any]) -> dict[str, str]:
+    """Named Celery entrypoint for incremental default-branch Qdrant synchronization."""
+    return _dispatch_push_task(sync_default_branch, payload)

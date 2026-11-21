@@ -11,6 +11,7 @@ from codesight.worker.celery_app import (
     handle_pr_event,
     handle_push_event,
     ping,
+    sync_default_branch,
 )
 from codesight.worker.lifecycle import (
     PRReviewLifecycleContext,
@@ -29,6 +30,12 @@ from codesight.worker.supersede_lock import (
     pr_active_task_key,
     pr_active_ts_key,
 )
+from codesight.worker.tasks.indexing_tasks import (
+    PushSyncRunner,
+    extract_push_coords,
+    has_indexing_credentials,
+    run_push_webhook_task,
+)
 
 __all__ = [
     "MAX_TASK_RETRIES",
@@ -40,18 +47,23 @@ __all__ = [
     "CodeSightTask",
     "PRReviewLifecycleContext",
     "PRSupersededError",
+    "PushSyncRunner",
     "SupersedeClaim",
     "SyncSupersedeLock",
     "classify_retryable_exception",
     "compute_retry_countdown",
     "create_celery_app",
     "execute_pr_review_lifecycle",
+    "extract_push_coords",
     "handle_pr_event",
     "handle_push_event",
+    "has_indexing_credentials",
     "is_pr_event_superseded",
     "ping",
     "pr_active_ancestors_key",
     "pr_active_sha_key",
     "pr_active_task_key",
     "pr_active_ts_key",
+    "run_push_webhook_task",
+    "sync_default_branch",
 ]
