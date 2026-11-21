@@ -35,6 +35,21 @@ def sanitize_signature(raw_header: str, *, max_chars: int = MAX_SIGNATURE_CHARS)
     return f"{collapsed[: max_chars - 3].rstrip()}..."
 
 
+def build_deterministic_point_id(
+    repo_full_name: str,
+    file_path: str,
+    blob_sha: str,
+    symbol_name: str,
+    start_line: int,
+) -> str:
+    """Return canonical UUIDv5 Qdrant point ID for a symbol/section at `(file_path, start_line)`."""
+    if isinstance(start_line, bool) or not isinstance(start_line, int) or start_line < 1:
+        raise ValueError("start_line must be an integer >= 1.")
+    norm_path = normalize_diff_path(file_path).rstrip("/") or file_path
+    seed = f"{repo_full_name}:{norm_path}:{blob_sha}:{symbol_name}:{start_line}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+
+
 @dataclass(frozen=True, slots=True)
 class CodeSymbolChunk:
     """AST semantic unit with transient RAM metadata and NFR-3 safe Qdrant payload."""
@@ -63,9 +78,13 @@ class CodeSymbolChunk:
 
     def build_point_id(self, repo: str, blob_sha: str) -> str:
         """Return deterministic UUIDv5 Qdrant point ID for this symbol and blob SHA."""
-        norm_path = normalize_diff_path(self.file_path) or self.file_path
-        seed = f"{repo}:{norm_path}:{blob_sha}:{self.symbol_name}:{self.start_line}"
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+        return build_deterministic_point_id(
+            repo,
+            self.file_path,
+            blob_sha,
+            self.symbol_name,
+            self.start_line,
+        )
 
     def build_embedding_text(self) -> str:
         """Assemble transient RAM text for embedding without persisting source code."""
