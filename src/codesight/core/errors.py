@@ -16,13 +16,13 @@ MAX_RETRY_AFTER_SECONDS: Final[float] = 60.0
 class RetryableTaskError(RuntimeError):
     """Raised on transient network, broker, or upstream 5xx errors eligible for Celery retry."""
 
-
-class RateLimitTaskError(RetryableTaskError):
-    """Raised on upstream HTTP 429 or secondary rate-limit responses."""
-
     def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+
+
+class RateLimitTaskError(RetryableTaskError):
+    """Raised on upstream HTTP 429 or secondary rate-limit responses."""
 
 
 def _clamp_delay(seconds: float) -> float:

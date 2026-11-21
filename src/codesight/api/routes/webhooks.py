@@ -16,13 +16,13 @@ import structlog
 from celery import Celery
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from codesight.core.config import Settings, get_settings
 from codesight.db.models import Repository, WebhookEvent
+from codesight.db.repositories import upsert_repository
 from codesight.vcs.github_auth import GitHubAuthConfigError, validate_repo_full_name
 from codesight.worker.celery_app import celery_app
 from codesight.worker.supersede_lock import (
@@ -506,89 +506,6 @@ def _classify_webhook(event_type: str, payload: dict[str, Any]) -> _ClassifiedWe
     return _IgnoredWebhook(ack_status="ignored", action=action)
 
 
-def _stale_repo_name(full_name: str, suffix: str) -> str:
-    tag = f"__stale_{suffix}"
-    return f"{full_name[: max(0, 255 - len(tag))]}{tag}"
-
-
-async def _apply_repo_upsert(
-    session: AsyncSession,
-    *,
-    github_repo_id: int | None,
-    full_name: str,
-    default_branch: str,
-    installation_id: int | None,
-) -> Repository | None:
-    if github_repo_id is None:
-        existing = (
-            await session.execute(select(Repository).where(Repository.full_name == full_name))
-        ).scalar_one_or_none()
-        if existing is None:
-            return None
-        needs_update = existing.default_branch != default_branch or (
-            installation_id is not None and existing.installation_id != installation_id
-        )
-        if needs_update:
-            existing.default_branch = default_branch
-            if installation_id is not None:
-                existing.installation_id = installation_id
-            await session.flush()
-        return existing
-
-    rows = list(
-        (
-            await session.execute(
-                select(Repository).where(
-                    or_(
-                        Repository.github_repo_id == github_repo_id,
-                        Repository.full_name == full_name,
-                    )
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    by_id = next((r for r in rows if r.github_repo_id == github_repo_id), None)
-    by_name = next((r for r in rows if r.full_name == full_name), None)
-
-    if by_id is not None:
-        if by_name is not None and by_name.id != by_id.id:
-            suffix = (
-                str(by_name.github_repo_id)
-                if by_name.github_repo_id is not None
-                else str(by_name.id)[:8]
-            )
-            by_name.full_name = _stale_repo_name(by_name.full_name, suffix)
-            await session.flush()
-        needs_update = (
-            by_id.full_name != full_name
-            or by_id.default_branch != default_branch
-            or (installation_id is not None and by_id.installation_id != installation_id)
-        )
-        if needs_update:
-            by_id.full_name = full_name
-            by_id.default_branch = default_branch
-            if installation_id is not None:
-                by_id.installation_id = installation_id
-            await session.flush()
-        return by_id
-
-    if by_name is not None:
-        if by_name.github_repo_id is None:
-            by_name.github_repo_id = github_repo_id
-            by_name.default_branch = default_branch
-            if installation_id is not None:
-                by_name.installation_id = installation_id
-            await session.flush()
-            return by_name
-        by_name.full_name = _stale_repo_name(by_name.full_name, str(by_name.github_repo_id))
-        await session.flush()
-        return None
-
-    return None
-
-
 async def _upsert_repository(
     session: AsyncSession,
     *,
@@ -597,41 +514,13 @@ async def _upsert_repository(
     default_branch: str,
     installation_id: int | None,
 ) -> Repository:
-    for _ in range(3):
-        try:
-            async with session.begin_nested():
-                updated = await _apply_repo_upsert(
-                    session,
-                    github_repo_id=github_repo_id,
-                    full_name=full_name,
-                    default_branch=default_branch,
-                    installation_id=installation_id,
-                )
-                if updated is not None:
-                    return updated
-
-                repo = Repository(
-                    github_repo_id=github_repo_id,
-                    full_name=full_name,
-                    default_branch=default_branch,
-                    installation_id=installation_id,
-                )
-                session.add(repo)
-                await session.flush()
-                return repo
-        except IntegrityError:
-            continue
-
-    resolved = await _apply_repo_upsert(
+    return await upsert_repository(
         session,
         github_repo_id=github_repo_id,
         full_name=full_name,
         default_branch=default_branch,
         installation_id=installation_id,
     )
-    if resolved is None:
-        raise RuntimeError(f"Failed to upsert repository '{full_name}'.")
-    return resolved
 
 
 def _get_runtime_settings(request: Request) -> Settings:

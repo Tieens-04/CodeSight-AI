@@ -5,18 +5,19 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import httpx
 import redis.asyncio as redis_async
 import redis.exceptions
+import sqlalchemy.exc as sa_exc
 import structlog
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from codesight.config_reader.repo_config import RepoConfig, RepoConfigLoader
 from codesight.core.config import Settings, get_settings
 from codesight.core.ephemeral import async_ephemeral_workspace
 from codesight.core.errors import (
-    RateLimitTaskError,
     RetryableTaskError,
     is_rate_limited_403,
     parse_retry_after_header,
@@ -28,6 +29,10 @@ from codesight.vcs.github_auth import (
     GitHubAuthProvider,
 )
 from codesight.worker.supersede_lock import AsyncSupersedeLock, PRSupersededError
+
+_RETRYABLE_GRPC_STATUS_NAMES: Final[frozenset[str]] = frozenset(
+    {"UNAVAILABLE", "DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED", "ABORTED"}
+)
 
 logger = structlog.get_logger("codesight.worker.lifecycle")
 
@@ -79,10 +84,8 @@ def classify_retryable_exception(exc: BaseException) -> tuple[bool, float | None
     """Return (is_retryable, optional_retry_after_seconds) for worker exception triage."""
     if isinstance(exc, (PRSupersededError, GitHubAuthConfigError)):
         return False, None
-    if isinstance(exc, RateLimitTaskError):
-        return True, exc.retry_after_seconds
     if isinstance(exc, RetryableTaskError):
-        return True, None
+        return True, exc.retry_after_seconds
     if isinstance(exc, GitHubAuthError):
         cause = exc.__cause__
         if isinstance(cause, httpx.HTTPStatusError):
@@ -95,6 +98,27 @@ def classify_retryable_exception(exc: BaseException) -> tuple[bool, float | None
         return False, None
     if isinstance(exc, httpx.HTTPStatusError):
         return _classify_http_status_response(exc.response)
+    if isinstance(exc, ResponseHandlingException):
+        return True, None
+    if isinstance(exc, UnexpectedResponse):
+        status_code = exc.status_code
+        if status_code == 429:
+            delay = (
+                parse_retry_after_header(exc.headers) if isinstance(exc.headers, Mapping) else None
+            )
+            return True, delay
+        if status_code == 408 or (status_code is not None and 500 <= status_code < 600):
+            return True, None
+        return False, None
+    code_fn = getattr(exc, "code", None)
+    if callable(code_fn) and any(cls.__module__.startswith("grpc") for cls in type(exc).__mro__):
+        rpc_code = code_fn()
+        code_name = str(getattr(rpc_code, "name", rpc_code)).upper()
+        return code_name in _RETRYABLE_GRPC_STATUS_NAMES, None
+    if isinstance(exc, (sa_exc.OperationalError, sa_exc.InterfaceError, sa_exc.TimeoutError)):
+        return True, None
+    if isinstance(exc, sa_exc.DBAPIError) and bool(getattr(exc, "connection_invalidated", False)):
+        return True, None
     if isinstance(
         exc,
         (
@@ -102,6 +126,8 @@ def classify_retryable_exception(exc: BaseException) -> tuple[bool, float | None
             httpx.TransportError,
             redis.exceptions.ConnectionError,
             redis.exceptions.TimeoutError,
+            TimeoutError,
+            ConnectionError,
         ),
     ):
         return True, None

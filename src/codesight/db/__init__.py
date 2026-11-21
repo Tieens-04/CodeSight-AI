@@ -8,6 +8,7 @@ from codesight.db.models import (
     ReviewFinding,
     WebhookEvent,
 )
+from codesight.db.repositories import apply_repo_upsert, stale_repo_name, upsert_repository
 from codesight.db.session import create_db_engine, create_session_factory, get_db_session
 
 __all__ = [
@@ -17,7 +18,10 @@ __all__ = [
     "Repository",
     "ReviewFinding",
     "WebhookEvent",
+    "apply_repo_upsert",
     "create_db_engine",
     "create_session_factory",
     "get_db_session",
+    "stale_repo_name",
+    "upsert_repository",
 ]

@@ -9,6 +9,7 @@ import typer
 from rich.console import Console
 
 from codesight import __version__
+from codesight.cli.commands.index import index_command
 from codesight.cli.commands.review import review_command
 from codesight.core.config import get_settings
 from codesight.core.logging import configure_logging
@@ -57,4 +58,5 @@ def version() -> None:
     )
 
 
+app.command(name="index")(index_command)
 app.command(name="review")(review_command)
