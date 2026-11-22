@@ -780,11 +780,26 @@ class AsyncRepoIndexLock:
             interval = max(0.5, self._ttl_seconds / 3.0)
 
             async def _heartbeat() -> None:
-                while True:
-                    await asyncio.sleep(interval)
-                    still_owned = await self._renew(key, token)
-                    if not still_owned:
-                        return
+                try:
+                    while True:
+                        await asyncio.sleep(interval)
+                        still_owned = await self._renew(key, token)
+                        if not still_owned:
+                            logger.warning(
+                                "repo_index_lock_ownership_lost",
+                                lock_key=key,
+                                scope_key=scope_key,
+                            )
+                            return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "repo_index_lock_heartbeat_failed",
+                        lock_key=key,
+                        scope_key=scope_key,
+                        error_type=type(exc).__name__,
+                    )
 
             heartbeat_task = asyncio.create_task(_heartbeat())
 
@@ -794,7 +809,7 @@ class AsyncRepoIndexLock:
             try:
                 if heartbeat_task is not None:
                     heartbeat_task.cancel()
-                    with suppress(asyncio.CancelledError):
+                    with suppress(asyncio.CancelledError, Exception):
                         await heartbeat_task
             finally:
                 if acquired:

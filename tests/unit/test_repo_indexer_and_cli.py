@@ -263,7 +263,16 @@ class _FakeRedisLockClient:
         self.store[key] = value
         return True
 
-    async def eval(self, _script: str, _numkeys: int, key: str, token: str) -> int:
+    async def eval(
+        self,
+        script: str,
+        _numkeys: int,
+        key: str,
+        token: str,
+        *_args: Any,
+    ) -> int:
+        if "expire" in script.lower():
+            return 1 if self.store.get(key) == token else 0
         if self.store.get(key) == token:
             del self.store[key]
             return 1
@@ -1088,7 +1097,7 @@ async def test_push_sync_runner_failure_classification_and_celery_entrypoint(
         await runner.execute(payload, is_final_attempt=True)
     assert recorded_statuses == ["failed"]
 
-    # CancelledError marks webhook failed
+    # CancelledError defers without marking failed on retry; marks failed only on final attempt
     async def _raise_cancel(*_args: Any, **_kwargs: Any) -> Any:
         raise asyncio.CancelledError()
 
@@ -1097,7 +1106,10 @@ async def test_push_sync_runner_failure_classification_and_celery_entrypoint(
         _raise_cancel,
     )
     with pytest.raises(asyncio.CancelledError):
-        await runner.execute(payload)
+        await runner.execute(payload, is_final_attempt=False)
+    assert recorded_statuses == ["failed"]
+    with pytest.raises(asyncio.CancelledError):
+        await runner.execute(payload, is_final_attempt=True)
     assert recorded_statuses == ["failed", "failed"]
 
     # Dev stub on sync_default_branch and run_push_webhook_task
@@ -2870,6 +2882,10 @@ def test_cli_allow_non_default_branch_flag_forwarding(
 
 async def test_async_repo_index_lock_renew_extends_ttl_and_stops_when_token_replaced() -> None:
     import asyncio
+    import io
+    import json
+
+    from codesight.core.logging import configure_logging
 
     class _TTLTrackingRedis:
         def __init__(self) -> None:
@@ -2915,35 +2931,99 @@ async def test_async_repo_index_lock_renew_extends_ttl_and_stops_when_token_repl
                 return 1
             return 0
 
-    redis_client = _TTLTrackingRedis()
-    lock = AsyncRepoIndexLock(
-        redis_client,  # type: ignore[arg-type]
-        ttl_seconds=3,
-        acquire_timeout_seconds=0.1,
-        poll_interval_seconds=0.01,
-    )
+    log_buf = io.StringIO()
+    configure_logging(level="INFO", service_name="codesight-test", stream=log_buf)
+    try:
+        redis_client = _TTLTrackingRedis()
+        lock = AsyncRepoIndexLock(
+            redis_client,  # type: ignore[arg-type]
+            ttl_seconds=3,
+            acquire_timeout_seconds=0.1,
+            poll_interval_seconds=0.01,
+        )
 
-    async with lock.hold("repo:1"):
-        assert redis_client.ttls["repo_index_lock:repo:1"] == 3
-        redis_client.ttls["repo_index_lock:repo:1"] = 1
-        await asyncio.sleep(2.25)
-        assert len([call for call in redis_client.renew_attempts if call[3] == 1]) >= 2
-        assert redis_client.ttls["repo_index_lock:repo:1"] == 3
+        async with lock.hold("repo:1"):
+            assert redis_client.ttls["repo_index_lock:repo:1"] == 3
+            redis_client.ttls["repo_index_lock:repo:1"] = 1
+            await asyncio.sleep(2.25)
+            assert len([call for call in redis_client.renew_attempts if call[3] == 1]) >= 2
+            assert redis_client.ttls["repo_index_lock:repo:1"] == 3
 
-    assert "repo_index_lock:repo:1" not in redis_client.store
+        assert "repo_index_lock:repo:1" not in redis_client.store
 
-    # Replaced token must NEVER be renewed or released by original holder
-    redis_client.renew_attempts.clear()
-    async with lock.hold("repo:1"):
-        await asyncio.sleep(0.1)
-        redis_client.store["repo_index_lock:repo:1"] = "replaced-owner-token"
-        redis_client.ttls["repo_index_lock:repo:1"] = 99
-        await asyncio.sleep(1.2)
-        assert redis_client.ttls["repo_index_lock:repo:1"] == 99
-        assert any(call[3] == 0 for call in redis_client.renew_attempts)
+        # Replaced token must NEVER be renewed or released and logs repo_index_lock_ownership_lost
+        redis_client.renew_attempts.clear()
+        async with lock.hold("repo:1"):
+            await asyncio.sleep(0.1)
+            redis_client.store["repo_index_lock:repo:1"] = "replaced-owner-token"
+            redis_client.ttls["repo_index_lock:repo:1"] = 99
+            await asyncio.sleep(1.2)
+            assert redis_client.ttls["repo_index_lock:repo:1"] == 99
+            assert any(call[3] == 0 for call in redis_client.renew_attempts)
 
-    assert redis_client.store.get("repo_index_lock:repo:1") == "replaced-owner-token"
-    assert redis_client.ttls.get("repo_index_lock:repo:1") == 99
+        assert redis_client.store.get("repo_index_lock:repo:1") == "replaced-owner-token"
+        assert redis_client.ttls.get("repo_index_lock:repo:1") == 99
+
+        events = [json.loads(line) for line in log_buf.getvalue().strip().splitlines()]
+        assert any(
+            e.get("event") == "repo_index_lock_ownership_lost" and e.get("level") == "warning"
+            for e in events
+        )
+
+        # Unexpected exception in heartbeat (e.g., RuntimeError/TypeError) never masks body outcome
+        class _ExplodingHeartbeatRedis:
+            def __init__(self) -> None:
+                self.store: dict[str, str] = {}
+
+            async def set(
+                self,
+                key: str,
+                value: str,
+                *,
+                nx: bool = False,
+                ex: int | None = None,
+            ) -> bool:
+                if nx and key in self.store:
+                    return False
+                self.store[key] = value
+                return True
+
+            async def eval(
+                self,
+                script: str,
+                _numkeys: int,
+                key: str,
+                token: str,
+                *_args: Any,
+            ) -> int:
+                if "expire" in script.lower():
+                    raise RuntimeError("closed redis transport")
+                if self.store.get(key) == token:
+                    del self.store[key]
+                    return 1
+                return 0
+
+        exploding_redis = _ExplodingHeartbeatRedis()
+        exploding_lock = AsyncRepoIndexLock(
+            exploding_redis,  # type: ignore[arg-type]
+            ttl_seconds=1,
+            acquire_timeout_seconds=0.1,
+            poll_interval_seconds=0.01,
+        )
+        body_completed = False
+        async with exploding_lock.hold("repo:boom"):
+            await asyncio.sleep(0.7)
+            body_completed = True
+        assert body_completed is True
+        assert "repo_index_lock:repo:boom" not in exploding_redis.store
+
+        with pytest.raises(ValueError, match="body-failure"):
+            async with exploding_lock.hold("repo:boom2"):
+                await asyncio.sleep(0.7)
+                raise ValueError("body-failure")
+        assert "repo_index_lock:repo:boom2" not in exploding_redis.store
+    finally:
+        configure_logging()
 
 
 async def test_run_cli_index_contends_on_lock_and_syncer_fallback_avoids_self_deadlock(
@@ -3080,6 +3160,7 @@ async def test_upsert_repository_state_expected_previous_sha_prevents_cursor_rol
     class _FakeSession:
         def __init__(self) -> None:
             self._pending: list[Repository] = []
+            self.executed_sql: list[str] = []
 
         async def __aenter__(self) -> _FakeSession:
             return self
@@ -3098,6 +3179,7 @@ async def test_upsert_repository_state_expected_previous_sha_prevents_cursor_rol
         async def execute(self, stmt: Any) -> _FakeScalarResult:
             compiled = stmt.compile(dialect=postgresql.dialect())
             sql_text = str(compiled)
+            self.executed_sql.append(sql_text)
             where_sql = sql_text.split("WHERE", 1)[1] if "WHERE" in sql_text else sql_text
             params = compiled.params
             id_val = next(
@@ -3135,7 +3217,19 @@ async def test_upsert_repository_state_expected_previous_sha_prevents_cursor_rol
         async def rollback(self) -> None:
             self._pending.clear()
 
-    factory = lambda: _FakeSession()  # noqa: E731
+    recorded_sql: list[str] = []
+
+    def factory() -> _FakeSession:
+        sess = _FakeSession()
+        orig_exec = sess.execute
+
+        async def _tracking_exec(stmt: Any) -> _FakeScalarResult:
+            res = await orig_exec(stmt)
+            recorded_sql.extend(sess.executed_sql[-1:])
+            return res
+
+        sess.execute = _tracking_exec  # type: ignore[method-assign]
+        return sess
 
     repo_id, updated = await upsert_repository_state(
         factory,  # type: ignore[arg-type]
@@ -3148,6 +3242,7 @@ async def test_upsert_repository_state_expected_previous_sha_prevents_cursor_rol
     assert repo_id == str(existing_id)
     assert updated is False
     assert rows[0].last_indexed_sha == "newer_sha"
+    assert any("FOR UPDATE" in sql for sql in recorded_sql)
 
     repo_id2, updated2 = await upsert_repository_state(
         factory,  # type: ignore[arg-type]
@@ -3232,28 +3327,31 @@ async def test_push_sync_stub_emits_missing_credentials_warning(
 
     buf = io.StringIO()
     configure_logging(level="INFO", service_name="codesight-test", stream=buf)
-    no_creds_settings = Settings(
-        _env_file=None,
-        github_app_id=None,
-        github_private_key=None,
-        github_token=None,
-        gemini_api_key=None,
-    )
-    payload = {
-        "delivery_id": "deliv-stub-warn",
-        "repo_id": str(uuid.uuid4()),
-        "repo_full_name": "acme/stub-warn",
-        "after_sha": "abc1234",
-        "ref": "refs/heads/main",
-    }
-    res = await run_push_webhook_task(payload, settings=no_creds_settings)
-    assert res["status"] == "accepted"
+    try:
+        no_creds_settings = Settings(
+            _env_file=None,
+            github_app_id=None,
+            github_private_key=None,
+            github_token=None,
+            gemini_api_key=None,
+        )
+        payload = {
+            "delivery_id": "deliv-stub-warn",
+            "repo_id": str(uuid.uuid4()),
+            "repo_full_name": "acme/stub-warn",
+            "after_sha": "abc1234",
+            "ref": "refs/heads/main",
+        }
+        res = await run_push_webhook_task(payload, settings=no_creds_settings)
+        assert res["status"] == "accepted"
 
-    monkeypatch.setattr("codesight.worker.celery_app.get_settings", lambda: no_creds_settings)
-    celery_res = handle_push_event(payload)
-    assert celery_res["status"] == "accepted"
+        monkeypatch.setattr("codesight.worker.celery_app.get_settings", lambda: no_creds_settings)
+        celery_res = handle_push_event(payload)
+        assert celery_res["status"] == "accepted"
 
-    events = [json.loads(line) for line in buf.getvalue().strip().splitlines()]
-    warnings = [e for e in events if e.get("event") == "push_sync_skipped_missing_credentials"]
-    assert len(warnings) == 2
-    assert all(w.get("level") == "warning" for w in warnings)
+        events = [json.loads(line) for line in buf.getvalue().strip().splitlines()]
+        warnings = [e for e in events if e.get("event") == "push_sync_skipped_missing_credentials"]
+        assert len(warnings) == 2
+        assert all(w.get("level") == "warning" for w in warnings)
+    finally:
+        configure_logging()

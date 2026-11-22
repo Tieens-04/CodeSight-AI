@@ -336,3 +336,105 @@ async def test_soft_time_limit_exceeded_retryable_and_push_task_timeouts(
     with pytest.raises(SoftTimeLimitExceeded):
         await runner.execute(payload, is_final_attempt=True)
     assert recorded_statuses == ["failed"]
+
+
+def test_worker_runtime_soft_time_limit_cancels_coro_without_premature_failed_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import threading
+    import uuid
+    from concurrent.futures import Future
+    from typing import Any
+    from unittest.mock import patch
+
+    from billiard.exceptions import SoftTimeLimitExceeded
+    from pydantic import SecretStr
+
+    from codesight.core.config import Settings
+    from codesight.core.logging import configure_logging
+    from codesight.worker.celery_app import _WorkerAsyncRuntime
+    from codesight.worker.tasks.indexing_tasks import PushSyncRunner
+
+    configure_logging()
+    runtime = _WorkerAsyncRuntime()
+    started_evt = threading.Event()
+    cancelled_evt = threading.Event()
+    recorded_statuses: list[str] = []
+
+    async def _blocking_sync(*_args: Any, **_kwargs: Any) -> Any:
+        started_evt.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled_evt.set()
+            raise
+
+    async def _fake_record(
+        _self: Any,
+        _delivery_id: str | None,
+        *,
+        webhook_status: str,
+        trace_id: str,
+    ) -> None:
+        recorded_statuses.append(webhook_status)
+
+    monkeypatch.setattr(
+        "codesight.worker.tasks.indexing_tasks.IncrementalBranchSyncer.sync_push",
+        _blocking_sync,
+    )
+    monkeypatch.setattr(PushSyncRunner, "_record_webhook_status", _fake_record)
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_pools",
+        lambda _s: asyncio.sleep(0, result=(object(), object(), object())),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_rag_pools",
+        lambda _s: asyncio.sleep(0, result=(object(), None)),
+    )
+
+    test_settings = Settings(
+        _env_file=None,
+        github_token=SecretStr("ghp_test"),
+        gemini_api_key=SecretStr("gem_test"),
+    )
+    payload = {
+        "delivery_id": "deliv-runtime-soft",
+        "repo_id": str(uuid.uuid4()),
+        "repo_full_name": "acme/runtime-soft",
+        "after_sha": "abc1234",
+    }
+
+    orig_result = Future.result
+
+    def _raise_soft_limit_on_main(self: Any, timeout: float | None = None) -> Any:
+        if started_evt.wait(timeout=2.0):
+            raise SoftTimeLimitExceeded()
+        return orig_result(self, timeout=timeout)
+
+    try:
+        with patch.object(Future, "result", _raise_soft_limit_on_main):
+            with pytest.raises(SoftTimeLimitExceeded):
+                runtime.run_push_webhook_task_sync(
+                    payload,
+                    settings=test_settings,
+                    is_final_attempt=False,
+                )
+        assert cancelled_evt.wait(timeout=2.0) is True
+        assert recorded_statuses == []
+
+        started_evt.clear()
+        cancelled_evt.clear()
+        with patch.object(Future, "result", _raise_soft_limit_on_main):
+            with pytest.raises(SoftTimeLimitExceeded):
+                runtime.run_push_webhook_task_sync(
+                    payload,
+                    settings=test_settings,
+                    is_final_attempt=True,
+                )
+        assert cancelled_evt.wait(timeout=2.0) is True
+        assert recorded_statuses == ["failed"]
+    finally:
+        runtime.shutdown()

@@ -19,6 +19,7 @@ import redis.asyncio as redis_async
 import redis.exceptions
 import structlog
 from celery import Celery, Task
+from celery.exceptions import SoftTimeLimitExceeded
 from celery.signals import (
     before_task_publish,
     setup_logging,
@@ -426,11 +427,16 @@ class _WorkerAsyncRuntime:
 
         try:
             return result_future.result()
-        except BaseException:
+        except BaseException as exc:
+            cancel_msg = (
+                f"Cancelled due to {type(exc).__name__}"
+                if isinstance(exc, SoftTimeLimitExceeded)
+                else None
+            )
 
             def _cancel_running() -> None:
                 if task_holder and not task_holder[0].done():
-                    task_holder[0].cancel()
+                    task_holder[0].cancel(cancel_msg)
                 else:
                     result_future.cancel()
 

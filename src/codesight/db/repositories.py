@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Final
 
-from sqlalchemy import or_, select
+from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import Select
 
 from codesight.db.models import Repository
 
@@ -36,6 +37,13 @@ def _should_advance_sha(
     return current_sha == expected_trimmed
 
 
+def _build_repo_select(where_clause: ColumnElement[bool], *, lock_row: bool) -> Select[Repository]:
+    stmt = select(Repository).where(where_clause)
+    if lock_row:
+        return stmt.execution_options(populate_existing=True).with_for_update()
+    return stmt
+
+
 async def _apply_repo_upsert_guarded(
     session: AsyncSession,
     *,
@@ -48,9 +56,12 @@ async def _apply_repo_upsert_guarded(
 ) -> tuple[Repository | None, bool]:
     """Resolve and update Repository row with optional CAS check on `last_indexed_sha`."""
     trimmed_sha = last_indexed_sha[:64] if last_indexed_sha is not None else None
+    lock_row = expected_previous_sha is not _UNSET
     if github_repo_id is None:
         existing = (
-            await session.execute(select(Repository).where(Repository.full_name == full_name))
+            await session.execute(
+                _build_repo_select(Repository.full_name == full_name, lock_row=lock_row)
+            )
         ).scalar_one_or_none()
         if existing is None:
             return None, False
@@ -76,11 +87,12 @@ async def _apply_repo_upsert_guarded(
     rows = list(
         (
             await session.execute(
-                select(Repository).where(
+                _build_repo_select(
                     or_(
                         Repository.github_repo_id == github_repo_id,
                         Repository.full_name == full_name,
-                    )
+                    ),
+                    lock_row=lock_row,
                 )
             )
         )

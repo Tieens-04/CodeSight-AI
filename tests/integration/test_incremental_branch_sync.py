@@ -478,6 +478,32 @@ async def test_f03_upsert_repository_state_recreated_and_renamed_live_postgres(
         assert stale_id == resolved_300
         assert stale_updated is False
 
+        # 4. Concurrent READ COMMITTED race: SELECT ... FOR UPDATE serializes late writer
+        import asyncio
+
+        async with session_factory() as holding_session:
+            await holding_session.execute(
+                sa.update(Repository)
+                .where(Repository.github_repo_id == 300)
+                .values(last_indexed_sha="sha_300_concurrent_newer")
+            )
+            # holding_session holds row lock without committing yet!
+            racing_task = asyncio.create_task(
+                upsert_repository_state(
+                    session_factory,
+                    full_name="acme/api",
+                    default_branch="main",
+                    github_repo_id=300,
+                    last_indexed_sha="sha_300_stale_overwrite",
+                    expected_previous_sha="sha_300_fresh",
+                )
+            )
+            await asyncio.sleep(0.1)
+            await holding_session.commit()
+            race_id, race_updated = await racing_task
+            assert race_id == resolved_300
+            assert race_updated is False
+
         async with session_factory() as session:
             all_rows = (await session.execute(sa.select(Repository))).scalars().all()
             by_gh = {r.github_repo_id: r for r in all_rows}
@@ -485,6 +511,6 @@ async def test_f03_upsert_repository_state_recreated_and_renamed_live_postgres(
             assert by_gh[200].full_name == "acme/api__stale_200"
             assert by_gh[200].last_indexed_sha == "sha_200_renamed"
             assert by_gh[300].full_name == "acme/api"
-            assert by_gh[300].last_indexed_sha == "sha_300_fresh"
+            assert by_gh[300].last_indexed_sha == "sha_300_concurrent_newer"
     finally:
         await engine.dispose()

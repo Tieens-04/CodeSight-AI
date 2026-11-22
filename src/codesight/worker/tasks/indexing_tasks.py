@@ -339,11 +339,18 @@ class PushSyncRunner:
                 "trace_id": active_trace_id,
             }
         except asyncio.CancelledError:
-            await self._record_webhook_status(
-                delivery_id,
-                webhook_status="failed",
-                trace_id=active_trace_id,
-            )
+            if is_final_attempt:
+                await self._record_webhook_status(
+                    delivery_id,
+                    webhook_status="failed",
+                    trace_id=active_trace_id,
+                )
+            else:
+                logger.warning(
+                    "worker_push_sync_cancelled_deferred",
+                    trace_id=active_trace_id,
+                    repo=repo_full_name,
+                )
             raise
         except Exception as exc:
             is_retryable, _ = classify_retryable_exception(exc)
