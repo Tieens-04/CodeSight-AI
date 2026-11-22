@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import math
 import os
 import time
@@ -36,13 +37,17 @@ import sqlalchemy as sa
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from codesight.ast_engine.models import CodeSymbolChunk, PRFileContext
 from codesight.ast_engine.registry import ASTParserRegistry
 from codesight.cli.commands.index import run_cli_index
 from codesight.core.config import Settings
 from codesight.db.models import Base, Repository, WebhookEvent
 from codesight.diff.smart_diff_parser import SmartDiffParser
 from codesight.rag.embedder import GeminiEmbedder
+from codesight.rag.live_eval import (
+    DEFAULT_LIVE_PY_REPO,
+    run_milestone2_live_evaluation,
+    validate_m2_kpi_thresholds,
+)
 from codesight.rag.models import (
     DEFAULT_EMBED_BATCH_SIZE,
     EMBEDDING_DIMENSIONS,
@@ -1745,109 +1750,35 @@ async def test_week2_opt_in_live_github_and_gemini_rag_smoke(
     isolated_qdrant_collection: str,
     zerocode_auditor: Any,
 ) -> None:
-    """Opt-in live smoke indexing & querying real GitHub repo(s) via `gemini-embedding-001`."""
+    """Opt-in live Milestone 2 gate indexing & evaluating real Python + TS/TSX GitHub repos."""
     settings = Settings(qdrant_collection_name=isolated_qdrant_collection)
     if settings.gemini_api_key is None or not settings.gemini_api_key.get_secret_value().strip():
-        pytest.skip("GEMINI_API_KEY is not configured in .env for live Milestone 2 smoke.")
+        pytest.skip("GEMINI_API_KEY is not configured in .env for live Milestone 2 evaluation.")
     if not settings.has_github_credentials:
         pytest.skip(
             "GitHub credentials (GITHUB_TOKEN or GitHub App) are required for live Milestone 2 "
-            "smoke to avoid GitHub's 60 req/hr unauthenticated rate limit."
+            "evaluation to avoid GitHub's 60 req/hr unauthenticated rate limit."
         )
 
-    live_py_repo = os.getenv("CODESIGHT_LIVE_PY_REPO", "Tieens-04/CodeSight-AI").strip()
+    live_py_repo = os.getenv("CODESIGHT_LIVE_PY_REPO", DEFAULT_LIVE_PY_REPO).strip()
     live_ts_repo = os.getenv("CODESIGHT_LIVE_TS_REPO", "").strip()
 
-    async with (
-        _isolated_session_factory(isolated_postgres_dsn) as session_factory,
-        QdrantZeroCodeStore(
+    async with _isolated_session_factory(isolated_postgres_dsn) as session_factory:
+        report = await run_milestone2_live_evaluation(
             settings=settings,
+            py_repo=live_py_repo,
+            ts_repo=live_ts_repo,
             collection_name=isolated_qdrant_collection,
-        ) as store,
-        GeminiEmbedder(settings=settings) as embedder,
-    ):
-        py_report = await run_cli_index(
-            live_py_repo,
-            settings=settings,
             session_factory=session_factory,
-            store=store,
-            embedder=embedder,
+            auditor_module=zerocode_auditor,
         )
-        assert py_report.upserted_points > 0
-        assert py_report.persisted_cursor is True
 
-        # Exercise live RETRIEVAL_QUERY (768-dim) + HybridContextRetriever against indexed repo
-        query_vec = await embedder.embed_query("FastAPI AST RAG Qdrant zero-code persistence")
-        assert len(query_vec) == EMBEDDING_DIMENSIONS
-
-        sample_points = zerocode_auditor.scroll_all_points(
-            settings.qdrant_http_url,
-            isolated_qdrant_collection,
-            page_size=64,
-            max_points=64,
-        )
-        code_payload = next(
-            (
-                pt["payload"]
-                for pt in sample_points
-                if isinstance(pt.get("payload"), dict)
-                and pt["payload"].get("repo_full_name") == live_py_repo
-                and pt["payload"].get("chunk_type") == "code"
-            ),
-            None,
-        )
-        assert code_payload is not None
-        sample_chunk = CodeSymbolChunk(
-            file_path=str(code_payload["file_path"]),
-            language="python",
-            symbol_name=str(code_payload["symbol_name"]),
-            qualified_name=str(code_payload["symbol_name"]),
-            symbol_kind="function",
-            start_line=int(code_payload["start_line"]),
-            end_line=int(code_payload["end_line"]),
-            signature=str(code_payload["signature"]),
-            docstring=None,
-            decorators=(),
-            imports=tuple(str(x) for x in code_payload.get("imports", ())),
-            called_symbols=tuple(str(x) for x in code_payload.get("called_symbols", ())),
-            cyclomatic_complexity=int(code_payload.get("cyclomatic_complexity", 1)),
-            is_async=False,
-        )
-        sample_ctx = PRFileContext(
-            file_path=sample_chunk.file_path,
-            mode="ast",
-            language="python",
-            parsed_file=None,
-            touched_chunks=(sample_chunk,),
-        )
-        retriever = HybridContextRetriever(
-            store=store,
-            embedder=embedder,
-            doc_score_threshold=0.0,
-        )
-        live_retrieval = await retriever.retrieve(
-            [sample_ctx],
-            repo_full_name=live_py_repo,
-        )
-        assert live_retrieval.doc_search_degraded is False
-        assert live_retrieval.query_text is not None
-
-        if live_ts_repo:
-            ts_report = await run_cli_index(
-                live_ts_repo,
-                settings=settings,
-                session_factory=session_factory,
-                store=store,
-                embedder=embedder,
-            )
-            assert ts_report.upserted_points > 0
-
-        assert (
-            zerocode_auditor.audit_live_collection(
-                settings.qdrant_http_url,
-                isolated_qdrant_collection,
-                scan_all=True,
-                strict_indexes=True,
-            )
-            == 0
-        )
+    print(json.dumps(report.to_dict(), indent=2))
+    assert report.py_repo
+    assert report.ts_repo
+    assert report.recall_at_5 >= 0.85
+    assert report.p50_retrieval_ms < 850.0
+    assert report.tokens_saved_pct >= 45.0
+    assert report.zerocode_violations == 0
+    assert report.disk_violations == ()
+    assert validate_m2_kpi_thresholds(report) == []
