@@ -1386,3 +1386,128 @@ async def test_production_missing_credentials_fails_loud_and_runtime_cancels_on_
         assert cancelled_evt.wait(timeout=2.0) is True
     finally:
         runtime.shutdown()
+
+
+async def test_runner_cancelled_error_defers_retry_and_final_attempt_records_failure() -> None:
+    import uuid
+
+    from codesight.db.models import PRReview
+
+    repo_uuid = str(uuid.uuid4())
+
+    class _CancelAuditSession:
+        def __init__(self, *, updates: list[dict[str, Any]], added: list[Any]) -> None:
+            self._updates = updates
+            self._added = added
+
+        async def __aenter__(self) -> _CancelAuditSession:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def execute(self, stmt: Any) -> None:
+            self._updates.append(dict(stmt.compile().params))
+
+        async def scalar(self, stmt: Any) -> Any:
+            sql = str(stmt)
+            if "webhook_events" in sql:
+                return "queued"
+            return uuid.UUID(repo_uuid)
+
+        def add(self, obj: Any) -> None:
+            self._added.append(obj)
+
+        async def commit(self) -> None:
+            return None
+
+    async def _run_cancel_case(
+        *, is_final_attempt: bool
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[Any], list[dict[str, Any]]]:
+        patches: list[dict[str, Any]] = []
+        updates: list[dict[str, Any]] = []
+        added: list[Any] = []
+        sessions_opened = 0
+
+        def _session_factory() -> _CancelAuditSession:
+            nonlocal sessions_opened
+            sessions_opened += 1
+            return _CancelAuditSession(updates=updates, added=added)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8")) if request.content else {}
+            if request.url.path.endswith((".codesight.yaml", ".codesight.yml")):
+                return httpx.Response(404)
+            if request.url.path == "/repos/acme/api/check-runs" and request.method == "POST":
+                return httpx.Response(201, json={"id": 7001, "status": "in_progress"})
+            if request.url.path == "/repos/acme/api/pulls/31" and request.method == "GET":
+                raise asyncio.CancelledError("Cancelled due to SoftTimeLimitExceeded")
+            if request.url.path == "/repos/acme/api/check-runs/7001" and request.method == "PATCH":
+                patches.append(body)
+                return httpx.Response(200, json={"id": 7001, "status": "completed"})
+            return httpx.Response(404)
+
+        redis_mem = _InMemoryAsyncRedis()
+        redis_mem.store[pr_active_sha_key(repo_uuid, 31)] = "sha-cancel-31"
+        settings = Settings(_env_file=None, github_token=SecretStr("ghp_runner_test"))
+        payload = {
+            "delivery_id": f"deliv-cancel-{is_final_attempt}",
+            "repo_id": repo_uuid,
+            "repo_full_name": "acme/api",
+            "default_branch": "main",
+            "pr_number": 31,
+            "head_sha": "sha-cancel-31",
+        }
+        log_stream = io.StringIO()
+        configure_logging(level="WARNING", service_name="test-pr-cancel", stream=log_stream)
+        try:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                runner = Week1PRReviewRunner(
+                    settings=settings,
+                    http_client=client,
+                    session_factory=_session_factory,  # type: ignore[arg-type]
+                    redis_client=redis_mem,  # type: ignore[arg-type]
+                )
+                with pytest.raises(asyncio.CancelledError):
+                    await runner.execute(payload, is_final_attempt=is_final_attempt)
+        finally:
+            configure_logging()
+            clear_trace_context()
+
+        log_entries = [
+            json.loads(line) for line in log_stream.getvalue().strip().splitlines() if line.strip()
+        ]
+        if not is_final_attempt:
+            # Only the entry idempotency check opens a session; no failure audit is written
+            assert sessions_opened == 1
+        else:
+            assert sessions_opened == 2
+        return patches, updates, added, log_entries
+
+    # 1. Non-final attempt: neutral Retry Scheduled Check Run, zero failed DB writes, warning log
+    patches_retry, updates_retry, added_retry, logs_retry = await _run_cancel_case(
+        is_final_attempt=False
+    )
+    assert len(patches_retry) == 1
+    assert patches_retry[0]["conclusion"] == "neutral"
+    assert "Retry Scheduled" in patches_retry[0]["output"]["title"]
+    assert updates_retry == []
+    assert added_retry == []
+    assert any(
+        entry.get("event") == "worker_pr_review_cancelled_deferred"
+        and entry.get("level") == "warning"
+        and entry.get("trace_id") == "deliv-cancel-False"
+        for entry in logs_retry
+    )
+
+    # 2. Final attempt: terminal failure Check Run + failed PRReview & WebhookEvent audit
+    patches_final, updates_final, added_final, _logs_final = await _run_cancel_case(
+        is_final_attempt=True
+    )
+    assert len(patches_final) == 1
+    assert patches_final[0]["conclusion"] == "failure"
+    assert patches_final[0]["output"]["title"] == "CodeSight-AI Review Timed Out"
+    assert len(updates_final) == 1
+    assert updates_final[0].get("status") == "failed"
+    assert len(added_final) == 1 and isinstance(added_final[0], PRReview)
+    assert added_final[0].status == "failed"

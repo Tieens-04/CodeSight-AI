@@ -640,24 +640,44 @@ class Week1PRReviewRunner:
             return {"status": "completed", "trace_id": res["trace_id"]}
         except asyncio.CancelledError:
             trace_id = get_trace_id() or "-"
+            will_retry_cancel = not is_final_attempt
+            if will_retry_cancel:
+                logger.warning(
+                    "worker_pr_review_cancelled_deferred",
+                    trace_id=trace_id,
+                    repo=repo_full_name,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    check_run_id=check_run_id,
+                )
             if check_run_id is not None and not check_run_finalized:
                 check_run_finalized = True
+                cancel_conclusion: CheckConclusion = "neutral" if will_retry_cancel else "failure"
+                cancel_title = (
+                    "CodeSight-AI Review Retry Scheduled"
+                    if will_retry_cancel
+                    else "CodeSight-AI Review Timed Out"
+                )
+                cancel_summary = (
+                    f"Review execution for {head_sha[:12]} was interrupted before completion; "
+                    "Celery backoff retry scheduled."
+                    if will_retry_cancel
+                    else f"Review execution for {head_sha[:12]} was cancelled before completion."
+                )
                 await _safe_complete_check_run(
                     publisher,
                     repo_full_name=repo_full_name,
                     check_run_id=check_run_id,
-                    conclusion="failure",
-                    title="CodeSight-AI Review Timed Out",
-                    summary=(
-                        f"Review execution for {head_sha[:12]} was cancelled before completion."
-                    ),
+                    conclusion=cancel_conclusion,
+                    title=cancel_title,
+                    summary=cancel_summary,
                     installation_id=installation_id,
                     trace_id=trace_id,
                     pr_number=pr_number,
                     head_sha=head_sha,
                     failed_event="worker_pr_check_run_error_cleanup_failed",
                 )
-            if not audit_recorded:
+            if not will_retry_cancel and not audit_recorded:
                 latency_ms = max(0, int((time.perf_counter() - started_perf) * 1000))
                 tokens_pct = (
                     fetched_diff.parsed_diff.metrics.tokens_saved_pct

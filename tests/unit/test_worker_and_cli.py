@@ -438,3 +438,273 @@ def test_worker_runtime_soft_time_limit_cancels_coro_without_premature_failed_st
         assert recorded_statuses == ["failed"]
     finally:
         runtime.shutdown()
+
+
+def test_worker_runtime_pr_soft_time_limit_cancels_coro_without_premature_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import threading
+    import uuid
+    from concurrent.futures import Future
+    from typing import Any
+    from unittest.mock import patch
+
+    import httpx
+    from billiard.exceptions import SoftTimeLimitExceeded
+    from pydantic import SecretStr
+
+    from codesight.core.config import Settings
+    from codesight.core.logging import configure_logging
+    from codesight.db.models import PRReview
+    from codesight.worker.celery_app import _WorkerAsyncRuntime
+    from codesight.worker.supersede_lock import pr_active_sha_key
+
+    configure_logging()
+    runtime = _WorkerAsyncRuntime()
+    started_evt = threading.Event()
+    cancelled_evt = threading.Event()
+    repo_uuid = str(uuid.uuid4())
+    head_sha = "sha-pr-soft-limit"
+    patch_bodies: list[dict[str, Any]] = []
+    db_updates: list[dict[str, Any]] = []
+    added_rows: list[Any] = []
+
+    class _FakeRedis:
+        def __init__(self) -> None:
+            self._store: dict[str, str] = {pr_active_sha_key(repo_uuid, 44): head_sha}
+
+        async def get(self, key: str) -> str | None:
+            return self._store.get(key)
+
+    class _FakeSession:
+        async def __aenter__(self) -> "_FakeSession":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def execute(self, stmt: Any) -> None:
+            db_updates.append(dict(stmt.compile().params))
+
+        async def scalar(self, stmt: Any) -> Any:
+            if "webhook_events" in str(stmt):
+                return "queued"
+            return uuid.UUID(repo_uuid)
+
+        def add(self, obj: Any) -> None:
+            added_rows.append(obj)
+
+        async def commit(self) -> None:
+            return None
+
+    def _gh_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if request.url.path.endswith((".codesight.yaml", ".codesight.yml")):
+            return httpx.Response(404)
+        if request.url.path.endswith("/check-runs") and request.method == "POST":
+            return httpx.Response(201, json={"id": 8101, "status": "in_progress"})
+        if request.url.path.endswith("/check-runs/8101") and request.method == "PATCH":
+            patch_bodies.append(body)
+            return httpx.Response(200, json={"id": 8101, "status": "completed"})
+        return httpx.Response(404)
+
+    async def _blocking_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        started_evt.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled_evt.set()
+            raise
+
+    monkeypatch.setattr(
+        "codesight.worker.pr_review_runner.GitHubPullRequestClient.fetch_pull_request_diff",
+        _blocking_fetch,
+    )
+
+    test_settings = Settings(_env_file=None, github_token=SecretStr("ghp_test"))
+    payload = {
+        "delivery_id": "deliv-pr-runtime-soft",
+        "repo_id": repo_uuid,
+        "repo_full_name": "acme/pr-soft",
+        "default_branch": "main",
+        "pr_number": 44,
+        "head_sha": head_sha,
+    }
+    fake_redis = _FakeRedis()
+    orig_result = Future.result
+    main_thread = threading.current_thread()
+
+    def _raise_soft_limit_on_main(self: Any, timeout: float | None = None) -> Any:
+        if threading.current_thread() is not main_thread:
+            return orig_result(self, timeout=timeout)
+        if started_evt.wait(timeout=5.0):
+            raise SoftTimeLimitExceeded()
+        raise TimeoutError("Timed out waiting for _blocking_fetch to start")
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(_gh_handler))
+
+    async def _fake_ensure_pools(_s: Settings) -> tuple[Any, Any, Any]:
+        return http_client, fake_redis, lambda: _FakeSession()
+
+    monkeypatch.setattr(runtime, "_ensure_pools", _fake_ensure_pools)
+
+    try:
+        with patch.object(Future, "result", _raise_soft_limit_on_main):
+            with pytest.raises(SoftTimeLimitExceeded):
+                runtime.run_pr_webhook_task_sync(
+                    payload,
+                    settings=test_settings,
+                    is_final_attempt=False,
+                )
+        assert cancelled_evt.wait(timeout=2.0) is True
+        assert len(patch_bodies) == 1
+        assert patch_bodies[0]["conclusion"] == "neutral"
+        assert "Retry Scheduled" in patch_bodies[0]["output"]["title"]
+        assert db_updates == []
+        assert added_rows == []
+
+        started_evt.clear()
+        cancelled_evt.clear()
+        patch_bodies.clear()
+        with patch.object(Future, "result", _raise_soft_limit_on_main):
+            with pytest.raises(SoftTimeLimitExceeded):
+                runtime.run_pr_webhook_task_sync(
+                    payload,
+                    settings=test_settings,
+                    is_final_attempt=True,
+                )
+        assert cancelled_evt.wait(timeout=2.0) is True
+        assert len(patch_bodies) == 1
+        assert patch_bodies[0]["conclusion"] == "failure"
+        assert patch_bodies[0]["output"]["title"] == "CodeSight-AI Review Timed Out"
+        assert len(db_updates) == 1 and db_updates[0].get("status") == "failed"
+        assert len(added_rows) == 1 and isinstance(added_rows[0], PRReview)
+        assert added_rows[0].status == "failed"
+    finally:
+        runtime.run_coro(http_client.aclose())
+        runtime.shutdown()
+
+
+def test_codesight_task_schedules_retry_on_soft_time_limit_for_pr_and_push_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import Any
+    from unittest.mock import MagicMock
+
+    from billiard.exceptions import SoftTimeLimitExceeded
+    from pydantic import SecretStr
+
+    from codesight.core.config import Settings
+    from codesight.worker.celery_app import _WORKER_RUNTIME, handle_pr_event, handle_push_event
+
+    test_settings = Settings(
+        _env_file=None,
+        github_token=SecretStr("ghp_test"),
+        gemini_api_key=SecretStr("gem_test"),
+    )
+    monkeypatch.setattr("codesight.worker.celery_app.get_settings", lambda: test_settings)
+    monkeypatch.setattr(
+        "codesight.worker.celery_app.is_pr_event_superseded",
+        lambda *_args, **_kwargs: False,
+    )
+
+    pr_final_flags: list[bool] = []
+    push_final_flags: list[bool] = []
+
+    def _raise_pr_soft_limit(
+        _payload: Any,
+        *,
+        settings: Settings | None = None,
+        is_final_attempt: bool = False,
+    ) -> dict[str, str]:
+        pr_final_flags.append(is_final_attempt)
+        raise SoftTimeLimitExceeded()
+
+    def _raise_push_soft_limit(
+        _payload: Any,
+        *,
+        settings: Settings | None = None,
+        is_final_attempt: bool = False,
+    ) -> dict[str, str]:
+        push_final_flags.append(is_final_attempt)
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(_WORKER_RUNTIME, "run_pr_webhook_task_sync", _raise_pr_soft_limit)
+    monkeypatch.setattr(_WORKER_RUNTIME, "run_push_webhook_task_sync", _raise_push_soft_limit)
+
+    retry_sentinel = RuntimeError("celery-retry-scheduled")
+    pr_retry_mock = MagicMock(side_effect=retry_sentinel)
+    push_retry_mock = MagicMock(side_effect=retry_sentinel)
+    monkeypatch.setattr(handle_pr_event, "retry", pr_retry_mock)
+    monkeypatch.setattr(handle_push_event, "retry", push_retry_mock)
+
+    pr_payload = {
+        "delivery_id": "deliv-pr-task-soft",
+        "repo_id": "repo-pr-1",
+        "repo_full_name": "acme/pr-app",
+        "pr_number": 7,
+        "head_sha": "sha-pr-7",
+    }
+    push_payload = {
+        "delivery_id": "deliv-push-task-soft",
+        "repo_id": "repo-push-1",
+        "repo_full_name": "acme/push-app",
+        "ref": "refs/heads/main",
+        "default_branch": "main",
+        "after_sha": "sha-push-1",
+    }
+
+    # 1. Non-final attempt on handle_pr_event schedules Celery retry with SoftTimeLimitExceeded
+    handle_pr_event.push_request(id="pr-task-1", retries=0, called_directly=False)
+    try:
+        with pytest.raises(RuntimeError, match="celery-retry-scheduled"):
+            handle_pr_event(pr_payload)
+    finally:
+        handle_pr_event.pop_request()
+    assert pr_final_flags == [False]
+    pr_retry_mock.assert_called_once()
+    _, pr_kwargs = pr_retry_mock.call_args
+    assert isinstance(pr_kwargs["exc"], SoftTimeLimitExceeded)
+    assert 5.0 <= pr_kwargs["countdown"] <= 6.0
+    assert pr_kwargs["max_retries"] == MAX_TASK_RETRIES
+
+    # 2. Final attempt on handle_pr_event sets is_final_attempt=True and does not schedule retry
+    pr_retry_mock.reset_mock()
+    handle_pr_event.push_request(
+        id="pr-task-final", retries=MAX_TASK_RETRIES, called_directly=False
+    )
+    try:
+        with pytest.raises(SoftTimeLimitExceeded):
+            handle_pr_event(pr_payload)
+    finally:
+        handle_pr_event.pop_request()
+    assert pr_final_flags == [False, True]
+    pr_retry_mock.assert_not_called()
+
+    # 3. Non-final attempt on handle_push_event schedules Celery retry with SoftTimeLimitExceeded
+    handle_push_event.push_request(id="push-task-1", retries=0, called_directly=False)
+    try:
+        with pytest.raises(RuntimeError, match="celery-retry-scheduled"):
+            handle_push_event(push_payload)
+    finally:
+        handle_push_event.pop_request()
+    assert push_final_flags == [False]
+    push_retry_mock.assert_called_once()
+    _, push_kwargs = push_retry_mock.call_args
+    assert isinstance(push_kwargs["exc"], SoftTimeLimitExceeded)
+    assert 5.0 <= push_kwargs["countdown"] <= 6.0
+    assert push_kwargs["max_retries"] == MAX_TASK_RETRIES
+
+    # 4. Final attempt on handle_push_event sets is_final_attempt=True and does not schedule retry
+    push_retry_mock.reset_mock()
+    handle_push_event.push_request(
+        id="push-task-final", retries=MAX_TASK_RETRIES, called_directly=False
+    )
+    try:
+        with pytest.raises(SoftTimeLimitExceeded):
+            handle_push_event(push_payload)
+    finally:
+        handle_push_event.pop_request()
+    assert push_final_flags == [False, True]
+    push_retry_mock.assert_not_called()
