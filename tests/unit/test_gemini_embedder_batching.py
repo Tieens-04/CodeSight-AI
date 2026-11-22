@@ -1630,3 +1630,74 @@ export type Cond<T> = T extends string ? pass : raise;
             assert all(it.peek_embedding_text() is None for it in items)
         finally:
             loop.set_exception_handler(prev_handler)
+
+
+def test_zerocode_auditor_hardening_ident_canaries_signature_and_cli(
+    zerocode_auditor: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[CA-16/F-02] Auditor rejects flag/traversal idents, CRLF canaries, body leaks, bad CLI."""
+    # 1. Leading hyphen flag injection, path traversal '..', and sibling project containers rejected
+    for bad_container in ("--help", "-u", ".", "..", "flintflow-api", "documind-qdrant"):
+        with pytest.raises(ValueError):
+            zerocode_auditor.scan_container_storage_for_canaries(
+                bad_container, "codesight_ast_index", ("CANARY_1",)
+            )
+    for bad_collection in ("--all", ".", "..", "a..b", "col/sub"):
+        with pytest.raises(ValueError):
+            zerocode_auditor.scan_container_storage_for_canaries(
+                "codesight-qdrant", bad_collection, ("CANARY_1",)
+            )
+        with pytest.raises(ValueError):
+            zerocode_auditor.scroll_all_points("http://127.0.0.1:6333", bad_collection)
+        with pytest.raises(ValueError):
+            zerocode_auditor.audit_live_collection("http://127.0.0.1:6333", bad_collection)
+
+    # 2. Control characters (\r, \n, \x00) and whitespace-only canaries rejected
+    for bad_canary in ("", "   ", "\n", "SECRET\r", "SECRET\n", "SEC\x00RET"):
+        with pytest.raises(ValueError):
+            zerocode_auditor.scan_container_storage_for_canaries(
+                "codesight-qdrant", "codesight_ast_index", (bad_canary,)
+            )
+        with pytest.raises(ValueError):
+            zerocode_auditor.audit_payloads([], canary_substrings=(bad_canary,))
+
+    # 3. Quoted canary detected in raw payload strings (not bypassed by JSON escaping)
+    quoted_pt = [
+        {
+            "id": "p-quote",
+            "payload": {
+                "file_path": "a.py",
+                "signature": 'def f(tok: str = "SECRET_VAL")',
+            },
+        }
+    ]
+    quote_errs = zerocode_auditor.audit_payloads(quoted_pt, canary_substrings=('"SECRET_VAL"',))
+    assert any("canary" in err for err in quote_errs), quote_errs
+
+    # 4. Multi-line assignment body, single-line inline body, and non-str signature all detected
+    leaky_sigs = [
+        {"id": "s1", "payload": {"file_path": "a.py", "signature": "def f():\n    x = secret"}},
+        {"id": "s2", "payload": {"file_path": "b.py", "signature": "def f(): return secret"}},
+        {"id": "s3", "payload": {"file_path": "c.py", "signature": 12345}},
+    ]
+    sig_errs = zerocode_auditor.audit_payloads(leaky_sigs)
+    assert len(sig_errs) == 3, sig_errs
+
+    # 5. sample_limit <= 0 (when not scan_all) and --container without --canary must fail fast
+    with pytest.raises(ValueError):
+        zerocode_auditor.scroll_all_points(
+            "http://127.0.0.1:6333", "codesight_ast_index", max_points=0
+        )
+    with pytest.raises(ValueError):
+        zerocode_auditor.audit_live_collection(
+            "http://127.0.0.1:6333", "codesight_ast_index", sample_limit=0, scan_all=False
+        )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["audit_qdrant_zerocode.py", "--container", "codesight-qdrant"],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        zerocode_auditor.main()
+    assert exc_info.value.code == 2

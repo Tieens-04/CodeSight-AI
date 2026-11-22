@@ -1341,3 +1341,320 @@ async def test_retriever_handles_deleted_renamed_oversize_hunk_module_edit_and_s
         )
     assert mod_assembled.packed_bundle.metrics.baseline_tokens > 0
     assert mod_assembled.packed_bundle.metrics.tokens_saved_pct >= 45.0
+
+
+@pytest.mark.asyncio
+async def test_retriever_finds_callers_for_renamed_and_deleted_symbols_from_complexity_deltas() -> (
+    None
+):
+    """[CA-16] Signature rename & pure deletion query Qdrant/local callers via removed deltas."""
+    from codesight.ast_engine.registry import ASTParserRegistry
+    from codesight.diff.smart_diff_parser import SmartDiffParser
+    from codesight.rag.retriever import HybridContextRetriever
+
+    registry = ASTParserRegistry()
+
+    # Case 1: Service function renamed (`calculate_vat_breakdown` -> `compute_regional_vat`),
+    # plus a sibling untouched function in the same file still calling the old symbol name.
+    before_rename = (
+        b"from src.tax.rate_table import lookup_country_vat_rate\n\n"
+        b"def calculate_vat_breakdown(subtotal: int, country: str) -> int:\n"
+        b"    rate = lookup_country_vat_rate(country)\n"
+        b"    return int(subtotal * rate)\n\n"
+        b"def preview_local_vat(subtotal: int) -> int:\n"
+        b"    return calculate_vat_breakdown(subtotal, 'VN')\n"
+    )
+    after_rename = (
+        b"from src.tax.rate_table import lookup_country_vat_rate\n\n"
+        b"def compute_regional_vat(subtotal: int, country: str, include_duty: bool) -> int:\n"
+        b"    rate = lookup_country_vat_rate(country)\n"
+        b"    return int(subtotal * rate)\n\n"
+        b"def preview_local_vat(subtotal: int) -> int:\n"
+        b"    return calculate_vat_breakdown(subtotal, 'VN')\n"
+    )
+    rename_diff_text = (
+        "diff --git a/src/services/tax_service.py b/src/services/tax_service.py\n"
+        "--- a/src/services/tax_service.py\n"
+        "+++ b/src/services/tax_service.py\n"
+        "@@ -3,3 +3,3 @@ from src.tax.rate_table import lookup_country_vat_rate\n"
+        "-def calculate_vat_breakdown(subtotal: int, country: str) -> int:\n"
+        "+def compute_regional_vat(subtotal: int, country: str, include_duty: bool) -> int:\n"
+        "     rate = lookup_country_vat_rate(country)\n"
+        "     return int(subtotal * rate)\n"
+    )
+    rename_diff = SmartDiffParser().parse_diff(rename_diff_text)
+    rename_ctx = registry.resolve_pr_file(
+        rename_diff.files[0],
+        after_source=after_rename,
+        before_source=before_rename,
+    )
+
+    caller_pt = _make_qdrant_point(
+        point_id="00000000-0000-5000-8000-000000000101",
+        file_path="src/api/checkout_router.py",
+        blob_sha="c" * 40,
+        symbol_name="submit_checkout_endpoint",
+        called_symbols=["calculate_vat_breakdown"],
+        imports=["src.services.tax_service.calculate_vat_breakdown"],
+    )
+    doc_pt = _make_qdrant_point(
+        point_id="00000000-0000-5000-8000-000000000102",
+        file_path="docs/adr/0003-regional-vat.md",
+        blob_sha="d" * 40,
+        symbol_name="Regional VAT Rules",
+        symbol_kind="section",
+        chunk_type="architecture_doc",
+        language="markdown",
+        score=0.84,
+    )
+    store = _StubQdrantStore(callers=(caller_pt,), docs=(doc_pt,))
+    embedder = _StubEmbedder()
+    retriever = HybridContextRetriever(store=store, embedder=embedder)  # type: ignore[arg-type]
+
+    res = await retriever.retrieve(
+        [rename_ctx],
+        repo_full_name="acme/app",
+        parsed_diff=rename_diff,
+        head_ref="pr-rename-sha",
+    )
+
+    assert "compute_regional_vat" in store.called_symbols_queries[0]
+    assert "calculate_vat_breakdown" in store.called_symbols_queries[0]
+    caller_names = {c.symbol_name for c in res.callers}
+    assert "submit_checkout_endpoint" in caller_names
+    assert "preview_local_vat" in caller_names
+    assert res.query_text is not None
+    assert "calculate_vat_breakdown" in res.query_text
+
+    # Case 2: Pure function deletion (removed symbol + noise 'get'; 0 touched_chunks)
+    before_delete = (
+        b"def keep_unchanged(x: int) -> int:\n"
+        b"    return x + 1\n\n"
+        b"LEGACY_FLAG = True\n\n"
+        b"def legacy_sync_helper(order_id: str) -> str:\n"
+        b"    return order_id.strip()\n\n"
+        b"def get(key: str) -> str:\n"
+        b"    return key\n"
+    )
+    after_delete = b"def keep_unchanged(x: int) -> int:\n    return x + 1\n\nLEGACY_FLAG = True\n"
+    delete_diff_text = (
+        "diff --git a/src/services/legacy_service.py b/src/services/legacy_service.py\n"
+        "--- a/src/services/legacy_service.py\n"
+        "+++ b/src/services/legacy_service.py\n"
+        "@@ -4,7 +4,1 @@ LEGACY_FLAG = True\n"
+        " LEGACY_FLAG = True\n"
+        "-\n"
+        "-def legacy_sync_helper(order_id: str) -> str:\n"
+        "-    return order_id.strip()\n"
+        "-\n"
+        "-def get(key: str) -> str:\n"
+        "-    return key\n"
+    )
+    delete_diff = SmartDiffParser().parse_diff(delete_diff_text)
+    delete_ctx = registry.resolve_pr_file(
+        delete_diff.files[0],
+        after_source=after_delete,
+        before_source=before_delete,
+    )
+    assert delete_ctx.touched_chunks == ()
+
+    del_caller_pt = _make_qdrant_point(
+        point_id="00000000-0000-5000-8000-000000000103",
+        file_path="src/api/admin_router.py",
+        blob_sha="e" * 40,
+        symbol_name="trigger_legacy_sync",
+        called_symbols=["legacy_sync_helper"],
+        imports=["src.services.legacy_service.legacy_sync_helper"],
+    )
+    del_store = _StubQdrantStore(callers=(del_caller_pt,), docs=(doc_pt,))
+    del_embedder = _StubEmbedder()
+    del_retriever = HybridContextRetriever(
+        store=del_store,  # type: ignore[arg-type]
+        embedder=del_embedder,  # type: ignore[arg-type]
+    )
+
+    del_res = await del_retriever.retrieve(
+        [delete_ctx],
+        repo_full_name="acme/app",
+        parsed_diff=delete_diff,
+        head_ref="pr-del-sha",
+    )
+
+    assert del_store.called_symbols_queries == [["legacy_sync_helper"]]
+    assert [c.symbol_name for c in del_res.callers] == ["trigger_legacy_sync"]
+    assert del_res.query_text is not None
+    assert "legacy_sync_helper" in del_res.query_text
+
+
+@pytest.mark.asyncio
+async def test_retriever_finds_callers_for_renamed_classes_schemas_and_ts_interfaces() -> None:
+    """[CA-16/F-01] Class/schema/interface renames find callers without false-removing methods."""
+    from codesight.ast_engine.models import ComplexityDelta, ComplexityDiffSummary, PRFileContext
+    from codesight.ast_engine.registry import ASTParserRegistry
+    from codesight.diff.smart_diff_parser import SmartDiffParser
+    from codesight.rag.retriever import HybridContextRetriever, _extract_removed_symbol_names
+
+    registry = ASTParserRegistry()
+
+    # Case 1: Python class renamed while its method `execute_order` remains untouched
+    before_py_cls = (
+        b"class OrderProcessor:\n"
+        b"    def execute_order(self, order_id: str) -> bool:\n"
+        b"        return bool(order_id)\n\n"
+        b"class OrderCreateRequest:\n"
+        b"    def __init__(self, order_id: str) -> None:\n"
+        b"        self.order_id = order_id\n"
+    )
+    after_py_cls = (
+        b"class AsyncOrderProcessor:\n"
+        b"    def execute_order(self, order_id: str) -> bool:\n"
+        b"        return bool(order_id)\n\n"
+        b"class CreateOrderPayload:\n"
+        b"    def __init__(self, order_id: str) -> None:\n"
+        b"        self.order_id = order_id\n"
+    )
+    py_cls_diff = SmartDiffParser().parse_diff(
+        "diff --git a/src/services/order_processor.py b/src/services/order_processor.py\n"
+        "--- a/src/services/order_processor.py\n"
+        "+++ b/src/services/order_processor.py\n"
+        "@@ -1,6 +1,6 @@\n"
+        "-class OrderProcessor:\n"
+        "+class AsyncOrderProcessor:\n"
+        "     def execute_order(self, order_id: str) -> bool:\n"
+        "         return bool(order_id)\n"
+        " \n"
+        "-class OrderCreateRequest:\n"
+        "+class CreateOrderPayload:\n"
+        "     def __init__(self, order_id: str) -> None:\n"
+    )
+    py_cls_ctx = registry.resolve_pr_file(
+        py_cls_diff.files[0],
+        after_source=after_py_cls,
+        before_source=before_py_cls,
+    )
+    assert py_cls_ctx.removed_symbols == ("OrderProcessor", "OrderCreateRequest")
+    assert "execute_order" not in py_cls_ctx.removed_symbols
+
+    cls_caller_pt = _make_qdrant_point(
+        point_id="00000000-0000-5000-8000-000000000104",
+        file_path="src/api/orders_router.py",
+        blob_sha="f" * 40,
+        symbol_name="create_order_endpoint",
+        called_symbols=["OrderProcessor", "OrderCreateRequest"],
+        imports=["src.services.order_processor.OrderProcessor"],
+    )
+    cls_store = _StubQdrantStore(callers=(cls_caller_pt,))
+    cls_retriever = HybridContextRetriever(store=cls_store, embedder=_StubEmbedder())  # type: ignore[arg-type]
+    cls_res = await cls_retriever.retrieve(
+        [py_cls_ctx],
+        repo_full_name="acme/app",
+        parsed_diff=py_cls_diff,
+        head_ref="pr-cls-sha",
+    )
+    assert "OrderProcessor" in cls_store.called_symbols_queries[0]
+    assert "OrderCreateRequest" in cls_store.called_symbols_queries[0]
+    assert "execute_order" not in cls_store.called_symbols_queries[0]
+    assert [c.symbol_name for c in cls_res.callers] == ["create_order_endpoint"]
+    assert cls_res.query_text is not None
+    assert "removed OrderProcessor" in cls_res.query_text
+    assert "removed execute_order" not in cls_res.query_text
+
+    # Case 2: TypeScript interface + class renamed while method `submitOrder` stays untouched
+    before_ts_cls = (
+        b"export interface CartSummary {\n"
+        b"  cartId: string;\n"
+        b"}\n\n"
+        b"export class CheckoutCoordinator {\n"
+        b"  submitOrder(id: string): boolean {\n"
+        b"    return Boolean(id);\n"
+        b"  }\n"
+        b"}\n"
+    )
+    after_ts_cls = (
+        b"export interface VerifiedCartSummary {\n"
+        b"  cartId: string;\n"
+        b"}\n\n"
+        b"export class AsyncCheckoutCoordinator {\n"
+        b"  submitOrder(id: string): boolean {\n"
+        b"    return Boolean(id);\n"
+        b"  }\n"
+        b"}\n"
+    )
+    ts_cls_diff = SmartDiffParser().parse_diff(
+        "diff --git a/web/src/checkoutCoordinator.ts b/web/src/checkoutCoordinator.ts\n"
+        "--- a/web/src/checkoutCoordinator.ts\n"
+        "+++ b/web/src/checkoutCoordinator.ts\n"
+        "@@ -1,6 +1,6 @@\n"
+        "-export interface CartSummary {\n"
+        "+export interface VerifiedCartSummary {\n"
+        "   cartId: string;\n"
+        " }\n"
+        " \n"
+        "-export class CheckoutCoordinator {\n"
+        "+export class AsyncCheckoutCoordinator {\n"
+        "   submitOrder(id: string): boolean {\n"
+    )
+    ts_cls_ctx = registry.resolve_pr_file(
+        ts_cls_diff.files[0],
+        after_source=after_ts_cls,
+        before_source=before_ts_cls,
+    )
+    assert ts_cls_ctx.removed_symbols == ("CartSummary", "CheckoutCoordinator")
+    assert "submitOrder" not in ts_cls_ctx.removed_symbols
+
+    # Case 3: Surviving parent class removes a method while sibling class keeps same method name
+    before_method_del = (
+        b"class PrimaryWorker:\n"
+        b"    def run_job(self) -> int:\n"
+        b"        return 1\n\n"
+        b"class BackupWorker:\n"
+        b"    def run_job(self) -> int:\n"
+        b"        return 2\n"
+    )
+    after_method_del = (
+        b"class PrimaryWorker:\n"
+        b"    def execute_job(self) -> int:\n"
+        b"        return 1\n\n"
+        b"class BackupWorker:\n"
+        b"    def run_job(self) -> int:\n"
+        b"        return 2\n"
+    )
+    method_del_diff = SmartDiffParser().parse_diff(
+        "diff --git a/src/workers/jobs.py b/src/workers/jobs.py\n"
+        "--- a/src/workers/jobs.py\n"
+        "+++ b/src/workers/jobs.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " class PrimaryWorker:\n"
+        "-    def run_job(self) -> int:\n"
+        "+    def execute_job(self) -> int:\n"
+        "         return 1\n"
+    )
+    method_del_ctx = registry.resolve_pr_file(
+        method_del_diff.files[0],
+        after_source=after_method_del,
+        before_source=before_method_del,
+    )
+    assert method_del_ctx.removed_symbols == ("run_job",)
+
+    # Case 4: Manual PRFileContext stub without parsed_file still falls back to complexity deltas
+    manual_stub = PRFileContext(
+        file_path="src/manual.py",
+        mode="ast",
+        parsed_file=None,
+        complexity=ComplexityDiffSummary(
+            deltas=(
+                ComplexityDelta(
+                    symbol_name="manual_removed_fn",
+                    qualified_name="manual_removed_fn",
+                    change_kind="removed",
+                    before_cc=2,
+                    after_cc=0,
+                    delta_cc=-2,
+                ),
+            ),
+            net_delta_cc=-2,
+            max_delta_cc=0,
+            max_after_cc=0,
+        ),
+    )
+    assert _extract_removed_symbol_names(manual_stub) == ("manual_removed_fn",)
