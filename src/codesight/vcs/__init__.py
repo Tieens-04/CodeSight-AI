@@ -1,5 +1,18 @@
 """Version control and GitHub integrations."""
 
+from codesight.vcs.blob_fetcher import (
+    DEFAULT_BLOB_FETCH_CONCURRENCY,
+    MAX_BLOB_FETCH_BYTES,
+    BlobBatchFetchReport,
+    BlobDecodeStatus,
+    BlobSliceRequest,
+    BlobSliceResult,
+    GitHubBlobFetcher,
+    GitHubBlobFetchError,
+    SliceStatus,
+    decode_github_base64_blob,
+    slice_decoded_lines,
+)
 from codesight.vcs.github_auth import (
     INSTALLATION_TOKEN_TTL_SECONDS,
     GitHubAuthConfigError,
@@ -26,9 +39,15 @@ from codesight.vcs.github_publisher import (
 )
 
 __all__ = [
+    "DEFAULT_BLOB_FETCH_CONCURRENCY",
     "INSTALLATION_TOKEN_TTL_SECONDS",
+    "MAX_BLOB_FETCH_BYTES",
     "OUT_OF_HUNK_HEADING",
     "AsyncSupersedeLockProtocol",
+    "BlobBatchFetchReport",
+    "BlobDecodeStatus",
+    "BlobSliceRequest",
+    "BlobSliceResult",
     "CheckConclusion",
     "CheckRunRecord",
     "DowngradedComment",
@@ -36,6 +55,8 @@ __all__ = [
     "GitHubAuthConfigError",
     "GitHubAuthError",
     "GitHubAuthProvider",
+    "GitHubBlobFetchError",
+    "GitHubBlobFetcher",
     "GitHubPublishError",
     "GitHubPullRequestClient",
     "GitHubReviewPublisher",
@@ -43,8 +64,11 @@ __all__ = [
     "PublishedReviewRecord",
     "ReviewCommentDraft",
     "ReviewEvent",
+    "SliceStatus",
     "create_app_jwt",
+    "decode_github_base64_blob",
     "normalize_private_key",
     "partition_review_comments",
+    "slice_decoded_lines",
     "validate_repo_full_name",
 ]
