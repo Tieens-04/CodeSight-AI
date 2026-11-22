@@ -261,3 +261,78 @@ def test_codesight_task_retries_transient_errors_and_aborts_retry_when_supersede
         "called_directly": False,
         "ok": True,
     }
+
+
+async def test_soft_time_limit_exceeded_retryable_and_push_task_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uuid
+    from typing import Any
+
+    from billiard.exceptions import SoftTimeLimitExceeded
+    from pydantic import SecretStr, ValidationError
+
+    from codesight.core.config import Settings
+    from codesight.worker.celery_app import handle_push_event, sync_default_branch
+    from codesight.worker.tasks.indexing_tasks import PushSyncRunner
+
+    # 1. SoftTimeLimitExceeded is classified as retryable with 5.0s delay
+    assert classify_retryable_exception(SoftTimeLimitExceeded()) == (True, 5.0)
+
+    # 2. Settings exposes index_task_soft_time_limit_seconds=300 and hard=360 with hard > soft
+    defaults = Settings(_env_file=None)
+    assert defaults.index_task_soft_time_limit_seconds == 300
+    assert defaults.index_task_hard_time_limit_seconds == 360
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            index_task_soft_time_limit_seconds=300,
+            index_task_hard_time_limit_seconds=300,
+        )
+
+    # 3. Dedicated push indexing tasks use 300s/360s limits while global defaults remain 60/90
+    assert getattr(handle_push_event, "soft_time_limit", None) == 300
+    assert getattr(handle_push_event, "time_limit", None) == 360
+    assert getattr(sync_default_branch, "soft_time_limit", None) == 300
+    assert getattr(sync_default_branch, "time_limit", None) == 360
+
+    # 4. PushSyncRunner re-raises SoftTimeLimitExceeded on retry without marking failed prematurely
+    recorded_statuses: list[str] = []
+    runner = PushSyncRunner(
+        settings=Settings(
+            _env_file=None,
+            github_token=SecretStr("ghp_test"),
+            gemini_api_key=SecretStr("gem_test"),
+        )
+    )
+
+    async def _fake_record(
+        _delivery_id: str | None,
+        *,
+        webhook_status: str,
+        trace_id: str,
+    ) -> None:
+        recorded_statuses.append(webhook_status)
+
+    async def _raise_soft_limit(*_args: Any, **_kwargs: Any) -> Any:
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(runner, "_record_webhook_status", _fake_record)
+    monkeypatch.setattr(
+        "codesight.worker.tasks.indexing_tasks.IncrementalBranchSyncer.sync_push",
+        _raise_soft_limit,
+    )
+    payload = {
+        "delivery_id": "deliv-soft-timeout",
+        "repo_id": str(uuid.uuid4()),
+        "repo_full_name": "acme/timeout",
+        "after_sha": "abc1234",
+    }
+
+    with pytest.raises(SoftTimeLimitExceeded):
+        await runner.execute(payload, is_final_attempt=False)
+    assert recorded_statuses == []
+
+    with pytest.raises(SoftTimeLimitExceeded):
+        await runner.execute(payload, is_final_attempt=True)
+    assert recorded_statuses == ["failed"]

@@ -19,6 +19,7 @@ from codesight.core.logging import bind_trace_id, clear_trace_context, get_trace
 from codesight.db.models import WebhookEvent
 from codesight.rag.embedder import GeminiEmbedder
 from codesight.rag.indexer import (
+    AsyncRepoIndexLock,
     GitHubRepoIndexClient,
     IncrementalBranchSyncer,
     InitialRepoIndexer,
@@ -35,6 +36,42 @@ logger = structlog.get_logger("codesight.worker.indexing_tasks")
 def has_indexing_credentials(settings: Settings) -> bool:
     """Return True when both GitHub and Gemini embedding credentials are configured."""
     return bool(settings.has_github_credentials and settings.has_gemini_api_key)
+
+
+def can_run_live_push_sync(settings: Settings) -> bool:
+    """Return True when push sync has sufficient credentials for current environment."""
+    if has_indexing_credentials(settings):
+        return True
+    return bool(
+        settings.has_github_credentials
+        and not settings.index_embed_code_chunks
+        and settings.app_env != "production"
+    )
+
+
+def log_push_stub_fallback(
+    payload: Mapping[str, Any],
+    *,
+    settings: Settings,
+    trace_id: str,
+) -> None:
+    """Emit warning when dev push sync falls back to stub mode without credentials."""
+    if not can_run_live_push_sync(settings):
+        logger.warning(
+            "push_sync_skipped_missing_credentials",
+            trace_id=trace_id,
+            repo=str(payload.get("repo_full_name", "")),
+            ref=str(payload.get("ref", "")),
+            has_github_credentials=settings.has_github_credentials,
+            has_gemini_api_key=settings.has_gemini_api_key,
+            index_embed_code_chunks=settings.index_embed_code_chunks,
+        )
+    logger.info(
+        "webhook_push_stub_received",
+        trace_id=trace_id,
+        repo=str(payload.get("repo_full_name", "")),
+        ref=str(payload.get("ref", "")),
+    )
 
 
 def extract_push_coords(payload: Mapping[str, Any]) -> tuple[str, str, str] | None:
@@ -247,6 +284,7 @@ class PushSyncRunner:
                 http_client=active_http,
                 base_url=self._api_base_url,
             )
+            repo_lock = AsyncRepoIndexLock(active_redis)
             initial_indexer = InitialRepoIndexer(
                 auth_provider=auth,
                 embedder=active_embedder,
@@ -255,6 +293,7 @@ class PushSyncRunner:
                 repo_client=repo_client,
                 config_loader=config_loader,
                 session_factory=self._session_factory,
+                repo_lock=repo_lock,
                 base_url=self._api_base_url,
                 embed_code_chunks=self._settings.index_embed_code_chunks,
             )
@@ -266,6 +305,7 @@ class PushSyncRunner:
                 config_loader=config_loader,
                 session_factory=self._session_factory,
                 redis_client=active_redis,
+                lock=repo_lock,
                 embed_code_chunks=self._settings.index_embed_code_chunks,
             )
 
@@ -308,7 +348,14 @@ class PushSyncRunner:
         except Exception as exc:
             is_retryable, _ = classify_retryable_exception(exc)
             will_retry = is_retryable and not is_final_attempt
-            if not will_retry:
+            if will_retry:
+                logger.warning(
+                    "worker_push_sync_retry_deferred",
+                    trace_id=active_trace_id,
+                    repo=repo_full_name,
+                    error_type=type(exc).__name__,
+                )
+            else:
                 await self._record_webhook_status(
                     delivery_id,
                     webhook_status="failed",
@@ -355,12 +402,7 @@ async def run_push_webhook_task(
     """Run live FR-07 push sync when credentials are configured, else dev-mode stub."""
     active_settings = settings if settings is not None else get_settings()
     coords = extract_push_coords(payload)
-    can_run_code_only = (
-        active_settings.has_github_credentials
-        and not active_settings.index_embed_code_chunks
-        and active_settings.app_env != "production"
-    )
-    if coords is not None and (has_indexing_credentials(active_settings) or can_run_code_only):
+    if coords is not None and can_run_live_push_sync(active_settings):
         runner = PushSyncRunner(
             settings=active_settings,
             http_client=http_client,
@@ -393,10 +435,5 @@ async def run_push_webhook_task(
         )
 
     trace_id = get_trace_id() or "-"
-    logger.info(
-        "webhook_push_stub_received",
-        trace_id=trace_id,
-        repo=str(payload.get("repo_full_name", "")),
-        ref=str(payload.get("ref", "")),
-    )
+    log_push_stub_fallback(payload, settings=active_settings, trace_id=trace_id)
     return {"status": "accepted", "trace_id": trace_id}

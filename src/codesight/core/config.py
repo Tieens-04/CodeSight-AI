@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     index_embed_code_chunks: bool = False
     gemini_embed_tpm_budget: int = Field(default=25_000, ge=1_000)
     gemini_embed_concurrency: int = Field(default=2, ge=1, le=10)
+    index_task_soft_time_limit_seconds: int = Field(default=300, ge=30)
+    index_task_hard_time_limit_seconds: int = Field(default=360, ge=60)
 
     # Optional Phase 2+ secrets (kept None until configured)
     github_app_id: str | None = None
@@ -74,6 +76,10 @@ class Settings(BaseSettings):
             and self.postgres_password.get_secret_value() == "codesight_dev_password"
         ):
             raise ValueError("POSTGRES_PASSWORD must not use the dev default in production.")
+        if self.index_task_hard_time_limit_seconds <= self.index_task_soft_time_limit_seconds:
+            raise ValueError(
+                "INDEX_TASK_HARD_TIME_LIMIT_SECONDS must exceed INDEX_TASK_SOFT_TIME_LIMIT_SECONDS."
+            )
         return self
 
     @property

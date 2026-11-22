@@ -444,7 +444,7 @@ async def test_f03_upsert_repository_state_recreated_and_renamed_live_postgres(
         )
 
         # 1. Repo 200 renamed onto "acme/api" (collides with 100) -> resolves cleanly
-        resolved_200, sha_200 = await upsert_repository_state(
+        resolved_200, updated_200 = await upsert_repository_state(
             session_factory,
             full_name="acme/api",
             default_branch="main",
@@ -452,10 +452,10 @@ async def test_f03_upsert_repository_state_recreated_and_renamed_live_postgres(
             last_indexed_sha="sha_200_renamed",
         )
         assert resolved_200 == id_200
-        assert sha_200 == "sha_200_renamed"
+        assert updated_200 is True
 
         # 2. Recreated "acme/api" with new github_repo_id=300 -> new UUID, old 200 staled
-        resolved_300, sha_300 = await upsert_repository_state(
+        resolved_300, updated_300 = await upsert_repository_state(
             session_factory,
             full_name="acme/api",
             default_branch="main",
@@ -464,13 +464,26 @@ async def test_f03_upsert_repository_state_recreated_and_renamed_live_postgres(
         )
         assert resolved_300 != id_200
         assert resolved_300 != id_100
-        assert sha_300 == "sha_300_fresh"
+        assert updated_300 is True
+
+        # 3. Optimistic expected_previous_sha refuses stale rollback in live Postgres
+        stale_id, stale_updated = await upsert_repository_state(
+            session_factory,
+            full_name="acme/api",
+            default_branch="main",
+            github_repo_id=300,
+            last_indexed_sha="sha_300_old",
+            expected_previous_sha="sha_300_prior",
+        )
+        assert stale_id == resolved_300
+        assert stale_updated is False
 
         async with session_factory() as session:
             all_rows = (await session.execute(sa.select(Repository))).scalars().all()
             by_gh = {r.github_repo_id: r for r in all_rows}
             assert by_gh[100].full_name == "acme/api__stale_100"
             assert by_gh[200].full_name == "acme/api__stale_200"
+            assert by_gh[200].last_indexed_sha == "sha_200_renamed"
             assert by_gh[300].full_name == "acme/api"
             assert by_gh[300].last_indexed_sha == "sha_300_fresh"
     finally:

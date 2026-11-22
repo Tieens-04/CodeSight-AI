@@ -34,6 +34,7 @@ from codesight.core.errors import RateLimitTaskError, RetryableTaskError
 from codesight.db.session import create_db_engine, create_session_factory
 from codesight.rag.embedder import GeminiEmbedder
 from codesight.rag.indexer import (
+    AsyncRepoIndexLock,
     IndexProgressSnapshot,
     InitialIndexReport,
     InitialRepoIndexer,
@@ -104,6 +105,7 @@ async def run_cli_index(
     *,
     branch: str | None = None,
     recreate: bool = False,
+    allow_non_default_branch: bool = False,
     embed_code_chunks: bool | None = None,
     settings: Settings | None = None,
     http_client: httpx.AsyncClient | None = None,
@@ -137,7 +139,7 @@ async def run_cli_index(
             active_http = owned_http
 
         active_redis = redis_client
-        if active_redis is None and active_settings.has_github_app_credentials:
+        if active_redis is None:
             owned_redis = redis_async.from_url(
                 active_settings.redis_url,
                 decode_responses=True,
@@ -177,12 +179,14 @@ async def run_cli_index(
             else None
         )
 
+        repo_lock = AsyncRepoIndexLock(active_redis)
         indexer = InitialRepoIndexer(
             auth_provider=auth,
             embedder=active_embedder,
             store=active_store,
             http_client=active_http,
             session_factory=active_session_factory,
+            repo_lock=repo_lock,
             base_url=api_base_url,
             allow_public_fallback=True,
             embed_code_chunks=effective_embed_code,
@@ -193,6 +197,7 @@ async def run_cli_index(
                 ref=branch,
                 recreate=recreate,
                 persist_cursor=True,
+                allow_non_default_branch=allow_non_default_branch,
                 progress_callback=progress_callback,
             )
         finally:
@@ -263,6 +268,14 @@ def index_command(
         "--recreate",
         help="Delete existing Qdrant points for this repository before indexing from scratch.",
     ),
+    allow_non_default_branch: bool = typer.Option(
+        False,
+        "--allow-non-default-branch",
+        help=(
+            "Allow indexing a non-default branch via `--branch`. "
+            "Non-default runs skip PostgreSQL cursor updates and stale pruning."
+        ),
+    ),
     embed_code_chunks: bool | None = typer.Option(
         None,
         "--embed-code-chunks/--no-embed-code-chunks",
@@ -319,6 +332,7 @@ def index_command(
                     repo_slug,
                     branch=branch,
                     recreate=recreate,
+                    allow_non_default_branch=allow_non_default_branch,
                     embed_code_chunks=embed_code_chunks,
                     settings=settings,
                     progress_callback=_on_progress,

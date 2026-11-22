@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from collections.abc import Set as AbstractSet
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, Literal, Self, cast
@@ -34,7 +34,7 @@ from codesight.core.errors import (
     parse_retry_after_header,
 )
 from codesight.db.models import Repository
-from codesight.db.repositories import upsert_repository
+from codesight.db.repositories import _UNSET, upsert_repository_guarded
 from codesight.diff.file_filter import FileFilter, normalize_diff_path
 from codesight.rag.doc_chunker import MarkdownDocChunker, is_architecture_doc_path
 from codesight.rag.embedder import ExistingPointIdChecker, GeminiEmbedder
@@ -81,6 +81,13 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
+_RENEW_LOCK_LUA: Final[str] = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("expire", KEYS[1], tonumber(ARGV[2]))
+else
+    return 0
+end
+"""
 
 type SyncMode = Literal[
     "incremental_compare",
@@ -91,7 +98,6 @@ type SyncMode = Literal[
 ]
 type ProgressCallback = Callable[[IndexProgressSnapshot], None]
 
-_UNSET: Final[object] = object()
 logger = structlog.get_logger("codesight.rag.indexer")
 
 
@@ -672,18 +678,49 @@ class AsyncRepoIndexLock:
         redis_client: redis_async.Redis | None,
         *,
         ttl_seconds: int = REPO_INDEX_LOCK_TTL_SECONDS,
-        acquire_timeout_seconds: float = DEFAULT_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+        acquire_timeout_seconds: float | None = None,
         poll_interval_seconds: float = DEFAULT_LOCK_POLL_INTERVAL_SECONDS,
     ) -> None:
         self._client = redis_client
         self._ttl_seconds = validate_positive_int(ttl_seconds, name="ttl_seconds")
-        self._acquire_timeout = max(0.0, acquire_timeout_seconds)
+        timeout = (
+            DEFAULT_LOCK_ACQUIRE_TIMEOUT_SECONDS
+            if acquire_timeout_seconds is None
+            else acquire_timeout_seconds
+        )
+        self._acquire_timeout = max(0.0, timeout)
         self._poll_interval = max(0.005, poll_interval_seconds)
 
     @staticmethod
     def lock_key(scope_key: str) -> str:
         """Return canonical Redis lock key for a repository indexing scope."""
         return f"repo_index_lock:{scope_key}"
+
+    async def _renew(self, key: str, token: str) -> bool:
+        if self._client is None:
+            return False
+        eval_fn = getattr(self._client, "eval", None)
+        try:
+            if callable(eval_fn):
+                res = await eval_fn(_RENEW_LOCK_LUA, 1, key, token, self._ttl_seconds)
+                return bool(int(res or 0))
+            current = await self._client.get(key)
+            if isinstance(current, (bytes, bytearray)):
+                current = current.decode("utf-8", errors="ignore")
+            if current == token:
+                expire_fn = getattr(self._client, "expire", None)
+                if callable(expire_fn):
+                    return bool(await expire_fn(key, self._ttl_seconds))
+                await self._client.set(key, token, ex=self._ttl_seconds)
+                return True
+            return False
+        except (redis.exceptions.RedisError, OSError) as exc:
+            logger.warning(
+                "repo_index_lock_renew_failed",
+                lock_key=key,
+                error_type=type(exc).__name__,
+            )
+            return True
 
     async def _release(self, key: str, token: str) -> None:
         if self._client is None:
@@ -707,7 +744,7 @@ class AsyncRepoIndexLock:
 
     @asynccontextmanager
     async def hold(self, scope_key: str) -> AsyncIterator[None]:
-        """Acquire exclusive repo index lock or raise RetryableTaskError when contended."""
+        """Acquire exclusive repo index lock with heartbeat renewal or raise RetryableTaskError."""
         if self._client is None:
             yield
             return
@@ -738,11 +775,30 @@ class AsyncRepoIndexLock:
                 )
             await asyncio.sleep(self._poll_interval)
 
+        heartbeat_task: asyncio.Task[None] | None = None
+        if acquired:
+            interval = max(0.5, self._ttl_seconds / 3.0)
+
+            async def _heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(interval)
+                    still_owned = await self._renew(key, token)
+                    if not still_owned:
+                        return
+
+            heartbeat_task = asyncio.create_task(_heartbeat())
+
         try:
             yield
         finally:
-            if acquired:
-                await self._release(key, token)
+            try:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat_task
+            finally:
+                if acquired:
+                    await self._release(key, token)
 
 
 def _parse_uuid(raw: str | None) -> uuid.UUID | None:
@@ -833,22 +889,23 @@ async def upsert_repository_state(
     github_repo_id: int | None = None,
     installation_id: int | None = None,
     last_indexed_sha: str | None = None,
-) -> tuple[str, str | None]:
+    expected_previous_sha: str | object | None = _UNSET,
+) -> tuple[str, bool]:
     """Idempotently upsert a Repository row and optionally advance `last_indexed_sha`."""
     async with session_factory() as session:
         try:
-            row = await upsert_repository(
+            row, cursor_updated = await upsert_repository_guarded(
                 session,
                 github_repo_id=github_repo_id,
                 full_name=full_name,
                 default_branch=default_branch,
                 installation_id=installation_id,
                 last_indexed_sha=last_indexed_sha,
+                expected_previous_sha=expected_previous_sha,
             )
             repo_id_str = str(row.id)
-            indexed_sha = row.last_indexed_sha
             await session.commit()
-            return repo_id_str, indexed_sha
+            return repo_id_str, cursor_updated
         except (IntegrityError, RuntimeError) as exc:
             await session.rollback()
             raise RepoIndexError(
@@ -1080,6 +1137,14 @@ async def _prepare_and_embed_wave_items(
             item.clear_transient_text()
 
 
+def _repo_lock_scopes(slug: str, repo_id: str | None) -> tuple[str, ...]:
+    slug_lock_key = slug.lower()
+    clean_repo_id = repo_id.strip() if repo_id and repo_id.strip() else None
+    if clean_repo_id is not None and clean_repo_id.lower() != slug_lock_key:
+        return (slug_lock_key, clean_repo_id)
+    return (slug_lock_key,)
+
+
 class InitialRepoIndexer:
     """Indexes a repository's AST symbols and architecture docs into Qdrant in RAM waves."""
 
@@ -1095,6 +1160,7 @@ class InitialRepoIndexer:
         ast_registry: ASTParserRegistry | None = None,
         doc_chunker: MarkdownDocChunker | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
+        repo_lock: AsyncRepoIndexLock | None = None,
         base_url: str = "https://api.github.com",
         blob_concurrency: int = DEFAULT_BLOB_CONCURRENCY,
         wave_size: int = DEFAULT_INDEX_WAVE_SIZE,
@@ -1128,6 +1194,7 @@ class InitialRepoIndexer:
         self._ast_registry = ast_registry if ast_registry is not None else ASTParserRegistry()
         self._doc_chunker = doc_chunker if doc_chunker is not None else MarkdownDocChunker()
         self._session_factory = session_factory
+        self._repo_lock = repo_lock
         self._blob_concurrency = validate_positive_int(blob_concurrency, name="blob_concurrency")
         self._wave_size = validate_positive_int(wave_size, name="wave_size")
         self._max_blob_bytes = validate_positive_int(max_blob_bytes, name="max_blob_bytes")
@@ -1193,13 +1260,47 @@ class InitialRepoIndexer:
         recreate: bool = False,
         persist_cursor: bool = True,
         is_default_branch_target: bool | None = None,
+        allow_non_default_branch: bool = False,
         progress_callback: ProgressCallback | None = None,
+        _skip_repo_lock: bool = False,
     ) -> InitialIndexReport:
         """Index eligible Python/TS/TSX AST chunks and architecture docs for a repository."""
         started = time.perf_counter()
         slug = validate_repo_full_name(repo_full_name)
         if self._embed_code_chunks and self._embedder is None:
             raise EmbeddingConfigError("GEMINI_API_KEY is required when embed_code_chunks=True.")
+
+        async with AsyncExitStack() as lock_stack:
+            if self._repo_lock is not None and not _skip_repo_lock:
+                for scope_key in _repo_lock_scopes(slug, repo_id):
+                    await lock_stack.enter_async_context(self._repo_lock.hold(scope_key))
+            return await self._index_repository_unlocked(
+                slug=slug,
+                ref=ref,
+                repo_id=repo_id,
+                installation_id=installation_id,
+                recreate=recreate,
+                persist_cursor=persist_cursor,
+                is_default_branch_target=is_default_branch_target,
+                allow_non_default_branch=allow_non_default_branch,
+                progress_callback=progress_callback,
+                started=started,
+            )
+
+    async def _index_repository_unlocked(
+        self,
+        *,
+        slug: str,
+        ref: str | None,
+        repo_id: str | None,
+        installation_id: int | None,
+        recreate: bool,
+        persist_cursor: bool,
+        is_default_branch_target: bool | None,
+        allow_non_default_branch: bool,
+        progress_callback: ProgressCallback | None,
+        started: float,
+    ) -> InitialIndexReport:
         repo_meta = await self._repo_client.fetch_repo_metadata(
             slug,
             installation_id=installation_id,
@@ -1216,16 +1317,32 @@ class InitialRepoIndexer:
                 f"--recreate is only supported when indexing default branch "
                 f"'{repo_meta.default_branch}' (got '{target_branch}')."
             )
+        if not is_default_target and not allow_non_default_branch:
+            raise ValueError(
+                f"Refusing to index non-default branch '{target_branch}' for '{canonical_slug}' "
+                f"(default branch is '{repo_meta.default_branch}'); pass "
+                "allow_non_default_branch=True (or --allow-non-default-branch) to override."
+            )
 
         effective_repo_id = repo_id
-        if self._session_factory is not None and (effective_repo_id is None or is_default_target):
-            effective_repo_id, _ = await upsert_repository_state(
-                self._session_factory,
-                full_name=canonical_slug,
-                default_branch=repo_meta.default_branch,
-                github_repo_id=repo_meta.github_repo_id,
-                installation_id=installation_id,
-            )
+        initial_last_indexed_sha: str | None = None
+        if self._session_factory is not None:
+            if effective_repo_id is None or is_default_target:
+                effective_repo_id, _ = await upsert_repository_state(
+                    self._session_factory,
+                    full_name=canonical_slug,
+                    default_branch=repo_meta.default_branch,
+                    github_repo_id=repo_meta.github_repo_id,
+                    installation_id=installation_id,
+                )
+            if is_default_target and persist_cursor and not recreate:
+                initial_state = await _read_repository_sync_state(
+                    self._session_factory,
+                    repo_id=effective_repo_id,
+                    repo_full_name=canonical_slug,
+                    github_repo_id=repo_meta.github_repo_id,
+                )
+                initial_last_indexed_sha = initial_state.last_indexed_sha
 
         commit_sha = await self._repo_client.fetch_branch_head_sha(
             canonical_slug,
@@ -1445,15 +1562,22 @@ class InitialRepoIndexer:
 
         cursor_persisted = False
         if self._session_factory is not None and persist_cursor and is_default_target:
-            effective_repo_id, _ = await upsert_repository_state(
+            effective_repo_id, cursor_persisted = await upsert_repository_state(
                 self._session_factory,
                 full_name=canonical_slug,
                 default_branch=repo_meta.default_branch,
                 github_repo_id=repo_meta.github_repo_id,
                 installation_id=installation_id,
                 last_indexed_sha=commit_sha,
+                expected_previous_sha=_UNSET if recreate else initial_last_indexed_sha,
             )
-            cursor_persisted = True
+            if not cursor_persisted:
+                logger.warning(
+                    "repo_index_cursor_update_skipped_stale",
+                    repo=canonical_slug,
+                    commit_sha=commit_sha,
+                    expected_previous_sha=initial_last_indexed_sha,
+                )
 
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
         logger.info(
@@ -1650,6 +1774,7 @@ class IncrementalBranchSyncer:
             recreate=False,
             persist_cursor=True,
             is_default_branch_target=True,
+            _skip_repo_lock=True,
         )
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
         return IncrementalSyncReport(
@@ -1699,13 +1824,8 @@ class IncrementalBranchSyncer:
         if self._embed_code_chunks and self._embedder is None:
             raise EmbeddingConfigError("GEMINI_API_KEY is required when embed_code_chunks=True.")
 
-        slug_lock_key = slug.lower()
         clean_repo_id = repo_id.strip() if repo_id and repo_id.strip() else None
-        lock_scopes: tuple[str, ...] = (
-            (slug_lock_key, clean_repo_id)
-            if clean_repo_id is not None and clean_repo_id.lower() != slug_lock_key
-            else (slug_lock_key,)
-        )
+        lock_scopes = _repo_lock_scopes(slug, clean_repo_id)
         async with AsyncExitStack() as lock_stack:
             for scope_key in lock_scopes:
                 await lock_stack.enter_async_context(self._lock.hold(scope_key))
@@ -1816,15 +1936,15 @@ class IncrementalBranchSyncer:
             if compare.status == "identical":
                 persisted = False
                 if self._session_factory is not None:
-                    effective_repo_id, _ = await upsert_repository_state(
+                    effective_repo_id, persisted = await upsert_repository_state(
                         self._session_factory,
                         full_name=slug,
                         default_branch=effective_branch,
                         github_repo_id=github_repo_id,
                         installation_id=effective_inst_id,
                         last_indexed_sha=target_sha,
+                        expected_previous_sha=base_sha,
                     )
-                    persisted = True
                 return self._build_noop_report(
                     slug=slug,
                     repo_id=effective_repo_id,
@@ -2018,15 +2138,15 @@ class IncrementalBranchSyncer:
 
             cursor_persisted = False
             if self._session_factory is not None:
-                effective_repo_id, _ = await upsert_repository_state(
+                effective_repo_id, cursor_persisted = await upsert_repository_state(
                     self._session_factory,
                     full_name=slug,
                     default_branch=effective_branch,
                     github_repo_id=github_repo_id,
                     installation_id=effective_inst_id,
                     last_indexed_sha=target_sha,
+                    expected_previous_sha=base_sha,
                 )
-                cursor_persisted = True
 
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
             logger.info(
