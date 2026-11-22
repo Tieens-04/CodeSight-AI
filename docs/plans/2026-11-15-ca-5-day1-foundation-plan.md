@@ -136,7 +136,10 @@ def test_settings_docker_override_and_special_char_dsn_encoding() -> None:
         redis_port=6379,
         redis_password=SecretStr("r#dis@pw"),
     )
-    assert s.postgres_dsn == "postgresql://cs_user:p%40ss%3Aw%2Frd%231%25@codesight-postgres:5432/codesight"
+    assert (
+        s.postgres_dsn
+        == "postgresql://cs_user:p%40ss%3Aw%2Frd%231%25@codesight-postgres:5432/codesight"
+    )
     assert s.sqlalchemy_async_dsn.startswith("postgresql+asyncpg://cs_user:p%40ss%3Aw%2Frd%231%25@")
     assert s.redis_url == "redis://:r%23dis%40pw@codesight-redis:6379/0"
     assert "p@ss:w/rd#1%" not in repr(s)

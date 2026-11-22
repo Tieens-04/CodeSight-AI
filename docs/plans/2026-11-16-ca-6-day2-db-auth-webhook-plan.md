@@ -83,23 +83,46 @@ def test_orm_metadata_defines_all_four_tables_and_forward_columns() -> None:
     }
     repo_cols = set(Repository.__table__.columns.keys())
     assert {
-        "id", "github_repo_id", "installation_id", "full_name",
-        "default_branch", "last_indexed_sha", "installed_at",
+        "id",
+        "github_repo_id",
+        "installation_id",
+        "full_name",
+        "default_branch",
+        "last_indexed_sha",
+        "installed_at",
     } <= repo_cols
     assert Repository.__table__.columns["github_repo_id"].nullable is True
 
     pr_cols = set(PRReview.__table__.columns.keys())
     assert {
-        "id", "repo_id", "pr_number", "head_sha", "debt_score",
-        "critical_count", "warning_count", "info_count",
-        "tokens_saved_pct", "latency_ms", "status", "trace_id", "created_at",
+        "id",
+        "repo_id",
+        "pr_number",
+        "head_sha",
+        "debt_score",
+        "critical_count",
+        "warning_count",
+        "info_count",
+        "tokens_saved_pct",
+        "latency_ms",
+        "status",
+        "trace_id",
+        "created_at",
     } <= pr_cols
 
     finding_cols = set(ReviewFinding.__table__.columns.keys())
     assert {
-        "id", "pr_review_id", "file_path", "start_line", "end_line",
-        "severity", "category", "confidence", "message",
-        "suggestion_code", "accepted_on_merge",
+        "id",
+        "pr_review_id",
+        "file_path",
+        "start_line",
+        "end_line",
+        "severity",
+        "category",
+        "confidence",
+        "message",
+        "suggestion_code",
+        "accepted_on_merge",
     } <= finding_cols
 
     wh_cols = set(WebhookEvent.__table__.columns.keys())
@@ -128,7 +151,9 @@ async def test_engine_pool_kwargs_and_get_db_session_lifecycle() -> None:
     cm.__aenter__.return_value = fake_session
     cm.__aexit__.return_value = False
     factory = MagicMock(return_value=cm)
-    fake_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(session_factory=factory)))
+    fake_request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(session_factory=factory))
+    )
 
     yielded = [s async for s in get_db_session(fake_request)]  # type: ignore[arg-type]
     assert yielded == [fake_session]

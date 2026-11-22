@@ -252,13 +252,9 @@ class AsyncSupersedeLock:
             removed_ancestor = None
             if supports_sets:
                 prev_ts_ms = _parse_int_str(await self._client.get(ts_key))
-                is_direct_successor = bool(
-                    prev_sha and clean_before and clean_before == prev_sha
-                )
+                is_direct_successor = bool(prev_sha and clean_before and clean_before == prev_sha)
                 if prev_sha and prev_sha != head_sha and not is_direct_successor:
-                    is_known_ancestor = bool(
-                        await self._client.sismember(ancestors_key, head_sha)
-                    )
+                    is_known_ancestor = bool(await self._client.sismember(ancestors_key, head_sha))
                     if is_known_ancestor or (
                         norm_ts > 0 and prev_ts_ms is not None and norm_ts < prev_ts_ms
                     ):
@@ -283,11 +279,7 @@ class AsyncSupersedeLock:
                     await self._client.expire(ancestors_key, ttl_seconds)
                 if norm_ts > 0:
                     next_ts = norm_ts
-                    if (
-                        not is_direct_successor
-                        and prev_ts_ms is not None
-                        and prev_ts_ms > next_ts
-                    ):
+                    if not is_direct_successor and prev_ts_ms is not None and prev_ts_ms > next_ts:
                         next_ts = prev_ts_ms
                     await self._client.set(ts_key, str(next_ts), ex=ttl_seconds)
             else:

@@ -61,21 +61,15 @@ async def test_live_redis_lua_cas_claim_rollback_and_superseded_detection() -> N
 
         # 2. CAS Rollback Hazard: SHA_3 arrives BEFORE SHA_2's failed-publish rollback runs
         await lock.claim_active_sha(repo_id, pr_num, "sha-3")
-        await lock.rollback_active_sha(
-            repo_id, pr_num, attempted_sha="sha-2", prev_sha="sha-1"
-        )
+        await lock.rollback_active_sha(repo_id, pr_num, attempted_sha="sha-2", prev_sha="sha-1")
         await lock.record_active_task(repo_id, pr_num, head_sha="sha-2", task_id="stale-task-2")
         assert await async_client.get(pr_active_sha_key(repo_id, pr_num)) == "sha-3"
         assert await async_client.get(pr_active_task_key(repo_id, pr_num)) == "task-1"
 
         # 3. Legitimate rollback when SHA_3 itself fails broker publish restores SHA_1 (or deletes)
-        await lock.rollback_active_sha(
-            repo_id, pr_num, attempted_sha="sha-3", prev_sha="sha-1"
-        )
+        await lock.rollback_active_sha(repo_id, pr_num, attempted_sha="sha-3", prev_sha="sha-1")
         assert await async_client.get(pr_active_sha_key(repo_id, pr_num)) == "sha-1"
-        await lock.rollback_active_sha(
-            repo_id, pr_num, attempted_sha="sha-1", prev_sha=None
-        )
+        await lock.rollback_active_sha(repo_id, pr_num, attempted_sha="sha-1", prev_sha=None)
         assert await async_client.get(pr_active_sha_key(repo_id, pr_num)) is None
 
         # 4. Out-of-order SHA_2 before SHA_1 rejects SHA_1, while direct revert succeeds
@@ -355,9 +349,10 @@ async def test_execute_pr_review_lifecycle_blocks_stale_publish_and_cleans_works
             check_entry_supersede=False,
         )
         assert res_stub["status"] == "accepted"
-        assert handle_pr_event({"repo_full_name": "org/unconfigured-stub", "pr_number": 5})[
-            "status"
-        ] == "accepted"
+        assert (
+            handle_pr_event({"repo_full_name": "org/unconfigured-stub", "pr_number": 5})["status"]
+            == "accepted"
+        )
     finally:
         clear_trace_context()
         await async_client.delete(
@@ -612,6 +607,7 @@ async def test_offline_out_of_order_guard_and_worker_pre_publish_lock_creation(
     bind_trace_id("trace-offline-prepub")
     seen_locks: list[AsyncSupersedeLock | None] = []
     try:
+
         async def _review_with_mid_supersede(ctx: PRReviewLifecycleContext) -> None:
             seen_locks.append(ctx.supersede_lock)
             assert ctx.supersede_lock is not None
