@@ -24,6 +24,9 @@ type RAGLanguage = Literal["python", "typescript", "tsx", "markdown"]
 
 EMBEDDING_MODEL_NAME: Final[str] = "gemini-embedding-001"
 EMBEDDING_DIMENSIONS: Final[int] = 768
+CODE_CHUNK_PLACEHOLDER_VECTOR: Final[tuple[float, ...]] = (1.0,) + (0.0,) * (
+    EMBEDDING_DIMENSIONS - 1
+)
 DEFAULT_EMBED_BATCH_SIZE: Final[int] = 64
 MAX_EMBED_BATCH_SIZE: Final[int] = 100
 DEFAULT_RPM_CONCURRENCY: Final[int] = 3

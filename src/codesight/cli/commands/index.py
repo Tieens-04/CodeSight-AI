@@ -104,6 +104,7 @@ async def run_cli_index(
     *,
     branch: str | None = None,
     recreate: bool = False,
+    embed_code_chunks: bool | None = None,
     settings: Settings | None = None,
     http_client: httpx.AsyncClient | None = None,
     redis_client: redis_async.Redis | None = None,
@@ -115,6 +116,9 @@ async def run_cli_index(
 ) -> InitialIndexReport:
     """Execute initial repository indexing against PostgreSQL and Qdrant in RAM waves."""
     active_settings = settings if settings is not None else get_settings()
+    effective_embed_code = (
+        active_settings.index_embed_code_chunks if embed_code_chunks is None else embed_code_chunks
+    )
     owned_http: httpx.AsyncClient | None = None
     owned_redis: redis_async.Redis | None = None
     owned_engine: AsyncEngine | None = None
@@ -154,8 +158,13 @@ async def run_cli_index(
 
         active_embedder = embedder
         if active_embedder is None:
-            owned_embedder = GeminiEmbedder(settings=active_settings)
-            active_embedder = owned_embedder
+            if active_settings.has_gemini_api_key:
+                owned_embedder = GeminiEmbedder(settings=active_settings)
+                active_embedder = owned_embedder
+            elif effective_embed_code:
+                raise EmbeddingConfigError(
+                    "GEMINI_API_KEY is required when embed_code_chunks=True."
+                )
 
         auth: GitHubAuthProvider | None = (
             GitHubAuthProvider(
@@ -176,6 +185,7 @@ async def run_cli_index(
             session_factory=active_session_factory,
             base_url=api_base_url,
             allow_public_fallback=True,
+            embed_code_chunks=effective_embed_code,
         )
         try:
             return await indexer.index_repository(
@@ -253,6 +263,14 @@ def index_command(
         "--recreate",
         help="Delete existing Qdrant points for this repository before indexing from scratch.",
     ),
+    embed_code_chunks: bool | None = typer.Option(
+        None,
+        "--embed-code-chunks/--no-embed-code-chunks",
+        help=(
+            "Embed AST code chunks via Gemini instead of using zero-API placeholder vectors "
+            "(defaults to INDEX_EMBED_CODE_CHUNKS)."
+        ),
+    ),
 ) -> None:
     """Index a GitHub repository into Qdrant (Zero-Code) and save last_indexed_sha in Postgres."""
     err_console = Console(file=sys.stderr, soft_wrap=True)
@@ -264,7 +282,7 @@ def index_command(
         raise typer.Exit(code=2) from exc
 
     settings = get_settings()
-    if settings.gemini_api_key is None or not settings.gemini_api_key.get_secret_value().strip():
+    if not settings.has_gemini_api_key:
         err_console.print(
             "[red]Missing configuration:[/red] Set [bold]GEMINI_API_KEY[/bold] in `.env` "
             "before running `codesight index`."
@@ -301,6 +319,7 @@ def index_command(
                     repo_slug,
                     branch=branch,
                     recreate=recreate,
+                    embed_code_chunks=embed_code_chunks,
                     settings=settings,
                     progress_callback=_on_progress,
                 )

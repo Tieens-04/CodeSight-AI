@@ -23,6 +23,7 @@ from codesight.rag.indexer import (
     IncrementalBranchSyncer,
     InitialRepoIndexer,
 )
+from codesight.rag.models import EmbeddingConfigError
 from codesight.rag.qdrant_store import QdrantZeroCodeStore
 from codesight.vcs.github_auth import GitHubAuthConfigError, GitHubAuthProvider
 from codesight.worker.lifecycle import classify_retryable_exception
@@ -33,11 +34,7 @@ logger = structlog.get_logger("codesight.worker.indexing_tasks")
 
 def has_indexing_credentials(settings: Settings) -> bool:
     """Return True when both GitHub and Gemini embedding credentials are configured."""
-    return bool(
-        settings.has_github_credentials
-        and settings.gemini_api_key is not None
-        and settings.gemini_api_key.get_secret_value().strip()
-    )
+    return bool(settings.has_github_credentials and settings.has_gemini_api_key)
 
 
 def extract_push_coords(payload: Mapping[str, Any]) -> tuple[str, str, str] | None:
@@ -226,8 +223,13 @@ class PushSyncRunner:
 
             active_embedder = self._embedder
             if active_embedder is None:
-                owned_embedder = GeminiEmbedder(settings=self._settings)
-                active_embedder = owned_embedder
+                if self._settings.has_gemini_api_key:
+                    owned_embedder = GeminiEmbedder(settings=self._settings)
+                    active_embedder = owned_embedder
+                elif self._settings.index_embed_code_chunks:
+                    raise EmbeddingConfigError(
+                        "GEMINI_API_KEY is required when index_embed_code_chunks=True."
+                    )
 
             auth = GitHubAuthProvider(
                 self._settings,
@@ -254,6 +256,7 @@ class PushSyncRunner:
                 config_loader=config_loader,
                 session_factory=self._session_factory,
                 base_url=self._api_base_url,
+                embed_code_chunks=self._settings.index_embed_code_chunks,
             )
             syncer = IncrementalBranchSyncer(
                 initial_indexer=initial_indexer,
@@ -263,6 +266,7 @@ class PushSyncRunner:
                 config_loader=config_loader,
                 session_factory=self._session_factory,
                 redis_client=active_redis,
+                embed_code_chunks=self._settings.index_embed_code_chunks,
             )
 
             report = await syncer.sync_push(
@@ -351,7 +355,12 @@ async def run_push_webhook_task(
     """Run live FR-07 push sync when credentials are configured, else dev-mode stub."""
     active_settings = settings if settings is not None else get_settings()
     coords = extract_push_coords(payload)
-    if coords is not None and has_indexing_credentials(active_settings):
+    can_run_code_only = (
+        active_settings.has_github_credentials
+        and not active_settings.index_embed_code_chunks
+        and active_settings.app_env != "production"
+    )
+    if coords is not None and (has_indexing_credentials(active_settings) or can_run_code_only):
         runner = PushSyncRunner(
             settings=active_settings,
             http_client=http_client,

@@ -183,6 +183,9 @@ services:
       QDRANT_HOST: codesight-qdrant
       QDRANT_HTTP_PORT: 6333
       QDRANT_GRPC_PORT: 6334
+      INDEX_EMBED_CODE_CHUNKS: ${INDEX_EMBED_CODE_CHUNKS:-false}
+      GEMINI_EMBED_TPM_BUDGET: ${GEMINI_EMBED_TPM_BUDGET:-25000}
+      GEMINI_EMBED_CONCURRENCY: ${GEMINI_EMBED_CONCURRENCY:-2}
     read_only: true
     security_opt:
       - no-new-privileges:true

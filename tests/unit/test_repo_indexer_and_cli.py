@@ -78,6 +78,7 @@ class _InMemoryZeroCodeStore:
     """In-memory fake matching QdrantZeroCodeStore's tenant-scoped contract."""
 
     points: dict[str, dict[str, Any]] = field(default_factory=dict)
+    vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
     ensured_calls: int = 0
     delete_by_repo_calls: int = 0
     delete_by_file_calls: list[tuple[tuple[str, ...], frozenset[str]]] = field(default_factory=list)
@@ -126,6 +127,7 @@ class _InMemoryZeroCodeStore:
     async def upsert_points(self, points: Sequence[QdrantZeroCodePoint]) -> int:
         for pt in points:
             self.points[pt.point_id] = dict(pt.payload)
+            self.vectors[pt.point_id] = tuple(pt.vector)
         return len(points)
 
     async def list_repo_point_refs(
@@ -1025,6 +1027,7 @@ async def test_blob_edge_cases_subchunk_snippet_identical_compare_and_lock_fallb
             store=store,  # type: ignore[arg-type]
             repo_client=repo_client,
             http_client=http,
+            embed_code_chunks=True,
         )
         rep = await indexer.index_repository("acme/sub", repo_id="r-sub")
         assert rep.code_chunks >= 2
@@ -2407,3 +2410,339 @@ async def test_indexer_isolates_zerocode_guard_errors_per_file_and_skipped_guard
             "good_two",
             "good_three",
         }
+
+
+async def test_placeholder_vector_default_skips_code_gemini_calls_and_embeds_docs_only() -> None:
+    from codesight.rag.models import CODE_CHUNK_PLACEHOLDER_VECTOR
+
+    blobs: dict[str, bytes] = {
+        "sha_py_1": b"def py_one() -> int:\n    return 1\n",
+        "sha_py_1_v2": b"def py_one_v2() -> int:\n    return 10\n",
+        "sha_py_2": b"def py_two() -> int:\n    return 2\n",
+        "sha_py_3": b"def py_three() -> int:\n    return 3\n",
+        "sha_ts_1": b"export function tsOne(): number { return 1; }\n",
+        "sha_tsx_1": b"export function TsxComp(): string { return 'ok'; }\n",
+        "sha_doc_1": b"# Architecture\n## ADR 001\nZero-Code persistence invariant.\n",
+    }
+    tree_entries = [
+        {"path": "src/one.py", "mode": "100644", "type": "blob", "sha": "sha_py_1", "size": 32},
+        {"path": "src/two.py", "mode": "100644", "type": "blob", "sha": "sha_py_2", "size": 32},
+        {"path": "src/three.py", "mode": "100644", "type": "blob", "sha": "sha_py_3", "size": 34},
+        {"path": "web/one.ts", "mode": "100644", "type": "blob", "sha": "sha_ts_1", "size": 46},
+        {"path": "web/comp.tsx", "mode": "100644", "type": "blob", "sha": "sha_tsx_1", "size": 50},
+        {
+            "path": "docs/adr/001.md",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "sha_doc_1",
+            "size": len(blobs["sha_doc_1"]),
+        },
+    ]
+    current_tree = list(tree_entries)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/placeholder":
+            return httpx.Response(
+                200,
+                json={"id": 501, "full_name": "acme/placeholder", "default_branch": "main"},
+            )
+        if path.startswith("/repos/acme/placeholder/commits/"):
+            return httpx.Response(200, json={"sha": "sha_main_1"})
+        if path.startswith("/repos/acme/placeholder/contents/.codesight."):
+            return httpx.Response(404)
+        if path.startswith("/repos/acme/placeholder/git/trees/"):
+            return httpx.Response(
+                200, json={"sha": "sha_main_1", "truncated": False, "tree": current_tree}
+            )
+        if path.startswith("/repos/acme/placeholder/git/blobs/"):
+            sha = path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200, json={"sha": sha, "encoding": "base64", "content": _b64(blobs[sha])}
+            )
+        if "/compare/" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ahead",
+                    "total_commits": 1,
+                    "files": [
+                        {"filename": "src/one.py", "status": "modified", "sha": "sha_py_1_v2"},
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    settings = _make_settings()
+    fake_genai = _FakeGenAIClient()
+    store = _InMemoryZeroCodeStore()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(settings, http_client=http)
+        embedder = GeminiEmbedder(client=fake_genai)  # type: ignore[arg-type]
+
+        # 1. Mixed repo (5 code + 1 architecture_doc) -> Gemini receives ONLY architecture_doc
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+        )
+        rep = await indexer.index_repository("acme/placeholder", repo_id="r-ph")
+        assert rep.code_chunks == 5
+        assert rep.doc_chunks >= 1
+        assert rep.embedded_points == rep.doc_chunks
+        assert rep.upserted_points == rep.code_chunks + rep.doc_chunks
+        assert fake_genai.batch_calls == 1
+        assert all("ADR 001" in txt or "Architecture" in txt for txt in fake_genai.embedded_inputs)
+        assert not any("py_one" in txt or "tsOne" in txt for txt in fake_genai.embedded_inputs)
+
+        for pid, payload in store.points.items():
+            if payload["chunk_type"] == "code":
+                assert store.vectors[pid] == CODE_CHUNK_PLACEHOLDER_VECTOR
+            else:
+                assert store.vectors[pid] != CODE_CHUNK_PLACEHOLDER_VECTOR
+
+        # 2. Code-only repo -> 0 Gemini calls and works with embedder=None
+        current_tree[:] = tree_entries[:5]
+        store.points.clear()
+        store.vectors.clear()
+        fake_genai.batch_calls = 0
+        fake_genai.embedded_inputs.clear()
+
+        no_key_indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+        )
+        code_only_rep = await no_key_indexer.index_repository("acme/placeholder", repo_id="r-ph")
+        assert code_only_rep.code_chunks == 5
+        assert code_only_rep.doc_chunks == 0
+        assert code_only_rep.embedded_points == 0
+        assert code_only_rep.upserted_points == 5
+        assert fake_genai.batch_calls == 0
+
+        # Code-only IncrementalBranchSyncer also works with embedder=None
+        no_key_syncer = IncrementalBranchSyncer(
+            initial_indexer=no_key_indexer,
+            repo_client=no_key_indexer.repo_client,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+        )
+        sync_rep = await no_key_syncer.sync_push(
+            repo_full_name="acme/placeholder",
+            after_sha="sha_main_2",
+            last_indexed_sha="sha_main_1",
+            repo_id="r-ph",
+        )
+        assert sync_rep.mode == "incremental_compare"
+        assert sync_rep.upserted_points == 1
+
+        # 3. embedder=None raises EmbeddingConfigError on docs or embed_code_chunks=True
+        current_tree[:] = tree_entries
+        with pytest.raises(EmbeddingConfigError):
+            await no_key_indexer.index_repository("acme/placeholder", repo_id="r-ph")
+
+        opt_in_no_key = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            embed_code_chunks=True,
+        )
+        with pytest.raises(EmbeddingConfigError):
+            await opt_in_no_key.index_repository("acme/placeholder", repo_id="r-ph")
+
+
+async def test_cli_embed_code_chunks_flag_and_worker_no_gemini_key_code_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.cli.commands.index import run_cli_index
+
+    captured_kwargs: list[dict[str, Any]] = []
+
+    class _FakeOwnedHttp:
+        async def aclose(self) -> None:
+            return None
+
+    class _FakeOwnedEngine:
+        async def dispose(self) -> None:
+            return None
+
+    class _FakeOwnedStore:
+        async def aclose(self) -> None:
+            return None
+
+    class _FakeIndexer:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.append(kwargs)
+
+        async def index_repository(self, *_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                repo_full_name="acme/flag",
+                repo_id="r-flag",
+                default_branch="main",
+                indexed_branch="main",
+                commit_sha="1" * 40,
+                tree_entries=1,
+                eligible_files=1,
+                unchanged_files_skipped=0,
+                fetched_files=1,
+                skipped_files=0,
+                code_chunks=1,
+                doc_chunks=0,
+                embedded_points=0,
+                upserted_points=1,
+                stale_points_deleted=0,
+                persisted_cursor=True,
+                truncated_tree=False,
+                elapsed_ms=5.0,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "codesight.cli.commands.index.httpx.AsyncClient", lambda **_k: _FakeOwnedHttp()
+    )
+    monkeypatch.setattr(
+        "codesight.cli.commands.index.create_db_engine", lambda _s: _FakeOwnedEngine()
+    )
+    monkeypatch.setattr("codesight.cli.commands.index.create_session_factory", lambda _e: object())
+    monkeypatch.setattr(
+        "codesight.cli.commands.index.QdrantZeroCodeStore", lambda **_k: _FakeOwnedStore()
+    )
+    monkeypatch.setattr("codesight.cli.commands.index.InitialRepoIndexer", _FakeIndexer)
+
+    # Code-only run_cli_index without GEMINI_API_KEY defaults embedder=None, embed_code_chunks=False
+    await run_cli_index("acme/flag", settings=_make_settings(gemini_key=""))
+    assert captured_kwargs[-1]["embedder"] is None
+    assert captured_kwargs[-1]["embed_code_chunks"] is False
+
+    # Passing embed_code_chunks=True without GEMINI_API_KEY fails fast
+    with pytest.raises(EmbeddingConfigError):
+        await run_cli_index(
+            "acme/flag",
+            embed_code_chunks=True,
+            settings=_make_settings(gemini_key=""),
+        )
+
+    # Worker push sync with github_token set and gemini_key="" runs PushSyncRunner in dev/CI
+    runner_calls: list[tuple[Any, bool]] = []
+
+    class _FakePushSyncRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            runner_calls.append(
+                (kwargs.get("embedder"), kwargs["settings"].index_embed_code_chunks)
+            )
+
+        async def execute(self, _payload: Any, *, is_final_attempt: bool = False) -> dict[str, str]:
+            return {"status": "completed", "mode": "incremental_compare", "trace_id": "t-no-gem"}
+
+    monkeypatch.setattr("codesight.worker.tasks.indexing_tasks.PushSyncRunner", _FakePushSyncRunner)
+    push_res = await run_push_webhook_task(
+        {
+            "repo_id": str(uuid.uuid4()),
+            "repo_full_name": "acme/flag",
+            "after_sha": "abc1234",
+        },
+        settings=_make_settings(gemini_key=""),
+    )
+    assert push_res["status"] == "completed"
+    assert runner_calls == [(None, False)]
+
+    # PushSyncRunner.execute without GEMINI_API_KEY leaves embedder=None when opt-in is False,
+    # and raises EmbeddingConfigError when index_embed_code_chunks=True.
+    monkeypatch.undo()
+    observed_syncer_kwargs: list[dict[str, Any]] = []
+
+    class _FakeSyncer:
+        def __init__(self, **kwargs: Any) -> None:
+            observed_syncer_kwargs.append(kwargs)
+
+        async def sync_push(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                mode="incremental_compare",
+                changed_files=1,
+                upserted_points=1,
+                elapsed_ms=2.0,
+            )
+
+    monkeypatch.setattr(
+        "codesight.worker.tasks.indexing_tasks.IncrementalBranchSyncer", _FakeSyncer
+    )
+    no_gem_runner = PushSyncRunner(
+        settings=_make_settings(gemini_key=""),
+        http_client=SimpleNamespace(),  # type: ignore[arg-type]
+        redis_client=SimpleNamespace(),  # type: ignore[arg-type]
+        store=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    exec_res = await no_gem_runner.execute(
+        {
+            "repo_id": str(uuid.uuid4()),
+            "repo_full_name": "acme/flag",
+            "after_sha": "abc1234",
+        }
+    )
+    assert exec_res["status"] == "completed"
+    assert observed_syncer_kwargs[-1]["embedder"] is None
+    assert observed_syncer_kwargs[-1]["embed_code_chunks"] is False
+
+    opt_in_runner = PushSyncRunner(
+        settings=Settings(
+            _env_file=None,
+            github_token=SecretStr("ghp_test"),
+            gemini_api_key=None,
+            index_embed_code_chunks=True,
+        ),
+        http_client=SimpleNamespace(),  # type: ignore[arg-type]
+        redis_client=SimpleNamespace(),  # type: ignore[arg-type]
+        store=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(EmbeddingConfigError):
+        await opt_in_runner.execute(
+            {
+                "repo_id": str(uuid.uuid4()),
+                "repo_full_name": "acme/flag",
+                "after_sha": "abc1234",
+            }
+        )
+
+
+def test_cli_embed_code_chunks_flag_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli_calls: list[bool | None] = []
+
+    async def _capture_cli_run(*_args: Any, **kwargs: Any) -> Any:
+        cli_calls.append(kwargs.get("embed_code_chunks"))
+        return SimpleNamespace(
+            repo_full_name="acme/flag",
+            repo_id="r-flag",
+            default_branch="main",
+            indexed_branch="main",
+            commit_sha="1" * 40,
+            tree_entries=1,
+            eligible_files=1,
+            unchanged_files_skipped=0,
+            fetched_files=1,
+            skipped_files=0,
+            code_chunks=1,
+            doc_chunks=0,
+            embedded_points=1,
+            upserted_points=1,
+            stale_points_deleted=0,
+            persisted_cursor=True,
+            truncated_tree=False,
+            elapsed_ms=5.0,
+        )
+
+    monkeypatch.setattr("codesight.cli.commands.index.get_settings", lambda: _make_settings())
+    monkeypatch.setattr("codesight.cli.commands.index.run_cli_index", _capture_cli_run)
+    runner = CliRunner()
+    res_on = runner.invoke(cli_app, ["index", "acme/flag", "--embed-code-chunks"])
+    assert res_on.exit_code == 0
+    res_off = runner.invoke(cli_app, ["index", "acme/flag", "--no-embed-code-chunks"])
+    assert res_off.exit_code == 0
+    assert cli_calls == [True, False]

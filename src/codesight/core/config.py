@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     # Week 1 E2E milestone smoke review behavior (set False when LangGraph AI pipeline takes over)
     week1_smoke_inline_comment: bool = True
 
+    # Hybrid Code RAG indexing & Gemini embedding quota discipline
+    index_embed_code_chunks: bool = False
+    gemini_embed_tpm_budget: int = Field(default=25_000, ge=1_000)
+    gemini_embed_concurrency: int = Field(default=2, ge=1, le=10)
+
     # Optional Phase 2+ secrets (kept None until configured)
     github_app_id: str | None = None
     github_private_key: SecretStr | None = None
@@ -90,6 +95,13 @@ class Settings(BaseSettings):
     def has_github_credentials(self) -> bool:
         """Return True when either GitHub App or PAT credentials are configured."""
         return self.has_github_app_credentials or self.has_github_token
+
+    @property
+    def has_gemini_api_key(self) -> bool:
+        """Return True when a non-empty GEMINI_API_KEY is configured."""
+        return bool(
+            self.gemini_api_key is not None and self.gemini_api_key.get_secret_value().strip()
+        )
 
     def _build_postgres_dsn(self, scheme: str) -> str:
         user = quote_plus(self.postgres_user)

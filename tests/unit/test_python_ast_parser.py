@@ -383,9 +383,13 @@ def test_python_ast_parser_additional_edge_cases_and_models() -> None:
     )
     emb = chunk_with_decorators.build_embedding_text()
     assert "decorators: @traced" in emb
-    assert "imports: os" in emb
+    assert "imports:" not in emb
     assert "docstring:" not in emb
     assert "calls:" not in emb
+    assert chunk_with_decorators.to_qdrant_payload(
+        repo_full_name="org/repo",
+        blob_sha="sha-dec",
+    )["imports"] == ["os"]
 
     source = '''
 from . import local_mod

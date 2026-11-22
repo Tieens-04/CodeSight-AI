@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from types import TracebackType
@@ -41,11 +43,15 @@ from codesight.rag.models import (
 
 type ExistingPointIdChecker = Callable[[Sequence[str]], Awaitable[AbstractSet[str]]]
 type SleepFn = Callable[[float], Awaitable[None]]
+type ClockFn = Callable[[], float]
 type EmbeddingTaskType = Literal["RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"]
 
-DEFAULT_MAX_RETRIES: Final[int] = 4
+DEFAULT_MAX_RETRIES: Final[int] = 5
 DEFAULT_RETRY_BASE_SECONDS: Final[float] = 1.0
-DEFAULT_RETRY_CAP_SECONDS: Final[float] = 30.0
+DEFAULT_RETRY_CAP_SECONDS: Final[float] = 65.0
+DEFAULT_EMBED_MAX_RETRIES: Final[int] = DEFAULT_MAX_RETRIES
+DEFAULT_EMBED_RETRY_CAP_SECONDS: Final[float] = DEFAULT_RETRY_CAP_SECONDS
+DEFAULT_TPM_WINDOW_SECONDS: Final[float] = 60.0
 _RETRIABLE_CLIENT_STATUS_CODES: Final[frozenset[int]] = frozenset({408, 429})
 _TRANSIENT_HTTPX_CLASS_NAMES: Final[frozenset[str]] = frozenset(
     {"TimeoutException", "NetworkError", "RemoteProtocolError", "ProxyError"}
@@ -61,6 +67,117 @@ def _extract_response_headers(exc: BaseException) -> Mapping[str, str]:
     if isinstance(raw_headers, Mapping):
         return {str(k): str(v) for k, v in raw_headers.items()}
     return {}
+
+
+def _parse_retry_delay_value(raw_delay: object) -> float | None:
+    if isinstance(raw_delay, (int, float)) and not isinstance(raw_delay, bool):
+        parsed = float(raw_delay)
+    elif isinstance(raw_delay, str):
+        cleaned = raw_delay.strip()
+        if cleaned.endswith(("s", "S")):
+            cleaned = cleaned[:-1].strip()
+        if not cleaned:
+            return None
+        try:
+            parsed = float(cleaned)
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return None
+    return parsed
+
+
+def parse_gemini_retry_delay(exc: BaseException, headers: Mapping[str, str]) -> float | None:
+    """Extract positive retry delay from `google.rpc.RetryInfo` before `Retry-After` headers."""
+    details = getattr(exc, "details", None)
+    if isinstance(details, Mapping):
+        error_obj = details.get("error")
+        nested_details = error_obj.get("details") if isinstance(error_obj, Mapping) else None
+        top_details = details.get("details")
+        for detail_list in (nested_details, top_details):
+            if not isinstance(detail_list, Sequence) or isinstance(detail_list, (str, bytes)):
+                continue
+            for item in detail_list:
+                if not isinstance(item, Mapping):
+                    continue
+                if "RetryInfo" not in str(item.get("@type", "")):
+                    continue
+                parsed = _parse_retry_delay_value(item.get("retryDelay"))
+                if parsed is not None:
+                    return parsed
+    return parse_retry_after_header(headers)
+
+
+class _AsyncTPMLimiter:
+    """Sliding-window 60-second TPM quota pacer for Gemini embedding batches."""
+
+    def __init__(
+        self,
+        tpm_budget: int | None,
+        sleep_fn: SleepFn = asyncio.sleep,
+        clock_fn: ClockFn = time.monotonic,
+        *,
+        window_seconds: float = DEFAULT_TPM_WINDOW_SECONDS,
+    ) -> None:
+        if tpm_budget is not None:
+            validate_positive_int(tpm_budget, name="tpm_budget")
+        if window_seconds <= 0.0:
+            raise ValueError("window_seconds must be > 0.")
+        self._tpm_budget = tpm_budget
+        self._sleep_fn = sleep_fn
+        self._clock_fn = clock_fn
+        self._window_seconds = window_seconds
+        self._lock = asyncio.Lock()
+        self._events: deque[tuple[float, int]] = deque()
+        self._used_tokens = 0
+        self._virtual_offset = 0.0
+
+    @staticmethod
+    def estimate_tokens(texts: Sequence[str]) -> int:
+        """Estimate batch tokens conservatively using `chars // 4`."""
+        if not texts:
+            return 0
+        total_chars = sum(len(text) for text in texts)
+        return max(1, total_chars // 4) if total_chars > 0 else 0
+
+    def _now(self) -> float:
+        return self._clock_fn() + self._virtual_offset
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self._window_seconds
+        while self._events and self._events[0][0] <= cutoff:
+            _, expired = self._events.popleft()
+            self._used_tokens -= expired
+
+    async def acquire(self, texts_or_tokens: Sequence[str] | int) -> int:
+        """Wait until `texts_or_tokens` fits in the 60s TPM window, then reserve its budget."""
+        if isinstance(texts_or_tokens, bool):
+            raise TypeError("texts_or_tokens must be a Sequence[str] or int, not bool.")
+        if isinstance(texts_or_tokens, int):
+            tokens = max(0, texts_or_tokens)
+        else:
+            tokens = self.estimate_tokens(texts_or_tokens)
+        if self._tpm_budget is None or tokens <= 0:
+            return tokens
+
+        async with self._lock:
+            while True:
+                now = self._now()
+                self._prune(now)
+                if self._used_tokens == 0 or (self._used_tokens + tokens) <= self._tpm_budget:
+                    self._events.append((now, tokens))
+                    self._used_tokens += tokens
+                    return tokens
+                oldest_ts, _ = self._events[0]
+                delay = max(0.01, (oldest_ts + self._window_seconds) - now)
+                before_sleep = self._clock_fn()
+                await self._sleep_fn(delay)
+                elapsed = max(0.0, self._clock_fn() - before_sleep)
+                if elapsed < delay * 0.5:
+                    # Support non-advancing sleep_fn test stubs without spinning.
+                    self._virtual_offset += delay - elapsed
 
 
 def _is_transient_transport_error(exc: BaseException) -> bool:
@@ -94,11 +211,13 @@ class GeminiEmbedder:
         model: str = EMBEDDING_MODEL_NAME,
         output_dimensionality: int = EMBEDDING_DIMENSIONS,
         batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
-        max_concurrency: int = DEFAULT_RPM_CONCURRENCY,
+        max_concurrency: int | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS,
         retry_cap_seconds: float = DEFAULT_RETRY_CAP_SECONDS,
+        tpm_budget: int | None = None,
         sleep_fn: SleepFn = asyncio.sleep,
+        clock_fn: ClockFn = time.monotonic,
         rng: random.Random = _SYSTEM_RNG,
     ) -> None:
         if output_dimensionality != EMBEDDING_DIMENSIONS:
@@ -110,7 +229,27 @@ class GeminiEmbedder:
             name="batch_size",
             maximum=MAX_EMBED_BATCH_SIZE,
         )
-        self._max_concurrency = validate_positive_int(max_concurrency, name="max_concurrency")
+        if max_concurrency is not None:
+            resolved_concurrency = validate_positive_int(max_concurrency, name="max_concurrency")
+        elif client is None and settings is not None:
+            resolved_concurrency = validate_positive_int(
+                settings.gemini_embed_concurrency,
+                name="max_concurrency",
+            )
+        else:
+            resolved_concurrency = DEFAULT_RPM_CONCURRENCY
+        self._max_concurrency = resolved_concurrency
+
+        if tpm_budget is not None:
+            resolved_tpm_budget: int | None = validate_positive_int(tpm_budget, name="tpm_budget")
+        elif client is None and settings is not None:
+            resolved_tpm_budget = validate_positive_int(
+                settings.gemini_embed_tpm_budget,
+                name="tpm_budget",
+            )
+        else:
+            resolved_tpm_budget = None
+
         if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
             raise ValueError("max_retries must be a non-negative integer.")
         if retry_base_seconds <= 0.0 or retry_cap_seconds < retry_base_seconds:
@@ -124,6 +263,15 @@ class GeminiEmbedder:
         self._sleep_fn = sleep_fn
         self._rng = rng
         self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        self._tpm_limiter: _AsyncTPMLimiter | None = (
+            _AsyncTPMLimiter(
+                resolved_tpm_budget,
+                sleep_fn=sleep_fn,
+                clock_fn=clock_fn,
+            )
+            if resolved_tpm_budget is not None
+            else None
+        )
         self._client_lock = asyncio.Lock()
         self._client_future: asyncio.Future[Any] | None = None
         self._closed = False
@@ -256,7 +404,7 @@ class GeminiEmbedder:
         retry_after: float | None = None,
     ) -> float:
         if retry_after is not None:
-            return retry_after
+            return min(self._retry_cap_seconds, max(1.0, retry_after))
         ceiling = min(self._retry_cap_seconds, self._retry_base_seconds * float(2**attempt))
         return self._rng.uniform(0.0, ceiling)
 
@@ -289,6 +437,12 @@ class GeminiEmbedder:
                             if consume_texts is None:
                                 raise ValueError("Either texts or consume_texts must be provided.")
                             materialized = consume_texts()
+                        if self._tpm_limiter is not None:
+                            await self._tpm_limiter.acquire(materialized)
+                        if abort_event is not None and abort_event.is_set():
+                            raise asyncio.CancelledError(
+                                "Embedding run aborted after sibling failure."
+                            )
                         response = await client.aio.models.embed_content(
                             model=self._model,
                             contents=materialized,
@@ -305,7 +459,7 @@ class GeminiEmbedder:
                             f"Gemini embedding rejected with non-retriable HTTP {status_code}."
                         ) from exc
                     headers = _extract_response_headers(exc)
-                    retry_after = parse_retry_after_header(headers)
+                    retry_after = parse_gemini_retry_delay(exc, headers)
                     if attempt >= self._max_retries:
                         if status_code == 429:
                             raise RateLimitTaskError(
@@ -328,7 +482,7 @@ class GeminiEmbedder:
                 except errors.ServerError as exc:
                     status_code = getattr(exc, "code", 500)
                     headers = _extract_response_headers(exc)
-                    retry_after = parse_retry_after_header(headers)
+                    retry_after = parse_gemini_retry_delay(exc, headers)
                     if attempt >= self._max_retries:
                         raise RetryableTaskError(
                             f"Gemini embedding server error (HTTP {status_code}) after retries."

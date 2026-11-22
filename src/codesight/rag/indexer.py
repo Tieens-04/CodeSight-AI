@@ -9,6 +9,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -38,10 +39,15 @@ from codesight.diff.file_filter import FileFilter, normalize_diff_path
 from codesight.rag.doc_chunker import MarkdownDocChunker, is_architecture_doc_path
 from codesight.rag.embedder import ExistingPointIdChecker, GeminiEmbedder
 from codesight.rag.models import (
+    CODE_CHUNK_PLACEHOLDER_VECTOR,
     MAX_TRANSIENT_SNIPPET_CHARS,
+    EmbeddingConfigError,
+    QdrantZeroCodePoint,
     TransientEmbeddingItem,
     ZeroCodeViolationError,
     validate_positive_int,
+    validate_uuid_point_id,
+    validate_zero_code_payload,
 )
 from codesight.rag.qdrant_store import QdrantPointRef, QdrantZeroCodeStore
 from codesight.vcs._http import (
@@ -930,13 +936,16 @@ def _extract_transient_items_from_blob(
     indexed_at: str,
     ast_registry: ASTParserRegistry,
     doc_chunker: MarkdownDocChunker,
+    embed_code_chunks: bool = False,
 ) -> tuple[list[TransientEmbeddingItem], int, int]:
     """Parse one in-RAM blob into TransientEmbeddingItems and return `(items, code, doc)` counts."""
     if ast_registry.supports(file_path):
         parsed = ast_registry.parse_file(raw_bytes, file_path=file_path)
         if parsed is None or not parsed.chunks:
             return [], 0, 0
-        needs_snippets = any(chunk.is_subchunk and not chunk.docstring for chunk in parsed.chunks)
+        needs_snippets = embed_code_chunks and any(
+            chunk.is_subchunk and not chunk.docstring for chunk in parsed.chunks
+        )
         source_lines: list[str] = (
             raw_bytes.decode("utf-8", errors="replace")
             .replace("\r\n", "\n")
@@ -953,7 +962,7 @@ def _extract_transient_items_from_blob(
                     start_line=chunk.start_line,
                     end_line=chunk.end_line,
                 )
-                if chunk.is_subchunk and not chunk.docstring
+                if needs_snippets and chunk.is_subchunk and not chunk.docstring
                 else None
             )
             items.append(
@@ -987,6 +996,90 @@ def _extract_transient_items_from_blob(
     return [], 0, 0
 
 
+async def _prepare_and_embed_wave_items(
+    wave_items: Sequence[TransientEmbeddingItem],
+    *,
+    embedder: GeminiEmbedder | None,
+    scoped_id_checker: ExistingPointIdChecker | None,
+    embed_code_chunks: bool,
+) -> tuple[tuple[QdrantZeroCodePoint, ...], int]:
+    """Deduplicate wave items, skip existing Qdrant IDs, and embed docs (or all if opt-in)."""
+    if not wave_items:
+        return (), 0
+
+    try:
+        if embed_code_chunks:
+            if embedder is None:
+                raise EmbeddingConfigError(
+                    "GEMINI_API_KEY is required when embed_code_chunks=True."
+                )
+            embed_res = await embedder.embed_items(
+                wave_items,
+                existing_id_checker=scoped_id_checker,
+            )
+            return embed_res.points, embed_res.embedded_count
+
+        unique_entries: list[tuple[str, dict[str, Any], TransientEmbeddingItem]] = []
+        seen_ids: set[str] = set()
+        for item in wave_items:
+            canonical_id = validate_uuid_point_id(item.point_id)
+            clean_payload = validate_zero_code_payload(item.payload, point_id=canonical_id)
+            if canonical_id in seen_ids:
+                item.clear_transient_text()
+                continue
+            seen_ids.add(canonical_id)
+            unique_entries.append((canonical_id, clean_payload, item))
+
+        existing_ids: AbstractSet[str] = frozenset()
+        if scoped_id_checker is not None and unique_entries:
+            raw_existing = await scoped_id_checker([cid for cid, _, _ in unique_entries])
+            existing_ids = {eid.strip().lower() for eid in raw_existing}
+
+        missing_entries: list[tuple[str, dict[str, Any], TransientEmbeddingItem]] = []
+        for cid, clean_payload, item in unique_entries:
+            if cid in existing_ids:
+                item.clear_transient_text()
+            else:
+                missing_entries.append((cid, clean_payload, item))
+
+        if not missing_entries:
+            return (), 0
+
+        placeholder_by_id: dict[str, QdrantZeroCodePoint] = {}
+        doc_items: list[TransientEmbeddingItem] = []
+        for cid, clean_payload, item in missing_entries:
+            if item.chunk_type == "code":
+                item.clear_transient_text()
+                placeholder_by_id[cid] = QdrantZeroCodePoint(
+                    point_id=cid,
+                    vector=CODE_CHUNK_PLACEHOLDER_VECTOR,
+                    payload=clean_payload,
+                )
+            else:
+                doc_items.append(item)
+
+        embedded_by_id: dict[str, QdrantZeroCodePoint] = {}
+        embedded_count = 0
+        if doc_items:
+            if embedder is None:
+                raise EmbeddingConfigError(
+                    "GEMINI_API_KEY is required to embed architecture_doc chunks."
+                )
+            doc_res = await embedder.embed_items(doc_items, existing_id_checker=None)
+            embedded_count = doc_res.embedded_count
+            for pt in doc_res.points:
+                embedded_by_id[pt.point_id] = pt
+
+        ordered_points = tuple(
+            placeholder_by_id[cid] if cid in placeholder_by_id else embedded_by_id[cid]
+            for cid, _, _ in missing_entries
+        )
+        return ordered_points, embedded_count
+    finally:
+        for item in wave_items:
+            item.clear_transient_text()
+
+
 class InitialRepoIndexer:
     """Indexes a repository's AST symbols and architecture docs into Qdrant in RAM waves."""
 
@@ -994,7 +1087,7 @@ class InitialRepoIndexer:
         self,
         *,
         auth_provider: GitHubAuthProvider | None,
-        embedder: GeminiEmbedder,
+        embedder: GeminiEmbedder | None = None,
         store: QdrantZeroCodeStore,
         http_client: httpx.AsyncClient | None = None,
         repo_client: GitHubRepoIndexClient | None = None,
@@ -1007,6 +1100,7 @@ class InitialRepoIndexer:
         wave_size: int = DEFAULT_INDEX_WAVE_SIZE,
         max_blob_bytes: int = MAX_INDEXABLE_BLOB_BYTES,
         allow_public_fallback: bool = False,
+        embed_code_chunks: bool = False,
     ) -> None:
         self._auth = auth_provider
         self._embedder = embedder
@@ -1038,6 +1132,7 @@ class InitialRepoIndexer:
         self._wave_size = validate_positive_int(wave_size, name="wave_size")
         self._max_blob_bytes = validate_positive_int(max_blob_bytes, name="max_blob_bytes")
         self._allow_public_fallback = allow_public_fallback
+        self._embed_code_chunks = embed_code_chunks
 
     @property
     def repo_client(self) -> GitHubRepoIndexClient:
@@ -1103,6 +1198,8 @@ class InitialRepoIndexer:
         """Index eligible Python/TS/TSX AST chunks and architecture docs for a repository."""
         started = time.perf_counter()
         slug = validate_repo_full_name(repo_full_name)
+        if self._embed_code_chunks and self._embedder is None:
+            raise EmbeddingConfigError("GEMINI_API_KEY is required when embed_code_chunks=True.")
         repo_meta = await self._repo_client.fetch_repo_metadata(
             slug,
             installation_id=installation_id,
@@ -1271,6 +1368,7 @@ class InitialRepoIndexer:
                             indexed_at=indexed_at,
                             ast_registry=self._ast_registry,
                             doc_chunker=self._doc_chunker,
+                            embed_code_chunks=self._embed_code_chunks,
                         )
                         wave_items.extend(file_items)
                         live_point_ids.update(item.point_id for item in file_items)
@@ -1292,13 +1390,15 @@ class InitialRepoIndexer:
                 fetched_pairs.clear()
 
                 if wave_items:
-                    embed_res = await self._embedder.embed_items(
+                    points, embedded_cnt = await _prepare_and_embed_wave_items(
                         wave_items,
-                        existing_id_checker=scoped_id_checker,
+                        embedder=self._embedder,
+                        scoped_id_checker=scoped_id_checker,
+                        embed_code_chunks=self._embed_code_chunks,
                     )
-                    total_embedded += embed_res.embedded_count
-                    if embed_res.points:
-                        total_upserted += await self._store.upsert_points(embed_res.points)
+                    total_embedded += embedded_cnt
+                    if points:
+                        total_upserted += await self._store.upsert_points(points)
             finally:
                 for item in wave_items:
                     item.clear_transient_text()
@@ -1411,7 +1511,7 @@ class IncrementalBranchSyncer:
         *,
         initial_indexer: InitialRepoIndexer,
         repo_client: GitHubRepoIndexClient,
-        embedder: GeminiEmbedder,
+        embedder: GeminiEmbedder | None = None,
         store: QdrantZeroCodeStore,
         config_loader: RepoConfigLoader | None = None,
         ast_registry: ASTParserRegistry | None = None,
@@ -1422,6 +1522,7 @@ class IncrementalBranchSyncer:
         blob_concurrency: int = DEFAULT_BLOB_CONCURRENCY,
         wave_size: int = DEFAULT_INDEX_WAVE_SIZE,
         max_blob_bytes: int = MAX_INDEXABLE_BLOB_BYTES,
+        embed_code_chunks: bool = False,
     ) -> None:
         self._initial_indexer = initial_indexer
         self._repo_client = repo_client
@@ -1435,6 +1536,7 @@ class IncrementalBranchSyncer:
         self._blob_concurrency = validate_positive_int(blob_concurrency, name="blob_concurrency")
         self._wave_size = validate_positive_int(wave_size, name="wave_size")
         self._max_blob_bytes = validate_positive_int(max_blob_bytes, name="max_blob_bytes")
+        self._embed_code_chunks = embed_code_chunks
 
     @staticmethod
     def _build_noop_report(
@@ -1594,6 +1696,8 @@ class IncrementalBranchSyncer:
                 persisted_cursor=False,
                 started=started,
             )
+        if self._embed_code_chunks and self._embedder is None:
+            raise EmbeddingConfigError("GEMINI_API_KEY is required when embed_code_chunks=True.")
 
         slug_lock_key = slug.lower()
         clean_repo_id = repo_id.strip() if repo_id and repo_id.strip() else None
@@ -1872,6 +1976,7 @@ class IncrementalBranchSyncer:
                                 indexed_at=indexed_at,
                                 ast_registry=self._ast_registry,
                                 doc_chunker=self._doc_chunker,
+                                embed_code_chunks=self._embed_code_chunks,
                             )
                             wave_items.extend(file_items)
                             indexed_files += 1
@@ -1890,12 +1995,14 @@ class IncrementalBranchSyncer:
 
                     kept_point_ids.extend(item.point_id for item in wave_items)
                     if wave_items:
-                        embed_res = await self._embedder.embed_items(
+                        points, _ = await _prepare_and_embed_wave_items(
                             wave_items,
-                            existing_id_checker=scoped_id_checker,
+                            embedder=self._embedder,
+                            scoped_id_checker=scoped_id_checker,
+                            embed_code_chunks=self._embed_code_chunks,
                         )
-                        if embed_res.points:
-                            upserted_points += await self._store.upsert_points(embed_res.points)
+                        if points:
+                            upserted_points += await self._store.upsert_points(points)
                 finally:
                     for item in wave_items:
                         item.clear_transient_text()
