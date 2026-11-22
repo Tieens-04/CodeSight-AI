@@ -11,6 +11,7 @@ from tree_sitter import Language, Node
 from codesight.ast_engine._ast_utils import (
     DEFAULT_MAX_CHUNK_LINES,
     append_unique,
+    count_syntax_error_nodes,
     resolve_ast_language,
     span_touches_deletion_anchors,
     span_touches_sorted_lines,
@@ -122,9 +123,19 @@ def _filter_touched_chunks(
 def _collect_removed_symbols(
     before_parsed: ParsedASTFile | None,
     after_parsed: ParsedASTFile,
+    *,
+    before_error_count: int | None = None,
+    after_error_count: int | None = None,
 ) -> tuple[str, ...]:
     """Return ordered unique symbol names removed or renamed between before/after ASTs."""
-    if before_parsed is None or before_parsed.has_syntax_error or after_parsed.has_syntax_error:
+    if before_parsed is None or not before_parsed.chunks:
+        return ()
+    if after_parsed.has_syntax_error and not after_parsed.chunks:
+        return ()
+    if before_error_count is not None and after_error_count is not None:
+        if after_error_count > before_error_count:
+            return ()
+    elif after_parsed.has_syntax_error and not before_parsed.has_syntax_error:
         return ()
     after_symbol_names = {chunk.symbol_name for chunk in after_parsed.chunks}
     after_qualified_names = {chunk.qualified_name for chunk in after_parsed.chunks}
@@ -297,6 +308,7 @@ class ASTParserRegistry:
                 self.resolve_language(parsed_diff.old_path) if parsed_diff.old_path else None
             ) or language
             before_parsed: ParsedASTFile | None = None
+            before_root: Node | None = None
             before_list: tuple[FunctionComplexity, ...] = ()
             before_has_error = False
             if before_source is not None:
@@ -319,7 +331,18 @@ class ASTParserRegistry:
                         before_list, before_has_error = _analyze_typescript_tree(
                             before_root, before_bytes
                         )
-            removed_symbols = _collect_removed_symbols(before_parsed, parsed_file)
+            before_error_count = (
+                count_syntax_error_nodes(before_root) if before_root is not None else 0
+            )
+            after_error_count = (
+                count_syntax_error_nodes(after_root) if after_root is not None else 0
+            )
+            removed_symbols = _collect_removed_symbols(
+                before_parsed,
+                parsed_file,
+                before_error_count=before_error_count,
+                after_error_count=after_error_count,
+            )
             complexity = _compute_complexity_delta_from_metrics(
                 before_list,
                 before_has_error,

@@ -22,6 +22,7 @@ from codesight.ast_engine import (
 from codesight.ast_engine.models import MAX_SIGNATURE_CHARS, ParsedASTFile
 from codesight.diff.models import PatchFileEntry
 from codesight.diff.smart_diff_parser import SmartDiffParser
+from codesight.rag.models import TransientEmbeddingItem, ZeroCodeViolationError
 
 
 def _load_audit_payloads() -> Any:
@@ -1028,3 +1029,48 @@ def test_detect_missing_test_companion_ignores_ambient_dts_pyi_and_jsx_comments(
     assert report.added_source_logic_lines == 1
     assert report.is_untested is False
     assert report.source_files == ("src/ui/Banner.tsx", "src/ui/Mixed.tsx")
+
+
+def test_ts_string_literal_type_with_colon_keyword_passes_zerocode_guard() -> None:
+    src = 'export const notify = (mode: "Note: if set" | "Error: return null"): string => mode;\n'
+    chunks = TypeScriptASTParser().parse(src, file_path="src/notify.ts").chunks
+    item = TransientEmbeddingItem.from_code_chunk(
+        chunks[0], repo_full_name="acme/web", blob_sha="b2" * 20
+    )
+    assert item.payload["symbol_name"] == "notify"
+    assert AUDIT_PAYLOADS([{"id": item.point_id, "payload": item.payload}]) == []
+
+    # Backticks, single quotes, and escaped quotes in string-literal types also pass cleanly
+    escaped_src = (
+        "export const fmt = (tpl: `Warn: if \\`empty\\`` | 'Info: return 0'): string => tpl;\n"
+    )
+    escaped_chunks = TypeScriptASTParser().parse(escaped_src, file_path="src/fmt.ts").chunks
+    escaped_item = TransientEmbeddingItem.from_code_chunk(
+        escaped_chunks[0], repo_full_name="acme/web", blob_sha="b2" * 20
+    )
+    assert escaped_item.payload["symbol_name"] == "fmt"
+    assert AUDIT_PAYLOADS([{"id": escaped_item.point_id, "payload": escaped_item.payload}]) == []
+
+    # Genuine inline body leaks outside quotes remain strictly blocked
+    with pytest.raises(ZeroCodeViolationError, match="signature"):
+        TransientEmbeddingItem.from_code_chunk(
+            chunks[0].__class__(
+                **{
+                    **{
+                        f: getattr(chunks[0], f)
+                        for f in (
+                            "file_path",
+                            "language",
+                            "symbol_name",
+                            "qualified_name",
+                            "symbol_kind",
+                            "start_line",
+                            "end_line",
+                        )
+                    },
+                    "signature": 'export const notify = (mode: "Note: if set") => { return mode; }',
+                }
+            ),
+            repo_full_name="acme/web",
+            blob_sha="b2" * 20,
+        )

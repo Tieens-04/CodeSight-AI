@@ -11,6 +11,7 @@ import pytest
 
 from codesight.ast_engine.models import MAX_SIGNATURE_CHARS, CodeSymbolChunk, ParsedASTFile
 from codesight.ast_engine.python_parser import PythonASTParser
+from codesight.rag.models import TransientEmbeddingItem
 
 
 def _load_audit_payloads() -> Any:
@@ -151,7 +152,7 @@ def test_python_ast_parser_extracts_classes_methods_async_nested_decorators_and_
     assert len(process_chunk.decorators) == 1
     assert process_chunk.decorators[0].startswith("@retry(")
     assert process_chunk.signature == (
-        "async def process_payment( self, user_id: str, amount: float, ) -> dict[str, Any]"
+        "async def process_payment(self, user_id: str, amount: float) -> dict[str, Any]"
     )
     assert process_chunk.docstring == (
         "Execute payment workflow.\n\nHandles normalization via nested helper."
@@ -464,9 +465,7 @@ def test_signature_strips_trailing_and_inline_header_comments_nfr3() -> None:
 
     assert by_name["login"].signature == "def login(user: str) -> bool"
     assert by_name["AuthClient"].signature == "class AuthClient(Base)"
-    assert (
-        by_name["connect"].signature == 'def connect( host: str, tag: str = "#keep_me", ) -> bool'
-    )
+    assert by_name["connect"].signature == "def connect(host: str, tag: str) -> bool"
     assert by_name["Child"].signature == "class Child( Base, )"
 
     for name in ("login", "AuthClient", "Child"):
@@ -487,7 +486,7 @@ def test_signature_strips_trailing_and_inline_header_comments_nfr3() -> None:
     )
     assert "hunter2" not in connect_payload["signature"]
     assert "trailing" not in connect_payload["signature"]
-    assert '"#keep_me"' in connect_payload["signature"]
+    assert "#keep_me" not in connect_payload["signature"]
     assert (
         AUDIT_PAYLOADS(
             [
@@ -659,3 +658,26 @@ def test_docstring_warnings_future_imports_crlf_and_nested_scopes() -> None:
     assert by_qname["bytes_not_doc"].docstring is None
     assert by_qname["outer_factory.InnerModel"].symbol_kind == "class"
     assert by_qname["outer_factory.InnerModel.build"].symbol_kind == "method"
+
+
+def test_python_signature_strips_default_values_and_credentials() -> None:
+    src = (
+        "def connect(\n"
+        "    dsn: str = 'postgresql://admin:S3cr3tP4ss@db/app',\n"
+        "    api_key = 'sk-live-secret',\n"
+        "    help_msg: str = typer.Option('x', help='Search: if empty, raise error'),\n"
+        "    *args: int,\n"
+        "    retries: int = 3,\n"
+        ") -> bool:\n"
+        "    return True\n"
+    )
+    chunks = PythonASTParser().parse(src, file_path="src/db.py").chunks
+    assert len(chunks) == 1
+    sig = chunks[0].signature
+    assert sig == "def connect(dsn: str, api_key, help_msg: str, *args: int, retries: int) -> bool"
+    assert "S3cr3tP4ss" not in sig
+    assert "sk-live-secret" not in sig
+    item = TransientEmbeddingItem.from_code_chunk(
+        chunks[0], repo_full_name="acme/app", blob_sha="a1" * 20
+    )
+    assert "S3cr3tP4ss" not in str(item.payload)

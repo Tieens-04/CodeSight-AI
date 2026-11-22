@@ -473,3 +473,91 @@ def test_registry_resolve_pr_file_parses_after_source_only_once(
     assert [c.symbol_name for c in ctx.touched_chunks] == ["newlyAdded"]
     assert ctx.complexity is not None and ctx.complexity.net_delta_cc == 2
     assert parse_calls == 1
+
+
+def test_count_syntax_error_nodes_and_ts_removed_symbols_with_localized_syntax_error() -> None:
+    from tree_sitter import Parser as TSParser
+
+    from codesight.ast_engine._ast_utils import count_syntax_error_nodes
+    from codesight.ast_engine._python_ast import PYTHON_LANGUAGE
+    from codesight.ast_engine._typescript_ast import TYPESCRIPT_LANGUAGE
+
+    clean_ts = TSParser(TYPESCRIPT_LANGUAGE).parse(b"export function ok(): number { return 1; }\n")
+    assert count_syntax_error_nodes(clean_ts.root_node) == 0
+
+    broken_ts = TSParser(TYPESCRIPT_LANGUAGE).parse(
+        b"export function ok(): number { return 1; }\nexport const broken = ;\n"
+    )
+    assert count_syntax_error_nodes(broken_ts.root_node) >= 1
+
+    missing_py = TSParser(PYTHON_LANGUAGE).parse(b"def broken(:\n    pass\n")
+    assert count_syntax_error_nodes(missing_py.root_node) >= 1
+
+    # Localized TS syntax error in baseline must not blank out valid sibling removed_symbols
+    before_ts = (
+        "export function legacyHelper(): number {\n"
+        "  return 1;\n"
+        "}\n\n"
+        "export function keepMe(): number {\n"
+        "  return 2;\n"
+        "}\n\n"
+        "export const broken = ;\n"
+    )
+    after_ts_fixed = "export function keepMe(): number {\n  return 2;\n}\n"
+    after_ts_same_err = (
+        "export function keepMe(): number {\n  return 2;\n}\n\nexport const broken = ;\n"
+    )
+    patch = (
+        "@@ -1,5 +1,1 @@\n"
+        "-export function legacyHelper(): number {\n"
+        "-  return 1;\n"
+        "-}\n"
+        "-\n"
+        " export function keepMe(): number {\n"
+    )
+    file_diff = (
+        SmartDiffParser()
+        .parse_patch_entries(
+            [PatchFileEntry(filename="src/helpers.ts", patch=patch, status="modified")]
+        )
+        .files[0]
+    )
+    registry = ASTParserRegistry()
+
+    ctx_fixed = registry.resolve_pr_file(
+        file_diff,
+        after_source=after_ts_fixed,
+        before_source=before_ts,
+    )
+    assert ctx_fixed.removed_symbols == ("legacyHelper",)
+
+    ctx_same_err = registry.resolve_pr_file(
+        file_diff,
+        after_source=after_ts_same_err,
+        before_source=before_ts,
+    )
+    assert ctx_same_err.removed_symbols == ("legacyHelper",)
+
+    # Clean before + newly introduced syntax error breaking legacyHelper in after -> empty removed
+    clean_before = (
+        "export function legacyHelper(): number {\n"
+        "  return 1;\n"
+        "}\n\n"
+        "export function keepMe(): number {\n"
+        "  return 2;\n"
+        "}\n"
+    )
+    broken_after = (
+        "export function legacyHelper( {\n"
+        "  return 1;\n"
+        "}\n\n"
+        "export function keepMe(): number {\n"
+        "  return 2;\n"
+        "}\n"
+    )
+    ctx_new_err = registry.resolve_pr_file(
+        file_diff,
+        after_source=broken_after,
+        before_source=clean_before,
+    )
+    assert ctx_new_err.removed_symbols == ()

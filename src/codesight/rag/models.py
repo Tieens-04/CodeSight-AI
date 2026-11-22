@@ -106,12 +106,40 @@ _PY_ONLY_INLINE_BODY_LEAK_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
+def mask_quoted_literals(text: str) -> str:
+    """Replace characters inside quoted literals (`'...'`, `\"...\"`, `` `...` ``) with spaces."""
+    if "'" not in text and '"' not in text and "`" not in text:
+        return text
+    out: list[str] = []
+    active_quote: str | None = None
+    escaped = False
+    for ch in text:
+        if active_quote is None:
+            if ch in ("'", '"', "`"):
+                active_quote = ch
+            out.append(ch)
+            continue
+        if escaped:
+            escaped = False
+            out.append(" ")
+        elif ch == "\\":
+            escaped = True
+            out.append(" ")
+        elif ch == active_quote:
+            active_quote = None
+            out.append(ch)
+        else:
+            out.append(" ")
+    return "".join(out)
+
+
 def _has_inline_body_leak(signature: str, *, language: str) -> bool:
-    if INLINE_BODY_LEAK_RE.search(signature) is not None:
+    masked = mask_quoted_literals(signature)
+    if INLINE_BODY_LEAK_RE.search(masked) is not None:
         return True
     return (
         language not in {"typescript", "tsx"}
-        and _PY_ONLY_INLINE_BODY_LEAK_RE.search(signature) is not None
+        and _PY_ONLY_INLINE_BODY_LEAK_RE.search(masked) is not None
     )
 
 

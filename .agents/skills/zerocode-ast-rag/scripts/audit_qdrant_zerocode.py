@@ -77,12 +77,40 @@ _PY_ONLY_INLINE_BODY_LEAK_RE = re.compile(r"[:;]\s*(?:pass|raise)\b(?!\s*[,:=?}\
 SAFE_IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
+def mask_quoted_literals(text: str) -> str:
+    """Replace characters inside quoted literals (`'...'`, `\"...\"`, `` `...` ``) with spaces."""
+    if "'" not in text and '"' not in text and "`" not in text:
+        return text
+    out: list[str] = []
+    active_quote: str | None = None
+    escaped = False
+    for ch in text:
+        if active_quote is None:
+            if ch in ("'", '"', "`"):
+                active_quote = ch
+            out.append(ch)
+            continue
+        if escaped:
+            escaped = False
+            out.append(" ")
+        elif ch == "\\":
+            escaped = True
+            out.append(" ")
+        elif ch == active_quote:
+            active_quote = None
+            out.append(ch)
+        else:
+            out.append(" ")
+    return "".join(out)
+
+
 def _has_inline_body_leak(signature: str, *, language: str) -> bool:
-    if INLINE_BODY_LEAK_RE.search(signature) is not None:
+    masked = mask_quoted_literals(signature)
+    if INLINE_BODY_LEAK_RE.search(masked) is not None:
         return True
     return (
         language not in {"typescript", "tsx"}
-        and _PY_ONLY_INLINE_BODY_LEAK_RE.search(signature) is not None
+        and _PY_ONLY_INLINE_BODY_LEAK_RE.search(masked) is not None
     )
 
 
@@ -433,7 +461,29 @@ def run_self_test() -> int:
                 "imports": ["hmac", "hashlib"],
                 "cyclomatic_complexity": 3,
             },
-        }
+        },
+        {
+            "id": "550e8400-e29b-41d4-a716-446655440001",
+            "payload": {
+                "repo_id": "repo-1",
+                "repo_full_name": "org/repo",
+                "file_path": "src/notify.ts",
+                "blob_sha": "def5678",
+                "chunk_type": "code",
+                "language": "typescript",
+                "symbol_name": "notify",
+                "symbol_kind": "function",
+                "start_line": 1,
+                "end_line": 3,
+                "signature": (
+                    'export const notify = (mode: "Note: if set" | "Error: return null"): '
+                    "string => mode"
+                ),
+                "called_symbols": [],
+                "imports": [],
+                "cyclomatic_complexity": 1,
+            },
+        },
     ]
     assert audit_payloads(clean_points, canary_substrings=("CODESIGHT_CANARY_SECRET_1",)) == []
 

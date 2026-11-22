@@ -2231,3 +2231,179 @@ async def test_fr02_recreated_repo_rotates_qdrant_repo_id_and_skips_stale_repo_p
                     repo_id=str(old_uuid),
                 )
         assert lock_exc.value.retry_after_seconds == 15.0
+
+
+async def test_indexer_isolates_zerocode_guard_errors_per_file_and_skipped_guard_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.ast_engine.models import CodeSymbolChunk, ParsedASTFile
+    from codesight.ast_engine.registry import ASTParserRegistry
+    from codesight.rag import indexer as indexer_mod
+
+    blobs: dict[str, bytes] = {
+        "sha_good1": b"def good_one() -> int:\n    return 1\n",
+        "sha_bad_v1": b"def old_leaky() -> int:\n    return 0\n",
+        "sha_bad_v2": b"def bad_leaky() -> int:\n    return 99\n",
+        "sha_good2": b"def good_two() -> int:\n    return 2\n",
+        "sha_good3": b"def good_three() -> int:\n    return 3\n",
+    }
+    tree_entries = [
+        {"path": "src/good1.py", "mode": "100644", "type": "blob", "sha": "sha_good1", "size": 36},
+        {"path": "src/leaky.py", "mode": "100644", "type": "blob", "sha": "sha_bad_v2", "size": 37},
+        {"path": "src/good2.py", "mode": "100644", "type": "blob", "sha": "sha_good2", "size": 36},
+    ]
+    current_sha = "sha_head_guard"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/guard":
+            return httpx.Response(
+                200,
+                json={"id": 77, "full_name": "acme/guard", "default_branch": "main"},
+            )
+        if path.startswith("/repos/acme/guard/commits/"):
+            return httpx.Response(200, json={"sha": current_sha})
+        if path.startswith("/repos/acme/guard/contents/.codesight."):
+            return httpx.Response(404)
+        if path.startswith("/repos/acme/guard/git/trees/"):
+            return httpx.Response(
+                200,
+                json={"sha": current_sha, "truncated": False, "tree": tree_entries},
+            )
+        if path.startswith("/repos/acme/guard/git/blobs/"):
+            sha = path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={"sha": sha, "encoding": "base64", "content": _b64(blobs[sha])},
+            )
+        if "/compare/" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ahead",
+                    "total_commits": 1,
+                    "files": [
+                        {"filename": "src/good1.py", "status": "modified", "sha": "sha_good1"},
+                        {"filename": "src/leaky.py", "status": "modified", "sha": "sha_bad_v2"},
+                        {"filename": "src/good3.py", "status": "added", "sha": "sha_good3"},
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    orig_parse_file = ASTParserRegistry.parse_file
+
+    def _inject_leaky_parse(
+        self: ASTParserRegistry,
+        source: str | bytes,
+        *,
+        file_path: str,
+    ) -> ParsedASTFile | None:
+        if file_path == "src/leaky.py":
+            return ParsedASTFile(
+                file_path=file_path,
+                language="python",
+                imports=(),
+                chunks=(
+                    CodeSymbolChunk(
+                        file_path=file_path,
+                        language="python",
+                        symbol_name="bad_leaky",
+                        qualified_name="bad_leaky",
+                        symbol_kind="function",
+                        start_line=1,
+                        end_line=2,
+                        signature="def bad_leaky(): return secret_token",
+                    ),
+                ),
+            )
+        return orig_parse_file(self, source, file_path=file_path)
+
+    monkeypatch.setattr(ASTParserRegistry, "parse_file", _inject_leaky_parse)
+
+    persisted_shas: list[str | None] = []
+
+    async def _fake_upsert_repository_state(
+        _session_factory: Any,
+        *,
+        full_name: str,
+        default_branch: str,
+        github_repo_id: int | None = None,
+        installation_id: int | None = None,
+        last_indexed_sha: str | None = None,
+    ) -> tuple[str, str | None]:
+        persisted_shas.append(last_indexed_sha)
+        return "repo-guard-1", last_indexed_sha
+
+    async def _fake_read_sync_state(*_args: Any, **_kwargs: Any) -> Any:
+        return indexer_mod._RepositorySyncState(
+            repo_id="repo-guard-1",
+            last_indexed_sha=current_sha,
+            default_branch="main",
+            installation_id=None,
+            is_stale_conflict=False,
+        )
+
+    monkeypatch.setattr(indexer_mod, "upsert_repository_state", _fake_upsert_repository_state)
+    monkeypatch.setattr(indexer_mod, "_read_repository_sync_state", _fake_read_sync_state)
+
+    settings = _make_settings()
+    fake_genai = _FakeGenAIClient()
+    store = _InMemoryZeroCodeStore()
+    # Seed a stale point for src/leaky.py so we verify it gets pruned on guard skip
+    store.points["00000000-0000-5000-8000-000000000999"] = {
+        "repo_id": "repo-guard-1",
+        "repo_full_name": "acme/guard",
+        "file_path": "src/leaky.py",
+        "blob_sha": "sha_bad_v1",
+        "symbol_name": "old_leaky",
+    }
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(settings, http_client=http)
+        embedder = GeminiEmbedder(client=fake_genai)  # type: ignore[arg-type]
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+
+        report = await indexer.index_repository("acme/guard", repo_id="repo-guard-1")
+        assert report.skipped_guard_files == 1
+        assert report.persisted_cursor is True
+        assert persisted_shas[-1] == current_sha
+        assert {p["symbol_name"] for p in store.points.values()} == {"good_one", "good_two"}
+
+        # Incremental compare path also isolates guard failures per file and prunes stale points
+        store.points["00000000-0000-5000-8000-000000000998"] = {
+            "repo_id": "repo-guard-1",
+            "repo_full_name": "acme/guard",
+            "file_path": "src/leaky.py",
+            "blob_sha": "sha_bad_v1",
+            "symbol_name": "old_leaky",
+        }
+        syncer = IncrementalBranchSyncer(
+            initial_indexer=indexer,
+            repo_client=indexer.repo_client,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+        sync_report = await syncer.sync_push(
+            repo_full_name="acme/guard",
+            after_sha="sha_next_guard",
+            last_indexed_sha=current_sha,
+            repo_id="repo-guard-1",
+        )
+        assert sync_report.mode == "incremental_compare"
+        assert sync_report.skipped_guard_files == 1
+        assert sync_report.indexed_files == 2
+        assert sync_report.persisted_cursor is True
+        assert persisted_shas[-1] == "sha_next_guard"
+        assert {p["symbol_name"] for p in store.points.values()} == {
+            "good_one",
+            "good_two",
+            "good_three",
+        }

@@ -40,6 +40,7 @@ from codesight.rag.embedder import ExistingPointIdChecker, GeminiEmbedder
 from codesight.rag.models import (
     MAX_TRANSIENT_SNIPPET_CHARS,
     TransientEmbeddingItem,
+    ZeroCodeViolationError,
     validate_positive_int,
 )
 from codesight.rag.qdrant_store import QdrantPointRef, QdrantZeroCodeStore
@@ -177,6 +178,7 @@ class InitialIndexReport:
     persisted_cursor: bool
     truncated_tree: bool
     elapsed_ms: float
+    skipped_guard_files: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +197,7 @@ class IncrementalSyncReport:
     stale_points_deleted: int
     persisted_cursor: bool
     elapsed_ms: float
+    skipped_guard_files: int = 0
 
 
 def _make_index_error(message: str, status_code: int | None) -> RepoIndexError:
@@ -1221,6 +1224,8 @@ class InitialRepoIndexer:
         indexed_at = datetime.now(UTC).isoformat()
         total_to_fetch = len(files_to_fetch)
         processed_files = 0
+        skipped_guard_files = 0
+        skipped_guard_paths: set[str] = set()
         total_code_chunks = 0
         total_doc_chunks = 0
         total_embedded = 0
@@ -1271,6 +1276,17 @@ class InitialRepoIndexer:
                         live_point_ids.update(item.point_id for item in file_items)
                         total_code_chunks += code_cnt
                         total_doc_chunks += doc_cnt
+                    except ZeroCodeViolationError as exc:
+                        skipped_guard_files += 1
+                        skipped_guard_paths.add(entry.path)
+                        current_blob_by_path.pop(entry.path, None)
+                        logger.warning(
+                            "repo_index_file_skipped_zerocode_guard",
+                            repo=canonical_slug,
+                            file_path=entry.path,
+                            blob_sha=entry.blob_sha,
+                            error=str(exc),
+                        )
                     finally:
                         del raw_bytes
                 fetched_pairs.clear()
@@ -1317,7 +1333,7 @@ class InitialRepoIndexer:
                 if expected_sha is not None:
                     if ref_item.blob_sha != expected_sha:
                         stale_ids.append(ref_item.point_id)
-                elif not tree.truncated:
+                elif not tree.truncated or ref_item.file_path in skipped_guard_paths:
                     stale_ids.append(ref_item.point_id)
             if stale_ids:
                 stale_points_deleted = await self._store.delete_points_by_ids(
@@ -1347,6 +1363,7 @@ class InitialRepoIndexer:
             eligible_files=len(eligible_entries),
             unchanged_files_skipped=unchanged_files_skipped,
             fetched_files=total_to_fetch,
+            skipped_guard_files=skipped_guard_files,
             code_chunks=total_code_chunks,
             doc_chunks=total_doc_chunks,
             upserted_points=total_upserted,
@@ -1373,6 +1390,7 @@ class InitialRepoIndexer:
             persisted_cursor=cursor_persisted,
             truncated_tree=tree.truncated,
             elapsed_ms=elapsed_ms,
+            skipped_guard_files=skipped_guard_files,
         )
 
 
@@ -1539,12 +1557,13 @@ class IncrementalBranchSyncer:
             after_sha=after_sha,
             mode=mode,
             changed_files=init_report.fetched_files,
-            indexed_files=init_report.fetched_files,
+            indexed_files=max(0, init_report.fetched_files - init_report.skipped_guard_files),
             deleted_file_paths=0,
             upserted_points=init_report.upserted_points,
             stale_points_deleted=init_report.stale_points_deleted,
             persisted_cursor=init_report.persisted_cursor,
             elapsed_ms=elapsed_ms,
+            skipped_guard_files=init_report.skipped_guard_files,
         )
 
     async def sync_push(
@@ -1817,6 +1836,7 @@ class IncrementalBranchSyncer:
 
             indexed_at = datetime.now(UTC).isoformat()
             indexed_files = 0
+            skipped_guard_files = 0
             upserted_points = 0
             kept_point_ids: list[str] = []
             scoped_id_checker = _make_scoped_id_checker(
@@ -1855,6 +1875,15 @@ class IncrementalBranchSyncer:
                             )
                             wave_items.extend(file_items)
                             indexed_files += 1
+                        except ZeroCodeViolationError as exc:
+                            skipped_guard_files += 1
+                            logger.warning(
+                                "repo_index_file_skipped_zerocode_guard",
+                                repo=slug,
+                                file_path=entry.filename,
+                                blob_sha=entry.blob_sha,
+                                error=str(exc),
+                            )
                         finally:
                             del raw_bytes
                     fetched_pairs.clear()
@@ -1900,6 +1929,7 @@ class IncrementalBranchSyncer:
                 after_sha=target_sha,
                 changed_files=len(compare.files),
                 indexed_files=indexed_files,
+                skipped_guard_files=skipped_guard_files,
                 deleted_file_paths=len(paths_to_delete),
                 upserted_points=upserted_points,
                 persisted_cursor=cursor_persisted,
@@ -1918,4 +1948,5 @@ class IncrementalBranchSyncer:
                 stale_points_deleted=0,
                 persisted_cursor=cursor_persisted,
                 elapsed_ms=elapsed_ms,
+                skipped_guard_files=skipped_guard_files,
             )
