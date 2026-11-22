@@ -59,6 +59,7 @@ _COMPOUND_SPLITTABLE_TYPES: Final[frozenset[str]] = frozenset(
     }
 )
 _ALLOWED_DOCSTRING_PREFIX_CHARS: Final[frozenset[str]] = frozenset({"r", "u"})
+_FASTAPI_DI_CALLABLES: Final[frozenset[str]] = frozenset({"Depends", "Security"})
 
 
 def _qualify_import(module_prefix: str, symbol: str) -> str:
@@ -176,17 +177,46 @@ def _extract_docstring(body_node: Node | None, source_bytes: bytes) -> str | Non
     return None
 
 
-def _extract_callee_name(call_node: Node, source_bytes: bytes) -> tuple[int, str] | None:
-    func = call_node.child_by_field_name("function")
-    if func is None:
+def _extract_callable_identifier(node: Node | None, source_bytes: bytes) -> tuple[int, str] | None:
+    if node is None:
         return None
-    if func.type == "identifier":
-        return func.start_byte, node_text(func, source_bytes)
-    if func.type == "attribute":
-        attr = func.child_by_field_name("attribute")
+    if node.type == "identifier":
+        return node.start_byte, node_text(node, source_bytes)
+    if node.type == "attribute":
+        attr = node.child_by_field_name("attribute")
         if attr is not None:
             return attr.start_byte, node_text(attr, source_bytes)
     return None
+
+
+def _extract_callee_name(call_node: Node, source_bytes: bytes) -> tuple[int, str] | None:
+    return _extract_callable_identifier(call_node.child_by_field_name("function"), source_bytes)
+
+
+def _extract_fastapi_di_target(
+    call_node: Node,
+    callee_name: str,
+    source_bytes: bytes,
+) -> tuple[int, str] | None:
+    """Extract the injected callable passed to FastAPI `Depends(fn)` or `Security(fn)`."""
+    if callee_name not in _FASTAPI_DI_CALLABLES:
+        return None
+    args_node = call_node.child_by_field_name("arguments")
+    if args_node is None:
+        return None
+    target_expr: Node | None = None
+    for child in args_node.named_children:
+        if child.type == "comment":
+            continue
+        if child.type == "keyword_argument":
+            kw_name = child.child_by_field_name("name")
+            if kw_name is not None and node_text(kw_name, source_bytes) == "dependency":
+                target_expr = child.child_by_field_name("value")
+                break
+            continue
+        target_expr = child
+        break
+    return _extract_callable_identifier(target_expr, source_bytes)
 
 
 def _extract_called_symbols(
@@ -205,6 +235,9 @@ def _extract_called_symbols(
                 extracted = _extract_callee_name(current, source_bytes)
                 if extracted is not None:
                     matches.append(extracted)
+                    di_target = _extract_fastapi_di_target(current, extracted[1], source_bytes)
+                    if di_target is not None:
+                        matches.append(di_target)
         for child in reversed(current.children):
             if child.type in NESTED_SCOPE_TYPES:
                 continue

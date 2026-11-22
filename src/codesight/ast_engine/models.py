@@ -223,6 +223,7 @@ class PRFileContext:
     language: ASTLanguage | None = None
     parsed_file: ParsedASTFile | None = None
     touched_chunks: tuple[CodeSymbolChunk, ...] = ()
+    removed_symbols: tuple[str, ...] = ()
     complexity: ComplexityDiffSummary | None = None
     hunk_slices: tuple[HunkContextSlice, ...] = ()
     fallback_reason: FallbackReason | None = None

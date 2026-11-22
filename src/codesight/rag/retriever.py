@@ -242,6 +242,21 @@ def _dedupe_ordered(values: Sequence[str]) -> list[str]:
     return out
 
 
+def _extract_removed_symbol_names(ctx: PRFileContext) -> tuple[str, ...]:
+    """Return unique symbol names removed or renamed away in a modified AST file."""
+    if ctx.mode != "ast":
+        return ()
+    if ctx.removed_symbols:
+        return tuple(_dedupe_ordered(ctx.removed_symbols))
+    if ctx.parsed_file is not None or ctx.complexity is None:
+        return ()
+    return tuple(
+        _dedupe_ordered(
+            [delta.symbol_name for delta in ctx.complexity.deltas if delta.change_kind == "removed"]
+        )
+    )
+
+
 def build_architecture_query(file_contexts: Sequence[PRFileContext]) -> str | None:
     """Synthesize one concise batch semantic query for Architecture Docs retrieval."""
     parts: list[str] = []
@@ -261,6 +276,8 @@ def build_architecture_query(file_contexts: Sequence[PRFileContext]) -> str | No
                 if first_line:
                     docs.append(first_line)
             imports.extend(chunk.imports[:8])
+        for removed_sym in _extract_removed_symbol_names(ctx):
+            symbols.append(f"removed {removed_sym}")
         for hunk in ctx.hunk_slices:
             if hunk.section_header:
                 symbols.append(hunk.section_header)
@@ -574,6 +591,11 @@ class HybridContextRetriever:
                 if ctx.mode == "ast":
                     ast_live_paths.add(norm_path)
                     ast_live_entries.append((norm_path, ctx, file_blob_sha))
+
+            for removed_sym in _extract_removed_symbol_names(ctx):
+                modified_symbol_keys.add((norm_path, removed_sym))
+                if not is_noise_symbol(removed_sym, noise_symbols=self._noise_symbols):
+                    raw_modified_symbols.append(removed_sym)
 
             if ctx.mode == "ast" and ctx.touched_chunks:
                 for idx, chunk in enumerate(ctx.touched_chunks):

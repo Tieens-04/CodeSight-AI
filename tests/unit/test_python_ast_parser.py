@@ -571,9 +571,44 @@ def test_called_symbols_includes_decorator_and_default_parameter_calls() -> None
         "get",
         "build_path",
         "Depends",
+        "get_session",
         "default_factory",
         "run_logic",
     )
+
+
+def test_python_ast_parser_extracts_fastapi_depends_and_security_targets() -> None:
+    source = (
+        "from typing import Annotated\n"
+        "import fastapi\n"
+        "from fastapi import Depends, Security\n\n"
+        "@router.post('/orders')\n"
+        "async def create_order(\n"
+        "    user = Depends(verify_bearer_principal),\n"
+        "    tenant = fastapi.Depends(auth_svc.resolve_tenant),\n"
+        "    admin: Annotated[str, Security(require_admin_scope, scopes=['orders:write'])],\n"
+        "    kw_user = Depends(dependency=load_actor_context),\n"
+        "    kw_attr = Security(scopes=['read'], dependency=auth_svc.check_policy),\n"
+        "    auto_dep: OrderService = Depends(),\n"
+        "    anon_dep = Depends(lambda: None),\n"
+        ") -> dict[str, str]:\n"
+        "    return submit_order(user, tenant, admin, kw_user, kw_attr, auto_dep, anon_dep)\n"
+    )
+    parsed = PythonASTParser().parse(source, file_path="src/api/orders_router.py")
+    assert len(parsed.chunks) == 1
+    calls = parsed.chunks[0].called_symbols
+    assert "Depends" in calls
+    assert "Security" in calls
+    assert "verify_bearer_principal" in calls
+    assert "resolve_tenant" in calls
+    assert "require_admin_scope" in calls
+    assert "load_actor_context" in calls
+    assert "check_policy" in calls
+    assert "submit_order" in calls
+    # Order-preserving relative to declaration position
+    assert calls.index("Depends") < calls.index("verify_bearer_principal")
+    assert calls.index("Security") < calls.index("require_admin_scope")
+    assert calls.index("check_policy") < calls.index("submit_order")
 
 
 def test_deeply_nested_definitions_do_not_raise_recursion_error() -> None:

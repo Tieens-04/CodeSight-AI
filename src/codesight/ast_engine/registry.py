@@ -10,6 +10,7 @@ from tree_sitter import Language, Node
 
 from codesight.ast_engine._ast_utils import (
     DEFAULT_MAX_CHUNK_LINES,
+    append_unique,
     resolve_ast_language,
     span_touches_deletion_anchors,
     span_touches_sorted_lines,
@@ -17,7 +18,6 @@ from codesight.ast_engine._ast_utils import (
 from codesight.ast_engine._python_ast import PYTHON_LANGUAGE
 from codesight.ast_engine._typescript_ast import TSX_LANGUAGE, TYPESCRIPT_LANGUAGE
 from codesight.ast_engine.complexity import (
-    ComplexityAnalyzer,
     _analyze_python_tree,
     _analyze_typescript_tree,
     _compute_complexity_delta_from_metrics,
@@ -119,13 +119,35 @@ def _filter_touched_chunks(
     )
 
 
+def _collect_removed_symbols(
+    before_parsed: ParsedASTFile | None,
+    after_parsed: ParsedASTFile,
+) -> tuple[str, ...]:
+    """Return ordered unique symbol names removed or renamed between before/after ASTs."""
+    if before_parsed is None or before_parsed.has_syntax_error or after_parsed.has_syntax_error:
+        return ()
+    after_symbol_names = {chunk.symbol_name for chunk in after_parsed.chunks}
+    after_qualified_names = {chunk.qualified_name for chunk in after_parsed.chunks}
+    removed: list[str] = []
+    seen: set[str] = set()
+    for chunk in before_parsed.chunks:
+        if chunk.qualified_name in after_qualified_names:
+            continue
+        if chunk.symbol_name not in after_symbol_names or "." not in chunk.qualified_name:
+            append_unique(removed, seen, chunk.symbol_name)
+            continue
+        parent_qname = chunk.qualified_name.rsplit(".", 1)[0]
+        if parent_qname in after_qualified_names:
+            append_unique(removed, seen, chunk.symbol_name)
+    return tuple(removed)
+
+
 class ASTParserRegistry:
     """Dispatch Python & TypeScript/TSX AST parsing with zero-crash Hunk context fallback."""
 
     def __init__(self, *, max_chunk_lines: int = DEFAULT_MAX_CHUNK_LINES) -> None:
         self._py_parser = PythonASTParser(max_chunk_lines=max_chunk_lines)
         self._ts_parser = TypeScriptASTParser(max_chunk_lines=max_chunk_lines)
-        self._complexity_analyzer = ComplexityAnalyzer()
 
     def resolve_language(self, file_path: str) -> ASTLanguage | None:
         """Return canonical `ASTLanguage` for supported files, or `None` for fallback formats."""
@@ -274,13 +296,30 @@ class ASTParserRegistry:
             before_language = (
                 self.resolve_language(parsed_diff.old_path) if parsed_diff.old_path else None
             ) or language
-            before_list, before_has_error = (
-                self._complexity_analyzer._analyze_with_status(
-                    before_source, language=before_language
+            before_parsed: ParsedASTFile | None = None
+            before_list: tuple[FunctionComplexity, ...] = ()
+            before_has_error = False
+            if before_source is not None:
+                before_path = (
+                    normalize_diff_path(parsed_diff.old_path).rstrip("/")
+                    if parsed_diff.old_path
+                    else norm_path
+                ) or norm_path
+                before_parsed, before_root, before_bytes = self._parse_tree_for_language(
+                    before_source,
+                    file_path=before_path,
+                    language=before_language,
                 )
-                if before_source is not None
-                else ((), False)
-            )
+                if before_root is not None:
+                    if before_language == "python":
+                        before_list, before_has_error = _analyze_python_tree(
+                            before_root, before_bytes
+                        )
+                    else:
+                        before_list, before_has_error = _analyze_typescript_tree(
+                            before_root, before_bytes
+                        )
+            removed_symbols = _collect_removed_symbols(before_parsed, parsed_file)
             complexity = _compute_complexity_delta_from_metrics(
                 before_list,
                 before_has_error,
@@ -296,6 +335,7 @@ class ASTParserRegistry:
                 language=language,
                 parsed_file=parsed_file,
                 touched_chunks=touched_chunks,
+                removed_symbols=removed_symbols,
                 complexity=complexity,
                 hunk_slices=(),
                 fallback_reason=None,
