@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     langfuse_secret_key: SecretStr | None = None
     langfuse_host: str = "https://cloud.langfuse.com"
 
+    # Optional Milestone 2 live evaluation overrides
+    codesight_live_py_repo: str | None = None
+    codesight_live_ts_repo: str | None = None
+    codesight_qdrant_container: str | None = None
+
     @model_validator(mode="after")
     def _validate_production_secrets(self) -> Self:
         if (

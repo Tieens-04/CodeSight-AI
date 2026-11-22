@@ -1715,7 +1715,11 @@ async def test_week2_dual_repo_cli_index_recall_latency_and_token_band(
             )
 
             # Layer 2: Physical container disk scan over `/qdrant/storage/collections/<collection>`
-            qdrant_container = os.getenv("CODESIGHT_QDRANT_CONTAINER", "codesight-qdrant")
+            qdrant_container = (
+                (base_settings.codesight_qdrant_container or "").strip()
+                or os.getenv("CODESIGHT_QDRANT_CONTAINER", "").strip()
+                or "codesight-qdrant"
+            )
             control_hits = zerocode_auditor.scan_container_storage_for_canaries(
                 qdrant_container,
                 isolated_qdrant_collection,
@@ -1760,8 +1764,14 @@ async def test_week2_opt_in_live_github_and_gemini_rag_smoke(
             "evaluation to avoid GitHub's 60 req/hr unauthenticated rate limit."
         )
 
-    live_py_repo = os.getenv("CODESIGHT_LIVE_PY_REPO", DEFAULT_LIVE_PY_REPO).strip()
-    live_ts_repo = os.getenv("CODESIGHT_LIVE_TS_REPO", "").strip()
+    live_py_repo = (
+        (settings.codesight_live_py_repo or "").strip()
+        or os.getenv("CODESIGHT_LIVE_PY_REPO", "").strip()
+        or DEFAULT_LIVE_PY_REPO
+    )
+    live_ts_repo = (settings.codesight_live_ts_repo or "").strip() or os.getenv(
+        "CODESIGHT_LIVE_TS_REPO", ""
+    ).strip()
 
     async with _isolated_session_factory(isolated_postgres_dsn) as session_factory:
         report = await run_milestone2_live_evaluation(

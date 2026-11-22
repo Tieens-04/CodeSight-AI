@@ -72,7 +72,7 @@ _MAX_FILE_SLICE_LINES: Final[int] = 200_000
 _MIN_CANARY_LEN: Final[int] = 24
 _FALLBACK_CANARY_LEN: Final[int] = 12
 _MAX_CANARY_LEN: Final[int] = 120
-_MAX_BODY_CANARIES: Final[int] = 12
+_MAX_BODY_CANARIES_PER_REPO: Final[int] = 6
 _STATIC_FALLBACK_CANARY: Final[str] = "CODESIGHT_NFR3_SYNTHETIC_BODY_CANARY"
 
 type IndexFn = Callable[..., Awaitable[InitialIndexReport]]
@@ -386,6 +386,17 @@ async def discover_live_ts_repo(
     return selected
 
 
+def _resolve_py_repo(py_repo: str | None, *, settings: Settings) -> str:
+    if py_repo is not None:
+        return _validate_slug_as_value_error(py_repo, label="py_repo")
+    candidate = (
+        (settings.codesight_live_py_repo or "").strip()
+        or os.getenv("CODESIGHT_LIVE_PY_REPO", "").strip()
+        or DEFAULT_LIVE_PY_REPO
+    )
+    return _validate_slug_as_value_error(candidate, label="CODESIGHT_LIVE_PY_REPO")
+
+
 async def _resolve_ts_repo(
     ts_repo: str | None,
     *,
@@ -397,6 +408,9 @@ async def _resolve_ts_repo(
     explicit = (ts_repo or "").strip()
     if explicit:
         return _validate_slug_as_value_error(explicit, label="ts_repo")
+    settings_ts = (settings.codesight_live_ts_repo or "").strip()
+    if settings_ts:
+        return _validate_slug_as_value_error(settings_ts, label="CODESIGHT_LIVE_TS_REPO")
     env_ts = os.getenv("CODESIGHT_LIVE_TS_REPO", "").strip()
     if env_ts:
         return _validate_slug_as_value_error(env_ts, label="CODESIGHT_LIVE_TS_REPO")
@@ -745,8 +759,9 @@ def _extract_body_canaries(
     end_line: int,
     payload_json_blobs: Sequence[str],
     collected: list[str],
+    max_canaries: int = _MAX_BODY_CANARIES_PER_REPO,
 ) -> None:
-    if len(collected) >= _MAX_BODY_CANARIES:
+    if len(collected) >= max_canaries:
         return
     lines = source_text.splitlines()
     if not lines:
@@ -765,7 +780,7 @@ def _extract_body_canaries(
             if any(candidate in blob for blob in payload_json_blobs):
                 continue
             collected.append(candidate)
-            if len(collected) >= _MAX_BODY_CANARIES:
+            if len(collected) >= max_canaries:
                 return
 
 
@@ -1067,7 +1082,7 @@ async def _default_index_repo(
 async def run_milestone2_live_evaluation(
     *,
     settings: Settings,
-    py_repo: str = DEFAULT_LIVE_PY_REPO,
+    py_repo: str | None = None,
     ts_repo: str | None = None,
     collection_name: str | None = None,
     session_factory: async_sessionmaker[AsyncSession],
@@ -1088,7 +1103,7 @@ async def run_milestone2_live_evaluation(
 ) -> M2LiveEvaluationReport:
     """Index real Python + TypeScript/TSX repos and verify Milestone 2 KPI & NFR-3 gates."""
     eff_probes = validate_positive_int(max_probes_per_repo, name="max_probes_per_repo")
-    py_slug = _validate_slug_as_value_error(py_repo, label="py_repo")
+    py_slug = _resolve_py_repo(py_repo, settings=settings)
     eff_collection = (
         collection_name.strip()
         if isinstance(collection_name, str) and collection_name.strip()
@@ -1198,6 +1213,9 @@ async def run_milestone2_live_evaluation(
             embed_code_chunks=False,
         )
 
+        canonical_py_slug = (py_index_report.repo_full_name or py_slug).strip() or py_slug
+        canonical_ts_slug = (ts_index_report.repo_full_name or ts_slug).strip() or ts_slug
+
         retriever = HybridContextRetriever(
             store=active_store,
             embedder=active_embedder,
@@ -1208,10 +1226,11 @@ async def run_milestone2_live_evaluation(
         diff_parser = SmartDiffParser()
 
         payload_json_blobs: list[str] = []
-        body_canaries: list[str] = []
+        py_body_canaries: list[str] = []
+        ts_body_canaries: list[str] = []
 
         py_summary, py_cases = await _evaluate_single_repo(
-            repo_full_name=py_slug,
+            repo_full_name=canonical_py_slug,
             language_label="python",
             index_report=py_index_report,
             store=active_store,
@@ -1225,10 +1244,10 @@ async def run_milestone2_live_evaluation(
             max_probes=eff_probes,
             doc_score_threshold=doc_score_threshold,
             payload_json_collector=payload_json_blobs,
-            body_canary_collector=body_canaries,
+            body_canary_collector=py_body_canaries,
         )
         ts_summary, ts_cases = await _evaluate_single_repo(
-            repo_full_name=ts_slug,
+            repo_full_name=canonical_ts_slug,
             language_label="typescript",
             index_report=ts_index_report,
             store=active_store,
@@ -1242,8 +1261,14 @@ async def run_milestone2_live_evaluation(
             max_probes=eff_probes,
             doc_score_threshold=doc_score_threshold,
             payload_json_collector=payload_json_blobs,
-            body_canary_collector=body_canaries,
+            body_canary_collector=ts_body_canaries,
         )
+
+        body_canaries = [
+            canary
+            for canary in (*py_body_canaries, *ts_body_canaries)
+            if not any(canary in blob for blob in payload_json_blobs)
+        ]
 
         all_cases = (*py_cases, *ts_cases)
         warm_latencies = sorted(c.warm_retrieval_ms for c in all_cases)
@@ -1280,21 +1305,22 @@ async def run_milestone2_live_evaluation(
         zerocode_violations = 0 if audit_rc == 0 else max(1, int(audit_rc))
 
         container_name = (
-            qdrant_container.strip()
-            if isinstance(qdrant_container, str) and qdrant_container.strip()
-            else os.getenv("CODESIGHT_QDRANT_CONTAINER", "codesight-qdrant")
+            (qdrant_container or "").strip()
+            or (eval_settings.codesight_qdrant_container or "").strip()
+            or os.getenv("CODESIGHT_QDRANT_CONTAINER", "").strip()
+            or "codesight-qdrant"
         )
         disk_violations_list: list[str] = []
         control_hits = await asyncio.to_thread(
             active_disk_scanner,
             container_name,
             eff_collection,
-            (py_slug,),
+            (canonical_py_slug,),
         )
         if not control_hits or not all(hit.startswith("NFR-3 disk breach") for hit in control_hits):
             disk_violations_list.append(
-                f"Positive control failed for '{py_slug}' in container '{container_name}': "
-                f"{control_hits!r}"
+                f"Positive control failed for '{canonical_py_slug}' in container "
+                f"'{container_name}': {control_hits!r}"
             )
 
         scan_markers = tuple(body_canaries) if body_canaries else (_STATIC_FALLBACK_CANARY,)
@@ -1307,8 +1333,8 @@ async def run_milestone2_live_evaluation(
         disk_violations_list.extend(leak_hits)
 
         report = M2LiveEvaluationReport(
-            py_repo=py_slug,
-            ts_repo=ts_slug,
+            py_repo=canonical_py_slug,
+            ts_repo=canonical_ts_slug,
             collection_name=eff_collection,
             recall_at_5=mean_recall,
             p50_retrieval_ms=p50_ms,
@@ -1326,8 +1352,8 @@ async def run_milestone2_live_evaluation(
         )
         logger.info(
             "m2_live_eval_completed",
-            py_repo=py_slug,
-            ts_repo=ts_slug,
+            py_repo=canonical_py_slug,
+            ts_repo=canonical_ts_slug,
             collection=eff_collection,
             recall_at_5=report.recall_at_5,
             p50_retrieval_ms=report.p50_retrieval_ms,
@@ -1335,6 +1361,8 @@ async def run_milestone2_live_evaluation(
             tokens_saved_pct=report.tokens_saved_pct,
             zerocode_violations=report.zerocode_violations,
             disk_violations=len(report.disk_violations),
+            py_canaries=len(py_body_canaries),
+            ts_canaries=len(ts_body_canaries),
         )
         return report
     finally:

@@ -34,12 +34,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--py-repo",
-        default=os.getenv("CODESIGHT_LIVE_PY_REPO", DEFAULT_LIVE_PY_REPO),
-        help=f"Python GitHub repository slug (default: {DEFAULT_LIVE_PY_REPO}).",
+        default=None,
+        help=(
+            f"Python GitHub repository slug (defaults to CODESIGHT_LIVE_PY_REPO or "
+            f"{DEFAULT_LIVE_PY_REPO})."
+        ),
     )
     parser.add_argument(
         "--ts-repo",
-        default=os.getenv("CODESIGHT_LIVE_TS_REPO", ""),
+        default=None,
         help=(
             "TypeScript/TSX GitHub repository slug "
             "(defaults to CODESIGHT_LIVE_TS_REPO or authenticated /user/repos discovery)."
@@ -73,7 +76,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run_async(args: argparse.Namespace, settings: Settings) -> int:
+async def _run_async(
+    args: argparse.Namespace,
+    settings: Settings,
+    *,
+    py_repo: str,
+    ts_repo: str,
+) -> int:
     engine = create_db_engine(settings)
     qdrant_cleanup = AsyncQdrantClient(
         host=settings.qdrant_host,
@@ -88,8 +97,8 @@ async def _run_async(args: argparse.Namespace, settings: Settings) -> int:
         session_factory: async_sessionmaker = create_session_factory(engine)
         report = await run_milestone2_live_evaluation(
             settings=settings,
-            py_repo=args.py_repo,
-            ts_repo=args.ts_repo,
+            py_repo=py_repo,
+            ts_repo=ts_repo,
             collection_name=args.collection,
             session_factory=session_factory,
             max_probes_per_repo=args.max_probes_per_repo,
@@ -138,8 +147,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
+    resolved_py_repo = (
+        args.py_repo
+        if args.py_repo is not None
+        else (
+            (settings.codesight_live_py_repo or "").strip()
+            or os.getenv("CODESIGHT_LIVE_PY_REPO", "").strip()
+            or DEFAULT_LIVE_PY_REPO
+        )
+    )
+    resolved_ts_repo = (
+        args.ts_repo
+        if args.ts_repo is not None
+        else (
+            (settings.codesight_live_ts_repo or "").strip()
+            or os.getenv("CODESIGHT_LIVE_TS_REPO", "").strip()
+        )
+    )
+
     try:
-        return asyncio.run(_run_async(args, settings))
+        return asyncio.run(
+            _run_async(
+                args,
+                settings,
+                py_repo=resolved_py_repo,
+                ts_repo=resolved_ts_repo,
+            )
+        )
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1

@@ -3,6 +3,7 @@
 import io
 import json
 import logging
+from pathlib import Path
 
 import pytest
 import structlog
@@ -168,3 +169,23 @@ def test_settings_rejects_dev_password_in_production_and_invalid_ports() -> None
         Settings(_env_file=None, api_port=0)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, health_timeout_seconds=-1.0)
+
+
+def test_settings_loads_live_eval_overrides_from_dotenv_without_shell_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for key in ("CODESIGHT_LIVE_PY_REPO", "CODESIGHT_LIVE_TS_REPO", "CODESIGHT_QDRANT_CONTAINER"):
+        monkeypatch.delenv(key, raising=False)
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        "CODESIGHT_LIVE_PY_REPO=org/dotenv-py\n"
+        "CODESIGHT_LIVE_TS_REPO=org/dotenv-ts\n"
+        "CODESIGHT_QDRANT_CONTAINER=codesight-qdrant-custom\n",
+        encoding="utf-8",
+    )
+    loaded = Settings(_env_file=dotenv)
+    assert loaded.codesight_live_py_repo == "org/dotenv-py"
+    assert loaded.codesight_live_ts_repo == "org/dotenv-ts"
+    assert loaded.codesight_qdrant_container == "codesight-qdrant-custom"

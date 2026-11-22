@@ -1565,3 +1565,291 @@ async def test_diagnostic_doc_scores_and_blob_skip_and_config_guards() -> None:
                 embedder=embedder,
                 index_fn=_seed_unfetchable,
             )
+
+
+@pytest.mark.asyncio
+async def test_live_eval_uses_settings_dotenv_overrides_canonical_slugs_and_per_repo_canaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify .env Settings overrides, canonical casing resolution, and TS disk canary budget."""
+    for key in ("CODESIGHT_LIVE_PY_REPO", "CODESIGHT_LIVE_TS_REPO", "CODESIGHT_QDRANT_CONTAINER"):
+        monkeypatch.delenv(key, raising=False)
+
+    # Python probe has >= 8 interior body lines (> 6 per-repo cap) so TS canaries must not starve.
+    py_service_long = (
+        b'"""Long billing module."""\n\n'
+        b"def compute_invoice_total(subtotal_cents: int, fee_bps: int) -> int:\n"
+        b'    """Compute total cents with audit trail steps."""\n'
+        b"    py_canary_body_line_one = subtotal_cents + 1001\n"
+        b"    py_canary_body_line_two = py_canary_body_line_one + 1002\n"
+        b"    py_canary_body_line_three = py_canary_body_line_two + 1003\n"
+        b"    py_canary_body_line_four = py_canary_body_line_three + 1004\n"
+        b"    py_canary_body_line_five = py_canary_body_line_four + 1005\n"
+        b"    py_canary_body_line_six = py_canary_body_line_five + 1006\n"
+        b"    py_canary_body_line_seven = py_canary_body_line_six + 1007\n"
+        b"    py_canary_body_line_eight = py_canary_body_line_seven + fee_bps\n"
+        b"    return py_canary_body_line_eight\n\n\n"
+        + b"\n\n".join(
+            f"def aux_billing_{i}(v: int) -> int:\n    return v + {i}\n".encode()
+            for i in range(1, 16)
+        )
+    )
+    py_router_long = (
+        b"from src.services.billing import compute_invoice_total\n\n"
+        b"def submit_order_route(subtotal_cents: int) -> int:\n"
+        b"    return compute_invoice_total(subtotal_cents, 250)\n\n"
+        + b"\n\n".join(
+            f"def aux_route_{i}(v: int) -> int:\n    return v + {i}\n".encode()
+            for i in range(1, 16)
+        )
+    )
+    ts_hook_long = (
+        b"export function buildCheckoutSummary(cents: number, taxBps: number): string {\n"
+        b"  const tsCanaryBodyLineOne = Math.floor((cents * taxBps) / 10000);\n"
+        b"  const tsCanaryBodyLineTwo = cents + tsCanaryBodyLineOne;\n"
+        b"  return `total=${tsCanaryBodyLineTwo}`;\n"
+        b"}\n\n"
+        + b"\n".join(
+            f"export function auxTsFn{i}(n: number): number {{ return n + {i}; }}\n".encode()
+            for i in range(1, 16)
+        )
+    )
+    ts_page_long = (
+        b"import { buildCheckoutSummary } from './checkoutSummary';\n\n"
+        b"export function CheckoutScreen(cents: number): string {\n"
+        b"  return buildCheckoutSummary(cents, 800);\n"
+        b"}\n\n"
+        + b"\n".join(
+            f"export function auxPageFn{i}(n: number): number {{ return n + {i}; }}\n".encode()
+            for i in range(1, 16)
+        )
+    )
+
+    canonical_py = "Tieens-04/CodeSight-AI"
+    canonical_ts = "Acme/React-Dashboard"
+    input_py_lower = "tieens-04/codesight-ai"
+    input_ts_lower = "acme/react-dashboard"
+
+    blobs_by_sha = {
+        _sha1_blob(raw): raw
+        for raw in (py_service_long, py_router_long, ts_hook_long, ts_page_long)
+    }
+    store = _InMemoryEvalStore(collection_name="canon_col")
+    seen_index_inputs: list[str] = []
+
+    async def _canonicalizing_index_fn(
+        repo_full_name: str,
+        **kwargs: Any,
+    ) -> InitialIndexReport:
+        del kwargs
+        seen_index_inputs.append(repo_full_name)
+        if repo_full_name == input_py_lower:
+            canonical = canonical_py
+            store.add_point(
+                payload={
+                    "repo_full_name": canonical,
+                    "file_path": "src/services/billing.py",
+                    "blob_sha": _sha1_blob(py_service_long),
+                    "chunk_type": "code",
+                    "language": "python",
+                    "symbol_name": "compute_invoice_total",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 13,
+                    "signature": (
+                        "def compute_invoice_total(subtotal_cents: int, fee_bps: int) -> int"
+                    ),
+                    "called_symbols": [],
+                    "imports": [],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": canonical,
+                    "file_path": "src/routers/orders.py",
+                    "blob_sha": _sha1_blob(py_router_long),
+                    "chunk_type": "code",
+                    "language": "python",
+                    "symbol_name": "submit_order_route",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 4,
+                    "signature": "def submit_order_route(subtotal_cents: int) -> int",
+                    "called_symbols": ["compute_invoice_total"],
+                    "imports": ["src.services.billing"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+        else:
+            canonical = canonical_ts
+            store.add_point(
+                payload={
+                    "repo_full_name": canonical,
+                    "file_path": "src/hooks/checkoutSummary.ts",
+                    "blob_sha": _sha1_blob(ts_hook_long),
+                    "chunk_type": "code",
+                    "language": "typescript",
+                    "symbol_name": "buildCheckoutSummary",
+                    "symbol_kind": "function",
+                    "start_line": 1,
+                    "end_line": 5,
+                    "signature": (
+                        "export function buildCheckoutSummary(cents: number, taxBps: number): "
+                        "string"
+                    ),
+                    "called_symbols": [],
+                    "imports": [],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": canonical,
+                    "file_path": "src/pages/CheckoutScreen.tsx",
+                    "blob_sha": _sha1_blob(ts_page_long),
+                    "chunk_type": "code",
+                    "language": "tsx",
+                    "symbol_name": "CheckoutScreen",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 5,
+                    "signature": "export function CheckoutScreen(cents: number): string",
+                    "called_symbols": ["buildCheckoutSummary"],
+                    "imports": ["./checkoutSummary"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+        return InitialIndexReport(
+            repo_full_name=canonical,
+            repo_id="r",
+            default_branch="main",
+            indexed_branch="main",
+            commit_sha="e" * 40,
+            tree_entries=2,
+            eligible_files=2,
+            unchanged_files_skipped=0,
+            fetched_files=2,
+            skipped_files=0,
+            code_chunks=2,
+            doc_chunks=0,
+            embedded_points=0,
+            upserted_points=2,
+            stale_points_deleted=0,
+            persisted_cursor=True,
+            truncated_tree=False,
+            elapsed_ms=5.0,
+        )
+
+    async def _gh_handler(request: httpx.Request) -> httpx.Response:
+        if "/git/blobs/" in request.url.path:
+            sha = request.url.path.rsplit("/", 1)[-1]
+            raw = blobs_by_sha.get(sha)
+            if raw is not None:
+                return httpx.Response(200, json=_blob_json(raw, sha))
+        return httpx.Response(404)
+
+    disk_calls: list[tuple[str, str, tuple[str, ...]]] = []
+
+    def _disk_scan(
+        container_name: str,
+        collection: str,
+        canary_substrings: Sequence[str],
+    ) -> list[str]:
+        markers = tuple(canary_substrings)
+        disk_calls.append((container_name, collection, markers))
+        if markers == (canonical_py,):
+            return ["NFR-3 disk breach — raw-code canary matched on Qdrant disk file: seg0"]
+        return []
+
+    settings = Settings(
+        _env_file=None,
+        qdrant_collection_name="canon_col",
+        github_token=SecretStr("ghp_ok"),
+        gemini_api_key=SecretStr("gem_ok"),
+        codesight_live_py_repo=input_py_lower,
+        codesight_live_ts_repo=input_ts_lower,
+        codesight_qdrant_container="codesight-qdrant-env",
+    )
+    fake_genai = _FakeEvalGenAIClient()
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(_gh_handler)) as http_client,
+        GeminiEmbedder(client=fake_genai) as embedder,  # type: ignore[arg-type]
+    ):
+        report = await run_milestone2_live_evaluation(
+            settings=settings,
+            py_repo=None,
+            ts_repo=None,
+            collection_name="canon_col",
+            session_factory=object(),  # type: ignore[arg-type]
+            http_client=http_client,
+            redis_client=SimpleNamespace(),  # type: ignore[arg-type]
+            store=store,  # type: ignore[arg-type]
+            embedder=embedder,
+            index_fn=_canonicalizing_index_fn,
+            auditor_fn=lambda *_a, **_kw: 0,
+            disk_scanner_fn=_disk_scan,
+        )
+
+    # Resolved from Settings (.env) without os.environ
+    assert seen_index_inputs == [input_py_lower, input_ts_lower]
+    # Canonicalized GitHub full_name used for Qdrant scroll, report, and disk positive control
+    assert report.py_repo == canonical_py
+    assert report.ts_repo == canonical_ts
+    assert report.recall_at_5 == 1.0
+    assert report.disk_violations == ()
+    assert disk_calls[0] == ("codesight-qdrant-env", "canon_col", (canonical_py,))
+
+    # Partitioned per-repo canary budget guarantees both Python (capped == 6) and TS/TSX lines
+    scanned_markers = disk_calls[1][2]
+    assert len(scanned_markers) == 9
+    py_hits = [
+        m for m in scanned_markers if "py_canary_body_line_" in m or "Compute total cents" in m
+    ]
+    ts_hits = [m for m in scanned_markers if "tsCanaryBodyLine" in m]
+    assert len(py_hits) == 6
+    assert len(ts_hits) == 3
+
+
+def test_eval_cli_passes_settings_dotenv_repos_when_cli_flags_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Thin CLI `evals/run_m2_eval.py` resolves py/ts repos from Settings when omitted."""
+    for key in ("CODESIGHT_LIVE_PY_REPO", "CODESIGHT_LIVE_TS_REPO"):
+        monkeypatch.delenv(key, raising=False)
+
+    cli_mod = _load_eval_cli_module()
+    monkeypatch.setattr(
+        cli_mod,
+        "Settings",
+        lambda **_kw: Settings(
+            _env_file=None,
+            gemini_api_key=SecretStr("gem_ok"),
+            github_token=SecretStr("ghp_ok"),
+            codesight_live_py_repo="org/dotenv-py",
+            codesight_live_ts_repo="org/dotenv-ts",
+        ),
+    )
+    captured_args: dict[str, Any] = {}
+
+    async def _fake_run_async(
+        args: Any,
+        settings: Settings,
+        *,
+        py_repo: str,
+        ts_repo: str,
+    ) -> int:
+        del args, settings
+        captured_args["py_repo"] = py_repo
+        captured_args["ts_repo"] = ts_repo
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_run_async", _fake_run_async)
+    rc = cli_mod.main(["--collection", "env_test_col"])
+    assert rc == 0
+    assert captured_args == {"py_repo": "org/dotenv-py", "ts_repo": "org/dotenv-ts"}
