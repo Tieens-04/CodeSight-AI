@@ -562,3 +562,38 @@ def test_compute_complexity_delta_max_after_cc_respects_changed_right_lines() ->
     assert [(d.qualified_name, d.delta_cc) for d in summary.deltas] == [("tiny", 0)]
     assert summary.max_after_cc == 1
     assert summary.high_complexity_functions == ()
+
+
+def test_detect_missing_test_companion_ignores_seed_json_yaml_and_supports_multi_layouts() -> None:
+    diff_parser = SmartDiffParser()
+    seed_lines = [f'  "key_{i}": {i},' for i in range(110)]
+    yaml_lines = [f"field_{i}: value_{i}" for i in range(110)]
+    non_code_diff = diff_parser.parse_diff(
+        _make_unified_diff("src/data/seed.json", seed_lines)
+        + _make_unified_diff("src/config/schema.yaml", yaml_lines)
+    )
+    non_code_report = detect_missing_test_companion(non_code_diff)
+    assert non_code_report.added_source_logic_lines == 0
+    assert non_code_report.source_files == ()
+    assert non_code_report.is_untested is False
+
+    app_lines = [f"order_step_{i} = {i}" for i in range(55)]
+    app_diff = diff_parser.parse_diff(_make_unified_diff("app/services/order.py", app_lines))
+    app_report = detect_missing_test_companion(app_diff)
+    assert app_report.added_source_logic_lines == 55
+    assert app_report.source_files == ("app/services/order.py",)
+    assert app_report.is_untested is True
+
+    multi_layout_diff = diff_parser.parse_diff(
+        _make_unified_diff("backend/api/orders.py", [f"val_{i} = {i}" for i in range(20)])
+        + _make_unified_diff("frontend/src/App.tsx", [f"const x{i} = {i};" for i in range(20)])
+        + _make_unified_diff("packages/core/src/calc.ts", [f"const y{i} = {i};" for i in range(20)])
+    )
+    multi_report = detect_missing_test_companion(multi_layout_diff)
+    assert multi_report.added_source_logic_lines == 60
+    assert multi_report.source_files == (
+        "backend/api/orders.py",
+        "frontend/src/App.tsx",
+        "packages/core/src/calc.ts",
+    )
+    assert multi_report.is_untested is True

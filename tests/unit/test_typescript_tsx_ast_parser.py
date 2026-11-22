@@ -240,17 +240,29 @@ def test_typescript_parser_extracts_symbols_generics_imports_jsdoc_and_calls() -
         "normalizeEndpoint",
         "AbortController",
         "get",
+        "axios.get",
         "info",
+        "logger.info",
         "formatKey",
     )
     # Nested function calls MUST NOT leak into parent
     assert "sanitizeUrl" not in fetch_fn.called_symbols
-    assert by_qname["fetchRecords.normalizeEndpoint"].called_symbols == ("sanitizeUrl", "trim")
+    assert by_qname["fetchRecords.normalizeEndpoint"].called_symbols == (
+        "sanitizeUrl",
+        "trim",
+        "raw.trim",
+    )
 
     hook = by_qname["usePagination"]
     assert hook.symbol_kind == "function"
     assert "<T,>" in hook.signature
-    assert hook.called_symbols == ("getDefaultPageSize", "map", "formatItem", "buildPage")
+    assert hook.called_symbols == (
+        "getDefaultPageSize",
+        "map",
+        "items.map",
+        "formatItem",
+        "buildPage",
+    )
 
     cls = by_qname["OrderClient"]
     assert cls.symbol_kind == "class"
@@ -268,7 +280,13 @@ def test_typescript_parser_extracts_symbols_generics_imports_jsdoc_and_calls() -
     assert submit.symbol_kind == "method"
     assert submit.is_async is True
     assert submit.decorators == ('@Trace("orders.submit")',)
-    assert submit.called_symbols == ("Trace", "ValidationError", "handleRetry")
+    assert submit.called_symbols == (
+        "Trace",
+        "ValidationError",
+        "ns.ValidationError",
+        "handleRetry",
+        "OrderClient.handleRetry",
+    )
 
     # Verify NFR-3 Qdrant payload compliance across all extracted chunks
     points = [
@@ -309,6 +327,7 @@ def test_tsx_parser_extracts_react_hoc_components_and_jsx_called_symbols() -> No
     assert card.docstring == "Displays a user profile card."
     assert card.called_symbols == (
         "memo",
+        "React.memo",
         "useState",
         "useEffect",
         "fetchUserProfile",
@@ -333,7 +352,7 @@ def test_tsx_parser_extracts_react_hoc_components_and_jsx_called_symbols() -> No
 
     dashboard = by_qname["DashboardPage"]
     assert dashboard.symbol_kind == "function"
-    assert dashboard.called_symbols == ("map", "UserCard")
+    assert dashboard.called_symbols == ("map", "ids.map", "UserCard")
     assert "main" not in dashboard.called_symbols
 
     # F-08: Verify NFR-3 Qdrant payload compliance on .tsx chunks as well
@@ -727,14 +746,20 @@ export default async () => {
     assert "runInternal" not in repo.called_symbols
 
     assert by_qname["LocalRepo.#secretStep"].symbol_kind == "method"
-    assert by_qname["LocalRepo.size"].called_symbols == ("#secretStep",)
+    assert by_qname["LocalRepo.size"].called_symbols == ("#secretStep", "LocalRepo.#secretStep")
     assert by_qname["LocalRepo.constructor"].symbol_kind == "method"
 
     assert by_qname["firstFn"].called_symbols == ("helperOne",)
     assert by_qname["secondFn"].called_symbols == ("helperTwo",)
 
     memo_ref = by_qname["MemoRefBox"]
-    assert memo_ref.called_symbols == ("memo", "forwardRef", "Badge")
+    assert memo_ref.called_symbols == (
+        "memo",
+        "React.memo",
+        "forwardRef",
+        "React.forwardRef",
+        "Badge",
+    )
 
     default_export = by_qname["default"]
     assert default_export.is_async is True
@@ -845,15 +870,15 @@ export function outerScope(svc?: ApiClient) {
     tsx_parsed = TypeScriptASTParser().parse(tsx_source, file_path="src/DataTable.tsx")
     by_qname = {c.qualified_name: c for c in tsx_parsed.chunks}
     assert "DataTable" in by_qname
-    assert by_qname["DataTable"].called_symbols == ("memo", "Grid")
+    assert by_qname["DataTable"].called_symbols == ("memo", "React.memo", "Grid")
     assert "UserBadge" in by_qname
     assert by_qname["UserBadge"].called_symbols == ("Avatar",)
     assert "DefaultNamedCard" in by_qname
-    assert by_qname["DefaultNamedCard"].called_symbols == ("memo", "CardBody")
+    assert by_qname["DefaultNamedCard"].called_symbols == ("memo", "React.memo", "CardBody")
     assert "outerScope.inner" in by_qname
     assert "outerScope.mutableHelper" in by_qname
     assert "outerScope.legacyHelper" in by_qname
-    assert by_qname["outerScope.mutableHelper"].called_symbols == ("save",)
+    assert by_qname["outerScope.mutableHelper"].called_symbols == ("save", "svc.save")
     # Nested `satisfies` helper must stay scope-isolated from outerScope
     assert "innerOnlyCall" not in by_qname["outerScope"].called_symbols
     assert by_qname["outerScope.inner"].called_symbols == ("innerOnlyCall",)
@@ -1074,3 +1099,47 @@ def test_ts_string_literal_type_with_colon_keyword_passes_zerocode_guard() -> No
             repo_full_name="acme/web",
             blob_sha="b2" * 20,
         )
+
+
+def test_typescript_ast_parser_extracts_receiver_qualified_and_class_qualified_calls() -> None:
+    src = """
+export class UserRepository extends BaseRepo {
+  update(repo: Repo, svc?: Svc) {
+    this.validate();
+    super.touch();
+    this.#secretCheck();
+    repo.save();
+    svc?.sync();
+    this.nested.chain();
+    makeClient().fetch();
+    return new ns.Record();
+  }
+}
+
+export function standalone(obj: any) {
+  obj.update();
+  this.ping();
+}
+"""
+    parsed = TypeScriptASTParser().parse(src, file_path="web/src/repos/userRepository.ts")
+    by_qname = {c.qualified_name: c for c in parsed.chunks}
+
+    assert by_qname["UserRepository.update"].called_symbols == (
+        "validate",
+        "UserRepository.validate",
+        "touch",
+        "UserRepository.touch",
+        "#secretCheck",
+        "UserRepository.#secretCheck",
+        "save",
+        "repo.save",
+        "sync",
+        "svc.sync",
+        "chain",
+        "makeClient",
+        "fetch",
+        "Record",
+        "ns.Record",
+    )
+    assert by_qname["standalone"].called_symbols == ("update", "obj.update", "ping")
+    assert "this.ping" not in by_qname["standalone"].called_symbols

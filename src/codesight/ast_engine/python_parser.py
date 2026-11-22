@@ -179,33 +179,63 @@ def _extract_docstring(body_node: Node | None, source_bytes: bytes) -> str | Non
     return None
 
 
-def _extract_callable_identifier(node: Node | None, source_bytes: bytes) -> tuple[int, str] | None:
+def _extract_callable_identifiers(
+    node: Node | None,
+    source_bytes: bytes,
+    *,
+    enclosing_class: str | None = None,
+) -> list[tuple[int, str]]:
     if node is None:
-        return None
+        return []
     if node.type == "identifier":
-        return node.start_byte, node_text(node, source_bytes)
+        name = node_text(node, source_bytes)
+        return [(node.start_byte, name)] if name else []
     if node.type == "attribute":
         attr = node.child_by_field_name("attribute")
-        if attr is not None:
-            return attr.start_byte, node_text(attr, source_bytes)
-    return None
+        if attr is None:
+            return []
+        attr_name = node_text(attr, source_bytes)
+        if not attr_name:
+            return []
+        matches: list[tuple[int, str]] = [(attr.start_byte, attr_name)]
+        obj = node.child_by_field_name("object")
+        if obj is not None and obj.type == "identifier":
+            receiver = node_text(obj, source_bytes)
+            if receiver in {"self", "cls"}:
+                if enclosing_class:
+                    matches.append((attr.start_byte, f"{enclosing_class}.{attr_name}"))
+            elif receiver:
+                matches.append((attr.start_byte, f"{receiver}.{attr_name}"))
+        return matches
+    return []
 
 
-def _extract_callee_name(call_node: Node, source_bytes: bytes) -> tuple[int, str] | None:
-    return _extract_callable_identifier(call_node.child_by_field_name("function"), source_bytes)
-
-
-def _extract_fastapi_di_target(
+def _extract_callee_names(
     call_node: Node,
-    callee_name: str,
     source_bytes: bytes,
-) -> tuple[int, str] | None:
+    *,
+    enclosing_class: str | None = None,
+) -> list[tuple[int, str]]:
+    return _extract_callable_identifiers(
+        call_node.child_by_field_name("function"),
+        source_bytes,
+        enclosing_class=enclosing_class,
+    )
+
+
+def _extract_fastapi_di_targets(
+    call_node: Node,
+    callee_names: Sequence[tuple[int, str]],
+    source_bytes: bytes,
+    *,
+    enclosing_class: str | None = None,
+) -> list[tuple[int, str]]:
     """Extract the injected callable passed to FastAPI `Depends(fn)` or `Security(fn)`."""
-    if callee_name not in _FASTAPI_DI_CALLABLES:
-        return None
+    if not callee_names or callee_names[0][1] not in _FASTAPI_DI_CALLABLES:
+        return []
     args_node = call_node.child_by_field_name("arguments")
     if args_node is None:
-        return None
+        return []
     target_expr: Node | None = None
     for child in args_node.named_children:
         if child.type == "comment":
@@ -218,13 +248,18 @@ def _extract_fastapi_di_target(
             continue
         target_expr = child
         break
-    return _extract_callable_identifier(target_expr, source_bytes)
+    return _extract_callable_identifiers(
+        target_expr,
+        source_bytes,
+        enclosing_class=enclosing_class,
+    )
 
 
 def _extract_called_symbols(
     nodes: Sequence[Node],
     source_bytes: bytes,
     *,
+    enclosing_class: str | None = None,
     line_range: tuple[int, int] | None = None,
 ) -> tuple[str, ...]:
     matches: list[tuple[int, str]] = []
@@ -234,12 +269,21 @@ def _extract_called_symbols(
         if current.type == "call":
             call_line = current.start_point[0] + 1
             if line_range is None or (line_range[0] <= call_line <= line_range[1]):
-                extracted = _extract_callee_name(current, source_bytes)
-                if extracted is not None:
-                    matches.append(extracted)
-                    di_target = _extract_fastapi_di_target(current, extracted[1], source_bytes)
-                    if di_target is not None:
-                        matches.append(di_target)
+                extracted = _extract_callee_names(
+                    current,
+                    source_bytes,
+                    enclosing_class=enclosing_class,
+                )
+                if extracted:
+                    matches.extend(extracted)
+                    matches.extend(
+                        _extract_fastapi_di_targets(
+                            current,
+                            extracted,
+                            source_bytes,
+                            enclosing_class=enclosing_class,
+                        )
+                    )
         for child in reversed(current.children):
             if child.type in NESTED_SCOPE_TYPES:
                 continue
@@ -458,10 +502,12 @@ class PythonASTParser:
             descend_into_definitions=False,
         )
         scope_imports: dict[tuple[str, ...], tuple[str, ...]] = {(): module_imports}
+        scope_classes: dict[tuple[str, ...], str | None] = {(): None}
         chunks: list[CodeSymbolChunk] = []
 
         for event in iter_python_definitions(root, source_bytes):
             parent_imports = scope_imports.get(event.scope_stack[:-1], module_imports)
+            parent_class = scope_classes.get(event.scope_stack[:-1])
             merged_imports = list(parent_imports)
             seen_imports = set(parent_imports)
             if event.body_node is not None:
@@ -474,6 +520,12 @@ class PythonASTParser:
                     append_unique(merged_imports, seen_imports, item)
             imports_tuple = tuple(merged_imports)
             scope_imports[event.scope_stack] = imports_tuple
+            if event.definition.type == "class_definition":
+                scope_classes[event.scope_stack] = event.symbol_name
+                enclosing_class_for_calls: str | None = None
+            else:
+                scope_classes[event.scope_stack] = parent_class
+                enclosing_class_for_calls = parent_class
 
             qualified_name = ".".join(event.scope_stack)
             start_line, end_line = node_line_span(event.outer_node, source_bytes)
@@ -500,7 +552,11 @@ class PythonASTParser:
                         docstring=docstring,
                         decorators=event.decorators,
                         imports=imports_tuple,
-                        called_symbols=_extract_called_symbols(call_scope_nodes, source_bytes),
+                        called_symbols=_extract_called_symbols(
+                            call_scope_nodes,
+                            source_bytes,
+                            enclosing_class=enclosing_class_for_calls,
+                        ),
                         cyclomatic_complexity=compute_python_nodes_cc(body_nodes, source_bytes),
                         is_async=False,
                         is_subchunk=False,
@@ -526,7 +582,11 @@ class PythonASTParser:
                         docstring=docstring,
                         decorators=event.decorators,
                         imports=imports_tuple,
-                        called_symbols=_extract_called_symbols(call_scope_nodes, source_bytes),
+                        called_symbols=_extract_called_symbols(
+                            call_scope_nodes,
+                            source_bytes,
+                            enclosing_class=enclosing_class_for_calls,
+                        ),
                         cyclomatic_complexity=compute_python_nodes_cc(body_nodes, source_bytes),
                         is_async=event.is_async,
                         is_subchunk=False,
@@ -564,6 +624,7 @@ class PythonASTParser:
                             called_symbols=_extract_called_symbols(
                                 call_scope_nodes,
                                 source_bytes,
+                                enclosing_class=enclosing_class_for_calls,
                                 line_range=(sub_start, sub_end),
                             ),
                             cyclomatic_complexity=compute_python_nodes_cc(

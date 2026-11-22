@@ -102,7 +102,16 @@ _IGNORED_PARAM_TYPES: Final[frozenset[str]] = frozenset(
     }
 )
 
-DEFAULT_SOURCE_GLOBS: Final[tuple[str, ...]] = ("src/**",)
+DEFAULT_SOURCE_GLOBS: Final[tuple[str, ...]] = (
+    "src/**",
+    "app/**",
+    "backend/**",
+    "frontend/src/**",
+    "packages/*/src/**",
+)
+_CODE_SOURCE_EXTENSIONS: Final[frozenset[str]] = frozenset(
+    {".py", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
+)
 DEFAULT_TEST_GLOBS: Final[tuple[str, ...]] = (
     "tests/**",
     "test/**",
@@ -967,14 +976,15 @@ def detect_missing_test_companion(
         if not norm_path:
             continue
 
-        logic_lines = _count_added_logic_lines(parsed_file, norm_path)
         if _matches_any(norm_path, test_matchers):
-            added_test_logic += logic_lines
+            added_test_logic += _count_added_logic_lines(parsed_file, norm_path)
             test_files.append(norm_path)
-        elif not is_ambient_declaration_path(norm_path) and _matches_any(
-            norm_path, source_matchers
+        elif (
+            Path(norm_path).suffix.lower() in _CODE_SOURCE_EXTENSIONS
+            and not is_ambient_declaration_path(norm_path)
+            and _matches_any(norm_path, source_matchers)
         ):
-            added_source_logic += logic_lines
+            added_source_logic += _count_added_logic_lines(parsed_file, norm_path)
             source_files.append(norm_path)
 
     is_untested = added_source_logic > logic_line_threshold and added_test_logic == 0

@@ -132,7 +132,7 @@ def test_python_ast_parser_extracts_classes_methods_async_nested_decorators_and_
     assert helper.is_async is False
     assert helper.signature == "def top_level_helper(raw: str) -> str"
     assert helper.docstring == "Normalize token input."
-    assert helper.called_symbols == ("strip", "helper_call")
+    assert helper.called_symbols == ("strip", "raw.strip", "helper_call")
     assert helper.start_line == 11
     assert helper.end_line == 14
 
@@ -196,7 +196,7 @@ def test_python_ast_parser_handles_multibyte_utf8_vietnamese_offsets_safely() ->
     assert chunk.symbol_name == "kiem_tra_chu_ky"
     assert chunk.signature == "def kiem_tra_chu_ky(du_lieu: str) -> bool"
     assert chunk.docstring == "Xác thực chữ ký bảo mật tiếng Việt."
-    assert chunk.called_symbols == ("xac_minh_hmac", "encode")
+    assert chunk.called_symbols == ("xac_minh_hmac", "encode", "du_lieu.encode")
     assert chunk.start_line == 4
     assert chunk.end_line == 6
 
@@ -572,6 +572,7 @@ def test_called_symbols_includes_decorator_and_default_parameter_calls() -> None
     assert by_qname["Controller"].called_symbols == ()
     assert by_qname["Controller.handle"].called_symbols == (
         "get",
+        "app.get",
         "build_path",
         "Depends",
         "get_session",
@@ -685,3 +686,43 @@ def test_python_signature_strips_default_values_and_credentials() -> None:
         chunks[0], repo_full_name="acme/app", blob_sha="a1" * 20
     )
     assert "S3cr3tP4ss" not in str(item.payload)
+
+
+def test_python_ast_parser_extracts_receiver_qualified_and_class_qualified_calls() -> None:
+    src = (
+        "class UserRepository:\n"
+        "    @classmethod\n"
+        "    def from_store(cls, store):\n"
+        "        return cls.build(store)\n\n"
+        "    def update(self, user, repo, factory):\n"
+        "        self.validate(user)\n"
+        "        repo.save(user)\n"
+        "        self.nested.chain()\n"
+        "        factory().create()\n"
+        "        return user\n\n"
+        "def standalone(self, cache):\n"
+        "    self.ping()\n"
+        "    cache.update()\n"
+    )
+    parsed = PythonASTParser().parse(src, file_path="src/repos/user_repository.py")
+    by_qname = {c.qualified_name: c for c in parsed.chunks}
+
+    assert by_qname["UserRepository.from_store"].called_symbols == (
+        "build",
+        "UserRepository.build",
+    )
+    assert by_qname["UserRepository.update"].called_symbols == (
+        "validate",
+        "UserRepository.validate",
+        "save",
+        "repo.save",
+        "chain",
+        "factory",
+        "create",
+    )
+    assert by_qname["standalone"].called_symbols == (
+        "ping",
+        "update",
+        "cache.update",
+    )
+    assert "self.ping" not in by_qname["standalone"].called_symbols

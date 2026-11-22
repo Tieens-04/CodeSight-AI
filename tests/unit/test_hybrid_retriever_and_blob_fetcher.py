@@ -592,13 +592,21 @@ async def test_retriever_batches_single_embed_query_filters_noise_and_ranks_impo
     assert store.similar_queries == [
         {"dim": 768, "chunk_type": "architecture_doc", "score_threshold": 0.65, "limit": 6}
     ]
-    # Noise symbols ('__init__', 'get', 'append', 'map', 'format') were excluded before Qdrant
-    assert store.called_symbols_queries == [["verify_session", "issue_session"]]
+    # Builtin noise dropped; class-qualified priority & split ambiguous lookup
+    assert store.called_symbols_queries == [
+        [
+            "AuthService.verify_session",
+            "verify_session",
+            "AuthService.issue_session",
+            "issue_session",
+        ]
+    ]
     assert set(store.symbol_names_queries[0]) == {
         "decode_token",
         "check_revocation",
         "sign_token",
     }
+    assert set(store.symbol_names_queries[1]) == {"get", "format"}
     # Self-hit removed, explicitly imported caller & callee ranked first
     assert [c.symbol_name for c in result.callers] == ["get_profile", "unrelated_handler"]
     assert result.callers[0].relevance_score > result.callers[1].relevance_score
@@ -1480,7 +1488,7 @@ async def test_retriever_finds_callers_for_renamed_and_deleted_symbols_from_comp
         head_ref="pr-del-sha",
     )
 
-    assert del_store.called_symbols_queries == [["legacy_sync_helper"]]
+    assert del_store.called_symbols_queries == [["legacy_sync_helper"], ["get"]]
     assert [c.symbol_name for c in del_res.callers] == ["trigger_legacy_sync"]
     assert del_res.query_text is not None
     assert "legacy_sync_helper" in del_res.query_text
@@ -1658,3 +1666,165 @@ async def test_retriever_finds_callers_for_renamed_classes_schemas_and_ts_interf
         ),
     )
     assert _extract_removed_symbol_names(manual_stub) == ("manual_removed_fn",)
+
+
+@pytest.mark.asyncio
+async def test_retriever_doc_degrades_on_config_value_and_grpc_errors_raises_zerocode() -> None:
+    """[M3] Doc search isolates EmbeddingConfigError/ValueError/RpcError/RuntimeError."""
+    from codesight.ast_engine.models import CodeSymbolChunk, ParsedASTFile, PRFileContext
+    from codesight.rag.models import EmbeddingConfigError, ZeroCodeViolationError
+    from codesight.rag.retriever import HybridContextRetriever
+
+    chunk = CodeSymbolChunk(
+        file_path="src/orders.py",
+        language="python",
+        symbol_name="submit_order",
+        qualified_name="submit_order",
+        symbol_kind="function",
+        start_line=1,
+        end_line=8,
+        signature="def submit_order(order_id: str)",
+        called_symbols=("charge_wallet",),
+    )
+    pr_ctx = PRFileContext(
+        file_path="src/orders.py",
+        mode="ast",
+        language="python",
+        parsed_file=ParsedASTFile(
+            file_path="src/orders.py",
+            language="python",
+            imports=(),
+            chunks=(chunk,),
+        ),
+        touched_chunks=(chunk,),
+    )
+    caller_pt = _make_qdrant_point(
+        point_id="00000000-0000-5000-8000-000000000201",
+        file_path="src/routes/orders.py",
+        blob_sha="8" * 40,
+        symbol_name="post_order",
+        called_symbols=["submit_order"],
+    )
+    callee_pt = _make_qdrant_point(
+        point_id="00000000-0000-5000-8000-000000000202",
+        file_path="src/wallet.py",
+        blob_sha="9" * 40,
+        symbol_name="charge_wallet",
+    )
+
+    for exc in (EmbeddingConfigError("missing API key"), ValueError("bad query dimension")):
+        store = _StubQdrantStore(callers=(caller_pt,), callees=(callee_pt,))
+        retriever = HybridContextRetriever(
+            store=store,  # type: ignore[arg-type]
+            embedder=_StubEmbedder(fail_exc=exc),  # type: ignore[arg-type]
+        )
+        res = await retriever.retrieve([pr_ctx], repo_full_name="acme/app")
+        assert res.doc_search_degraded is True
+        assert res.architecture_docs == ()
+        assert [c.symbol_name for c in res.callers] == ["post_order"]
+        assert [c.symbol_name for c in res.callees] == ["charge_wallet"]
+
+    class _FakeRpcError(RuntimeError):
+        pass
+
+    class _FailingSearchStore(_StubQdrantStore):
+        async def search_similar(
+            self,
+            query_vector: tuple[float, ...],
+            *,
+            repo_full_name: str | None = None,
+            repo_id: str | None = None,
+            chunk_type: str | None = None,
+            score_threshold: float | None = None,
+            limit: int = 10,
+        ) -> tuple[Any, ...]:
+            raise _FakeRpcError("qdrant grpc unavailable")
+
+    retriever_rpc = HybridContextRetriever(
+        store=_FailingSearchStore(callers=(caller_pt,), callees=(callee_pt,)),  # type: ignore[arg-type]
+        embedder=_StubEmbedder(),  # type: ignore[arg-type]
+    )
+    res_rpc = await retriever_rpc.retrieve([pr_ctx], repo_full_name="acme/app")
+    assert res_rpc.doc_search_degraded is True
+    assert res_rpc.architecture_docs == ()
+    assert [c.symbol_name for c in res_rpc.callers] == ["post_order"]
+    assert [c.symbol_name for c in res_rpc.callees] == ["charge_wallet"]
+
+    retriever_zc = HybridContextRetriever(
+        store=_StubQdrantStore(callers=(caller_pt,)),  # type: ignore[arg-type]
+        embedder=_StubEmbedder(fail_exc=ZeroCodeViolationError("payload leak")),  # type: ignore[arg-type]
+    )
+    with pytest.raises(ZeroCodeViolationError, match="payload leak"):
+        await retriever_zc.retrieve([pr_ctx], repo_full_name="acme/app")
+
+
+@pytest.mark.asyncio
+async def test_retriever_separates_ambiguous_symbols_and_applies_affinity_gate() -> None:
+    """[N3/M5] Builtins stay dropped, ambiguous CRUD runs separately with affinity gate."""
+    from codesight.ast_engine.models import CodeSymbolChunk, ParsedASTFile, PRFileContext
+    from codesight.rag.retriever import (
+        AMBIGUOUS_METHOD_SYMBOLS,
+        BUILTIN_NOISE_SYMBOLS,
+        COMMON_NOISE_SYMBOLS,
+        HybridContextRetriever,
+    )
+
+    assert BUILTIN_NOISE_SYMBOLS & AMBIGUOUS_METHOD_SYMBOLS == frozenset()
+    assert {"len", "print", "console", "Math", "JSON", "Promise"} <= BUILTIN_NOISE_SYMBOLS
+    assert {"update", "save", "get", "delete", "fetch"} <= AMBIGUOUS_METHOD_SYMBOLS
+    assert COMMON_NOISE_SYMBOLS == BUILTIN_NOISE_SYMBOLS
+
+    chunk = CodeSymbolChunk(
+        file_path="src/repos/user_repository.py",
+        language="python",
+        symbol_name="update",
+        qualified_name="UserRepository.update",
+        symbol_kind="method",
+        start_line=5,
+        end_line=10,
+        signature="def update(self, user: dict) -> dict",
+        called_symbols=("validate", "UserRepository.validate", "len"),
+    )
+    pr_ctx = PRFileContext(
+        file_path="src/repos/user_repository.py",
+        mode="ast",
+        language="python",
+        parsed_file=ParsedASTFile(
+            file_path="src/repos/user_repository.py",
+            language="python",
+            imports=(),
+            chunks=(chunk,),
+        ),
+        touched_chunks=(chunk,),
+    )
+    router_caller = _make_qdrant_point(
+        point_id="00000000-0000-5000-8000-000000000301",
+        file_path="src/routers/user_router.py",
+        blob_sha="a" * 40,
+        symbol_name="patch_user",
+        called_symbols=["update", "repo.update"],
+        imports=["src.repos.user_repository.UserRepository"],
+    )
+    cron_unrelated = _make_qdrant_point(
+        point_id="00000000-0000-5000-8000-000000000302",
+        file_path="src/jobs/cron_job.py",
+        blob_sha="b" * 40,
+        symbol_name="run_cleanup",
+        called_symbols=["update", "cache.update"],
+        imports=["src.cache.redis_cache.RedisCache"],
+    )
+    snake_caller = _make_qdrant_point(
+        point_id="00000000-0000-5000-8000-000000000303",
+        file_path="src/handlers/di_handler.py",
+        blob_sha="c" * 40,
+        symbol_name="sync_user_di",
+        called_symbols=["update", "user_repository.update"],
+        imports=[],
+    )
+    store = _StubQdrantStore(callers=(router_caller, cron_unrelated, snake_caller))
+    retriever = HybridContextRetriever(store=store, embedder=_StubEmbedder())  # type: ignore[arg-type]
+
+    res = await retriever.retrieve([pr_ctx], repo_full_name="acme/app")
+
+    assert store.called_symbols_queries == [["UserRepository.update"], ["update"]]
+    assert [c.symbol_name for c in res.callers] == ["patch_user", "sync_user_di"]
