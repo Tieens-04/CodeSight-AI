@@ -221,11 +221,14 @@ async def run_cli_index(
 def render_index_report(console: Console, report: InitialIndexReport) -> None:
     """Render structured Zero-Code indexing summary Panel and metrics Table to stdout."""
     short_sha = report.commit_sha[:12]
-    cursor_label = (
-        f"[bold green]saved ({escape(short_sha)})[/bold green]"
-        if report.persisted_cursor
-        else "[yellow]not updated (non-default branch)[/yellow]"
-    )
+    if report.persisted_cursor:
+        cursor_label = f"[bold green]saved ({escape(short_sha)})[/bold green]"
+    elif report.truncated_tree:
+        cursor_label = "[bold yellow]not updated (incomplete: truncated Git tree)[/bold yellow]"
+    elif report.indexed_branch != report.default_branch:
+        cursor_label = "[yellow]not updated (non-default branch)[/yellow]"
+    else:
+        cursor_label = "[yellow]not updated (cursor not advanced)[/yellow]"
     summary_lines = [
         f"[bold cyan]{escape(report.repo_full_name)}[/bold cyan] "
         f"([green]{escape(report.indexed_branch)}[/green] @ [dim]{escape(short_sha)}[/dim])",
@@ -368,6 +371,13 @@ def index_command(
 
     out_console = Console(file=sys.stdout)
     render_index_report(out_console, report)
+    if report.truncated_tree:
+        err_console.print(
+            f"[red]Incomplete index:[/red] Git tree for '{escape(report.repo_full_name)}' @ "
+            f"{escape(report.commit_sha[:12])} remained truncated after subtree traversal; "
+            "PostgreSQL `last_indexed_sha` was preserved."
+        )
+        raise typer.Exit(code=1)
     logger.debug(
         "cli_index_completed",
         repo=report.repo_full_name,

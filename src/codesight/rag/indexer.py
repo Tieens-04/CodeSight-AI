@@ -8,7 +8,7 @@ import binascii
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from collections.abc import Set as AbstractSet
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -72,7 +72,10 @@ REPO_INDEX_LOCK_TTL_SECONDS: Final[int] = 90
 DEFAULT_LOCK_RETRY_AFTER_SECONDS: Final[float] = 15.0
 DEFAULT_LOCK_ACQUIRE_TIMEOUT_SECONDS: Final[float] = 5.0
 DEFAULT_LOCK_POLL_INTERVAL_SECONDS: Final[float] = 0.1
+MAX_SUBTREE_REQUESTS: Final[int] = 1024
+MAX_TREE_DEPTH: Final[int] = 32
 SYMLINK_GIT_MODE: Final[str] = "120000"
+GITLINK_SUBMODULE_MODE: Final[str] = "160000"
 _ZERO_SHA: Final[str] = "0" * 40
 _CONFIG_FILENAME_SET: Final[frozenset[str]] = frozenset(name.lower() for name in CONFIG_FILENAMES)
 _RELEASE_LOCK_LUA: Final[str] = """
@@ -210,6 +213,7 @@ class IncrementalSyncReport:
     persisted_cursor: bool
     elapsed_ms: float
     skipped_guard_files: int = 0
+    truncated_tree: bool = False
 
 
 def _make_index_error(message: str, status_code: int | None) -> RepoIndexError:
@@ -456,6 +460,122 @@ class GitHubRepoIndexClient:
             )
         return raw_sha.strip()
 
+    @staticmethod
+    def _parse_tree_blob_item(
+        item: object,
+        *,
+        prefix: str = "",
+    ) -> GitTreeBlobEntry | None:
+        if not isinstance(item, dict) or item.get("type") != "blob":
+            return None
+        raw_path = item.get("path")
+        raw_sha = item.get("sha")
+        if not isinstance(raw_path, str) or not isinstance(raw_sha, str):
+            return None
+        joined = f"{prefix}/{raw_path}" if prefix else raw_path
+        norm_path = normalize_diff_path(joined).rstrip("/")
+        blob_sha = raw_sha.strip()
+        if not norm_path or not blob_sha:
+            return None
+        raw_size = item.get("size")
+        size = (
+            raw_size
+            if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0
+            else None
+        )
+        mode = str(item.get("mode") or "100644")
+        return GitTreeBlobEntry(path=norm_path, blob_sha=blob_sha, size=size, mode=mode)
+
+    async def _walk_git_tree_non_recursive(
+        self,
+        *,
+        slug: str,
+        root_sha: str,
+        fallback_entries: Sequence[GitTreeBlobEntry],
+        installation_id: int | None,
+    ) -> GitTreeSnapshot:
+        """Traverse non-recursive `/git/trees/{sha}` subtrees when `recursive=1` was truncated."""
+        by_path: dict[str, GitTreeBlobEntry] = {}
+        frontier: list[tuple[str, str, int]] = [("", root_sha, 0)]
+        visited: set[tuple[str, str]] = {("", root_sha)}
+        enqueued_count = 1
+        still_truncated = False
+        sem = asyncio.Semaphore(DEFAULT_BLOB_CONCURRENCY)
+
+        async def _fetch_dir(
+            prefix: str,
+            node_sha: str,
+            depth: int,
+        ) -> tuple[str, int, dict[str, Any]]:
+            async with sem:
+                encoded = quote(node_sha.strip(), safe="")
+                payload = await self._get_json(
+                    f"{self._base_url}/repos/{slug}/git/trees/{encoded}",
+                    slug=slug,
+                    context=f"git subtree '{node_sha}' for '{slug}'",
+                    installation_id=installation_id,
+                )
+                if payload is None:
+                    raise RepoIndexError(
+                        f"GitHub Git Trees response missing payload for '{slug}@{node_sha}'."
+                    )
+                return prefix, depth, payload
+
+        while frontier:
+            dir_results = await asyncio.gather(*(_fetch_dir(p, s, d) for p, s, d in frontier))
+            next_frontier: list[tuple[str, str, int]] = []
+            for prefix, depth, sub_data in dir_results:
+                if bool(sub_data.get("truncated")):
+                    still_truncated = True
+                raw_items = sub_data.get("tree")
+                if not isinstance(raw_items, list):
+                    raise RepoIndexError(
+                        f"GitHub Git Trees response missing 'tree' list for '{slug}'."
+                    )
+                for item in raw_items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type")
+                    if item_type == "blob":
+                        blob_entry = self._parse_tree_blob_item(item, prefix=prefix)
+                        if blob_entry is not None:
+                            by_path[blob_entry.path] = blob_entry
+                        continue
+                    if item_type != "tree":
+                        continue
+                    mode = str(item.get("mode") or "040000")
+                    if mode == GITLINK_SUBMODULE_MODE:
+                        continue
+                    raw_name = item.get("path")
+                    raw_sub_sha = item.get("sha")
+                    if not isinstance(raw_name, str) or not isinstance(raw_sub_sha, str):
+                        continue
+                    sub_sha = raw_sub_sha.strip()
+                    joined_dir = f"{prefix}/{raw_name}" if prefix else raw_name
+                    norm_dir = normalize_diff_path(joined_dir).rstrip("/")
+                    if not norm_dir or not sub_sha:
+                        continue
+                    if depth + 1 > MAX_TREE_DEPTH or enqueued_count >= MAX_SUBTREE_REQUESTS:
+                        still_truncated = True
+                        continue
+                    visit_key = (norm_dir, sub_sha)
+                    if visit_key in visited:
+                        continue
+                    visited.add(visit_key)
+                    enqueued_count += 1
+                    next_frontier.append((norm_dir, sub_sha, depth + 1))
+            frontier = next_frontier
+
+        if still_truncated:
+            for existing in fallback_entries:
+                by_path.setdefault(existing.path, existing)
+
+        return GitTreeSnapshot(
+            sha=root_sha,
+            truncated=still_truncated,
+            entries=tuple(by_path.values()),
+        )
+
     async def fetch_git_tree(
         self,
         repo_full_name: str,
@@ -463,46 +583,46 @@ class GitHubRepoIndexClient:
         *,
         installation_id: int | None = None,
     ) -> GitTreeSnapshot:
-        """Fetch recursive Git tree metadata for `tree_sha` without downloading file contents."""
+        """Fetch recursive Git tree metadata for `tree_sha`, walking subtrees if truncated."""
         slug = validate_repo_full_name(repo_full_name)
-        encoded_sha = quote(tree_sha.strip(), safe="")
+        cleaned_tree_sha = tree_sha.strip()
+        encoded_sha = quote(cleaned_tree_sha, safe="")
         data = await self._get_json(
             f"{self._base_url}/repos/{slug}/git/trees/{encoded_sha}?recursive=1",
             slug=slug,
             context=f"git tree '{tree_sha}' for '{slug}'",
             installation_id=installation_id,
         )
-        assert data is not None
+        if data is None:
+            raise RepoIndexError(f"GitHub Git Trees response empty for '{slug}'.")
         raw_tree = data.get("tree")
         if not isinstance(raw_tree, list):
             raise RepoIndexError(f"GitHub Git Trees response missing 'tree' list for '{slug}'.")
 
         entries: list[GitTreeBlobEntry] = []
         for item in raw_tree:
-            if not isinstance(item, dict) or item.get("type") != "blob":
-                continue
-            raw_path = item.get("path")
-            raw_sha = item.get("sha")
-            if not isinstance(raw_path, str) or not isinstance(raw_sha, str):
-                continue
-            norm_path = normalize_diff_path(raw_path).rstrip("/")
-            blob_sha = raw_sha.strip()
-            if not norm_path or not blob_sha:
-                continue
-            raw_size = item.get("size")
-            size = (
-                raw_size
-                if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0
-                else None
+            blob_entry = self._parse_tree_blob_item(item)
+            if blob_entry is not None:
+                entries.append(blob_entry)
+
+        resolved_sha = str(data.get("sha") or cleaned_tree_sha)
+        if bool(data.get("truncated")):
+            logger.info(
+                "repo_git_tree_recursive_truncated_walking_subtrees",
+                repo=slug,
+                tree_sha=resolved_sha,
+                partial_entries=len(entries),
             )
-            mode = str(item.get("mode") or "100644")
-            entries.append(
-                GitTreeBlobEntry(path=norm_path, blob_sha=blob_sha, size=size, mode=mode)
+            return await self._walk_git_tree_non_recursive(
+                slug=slug,
+                root_sha=cleaned_tree_sha,
+                fallback_entries=entries,
+                installation_id=installation_id,
             )
 
         return GitTreeSnapshot(
-            sha=str(data.get("sha") or tree_sha),
-            truncated=bool(data.get("truncated")),
+            sha=resolved_sha,
+            truncated=False,
             entries=tuple(entries),
         )
 
@@ -670,6 +790,85 @@ class GitHubRepoIndexClient:
         )
 
 
+class RepoIndexLockLease:
+    """Active distributed lock lease enforcing pre-write ownership verification."""
+
+    def __init__(
+        self,
+        *,
+        scope_key: str,
+        verify_fn: Callable[[], Awaitable[bool]] | None = None,
+        lease_deadline: float | None = None,
+        ttl_seconds: int = REPO_INDEX_LOCK_TTL_SECONDS,
+    ) -> None:
+        self._scope_key = scope_key
+        self._verify_fn = verify_fn
+        self._lease_deadline = lease_deadline
+        self._ttl_seconds = ttl_seconds
+        self._lost_reason: str | None = None
+
+    @property
+    def is_lost(self) -> bool:
+        """Return True when lock ownership was lost or the Redis lease TTL expired."""
+        if self._lost_reason is not None:
+            return True
+        if self._lease_deadline is not None and time.monotonic() >= self._lease_deadline:
+            self._lost_reason = "lease_expired"
+            return True
+        return False
+
+    def mark_lost(self, reason: str) -> None:
+        """Mark the lease as permanently lost for the remainder of the context."""
+        if self._lost_reason is None:
+            self._lost_reason = reason
+
+    def refresh_deadline(self, *, renewed_at: float) -> None:
+        """Advance local lease deadline after a confirmed Redis TTL renewal."""
+        if self._lost_reason is None and self._lease_deadline is not None:
+            self._lease_deadline = renewed_at + self._ttl_seconds
+
+    async def ensure_held(self) -> None:
+        """Verify lock ownership in Redis before mutating Qdrant or PostgreSQL."""
+        if self._verify_fn is None:
+            return
+        if self.is_lost:
+            raise RetryableTaskError(
+                f"Repository index lock ownership lost for '{self._scope_key}' "
+                f"({self._lost_reason}); aborting write.",
+                retry_after_seconds=DEFAULT_LOCK_RETRY_AFTER_SECONDS,
+            )
+        renew_started = time.monotonic()
+        still_owned = await self._verify_fn()
+        if not still_owned:
+            self.mark_lost("ownership_lost")
+            raise RetryableTaskError(
+                f"Repository index lock ownership lost for '{self._scope_key}'; aborting write.",
+                retry_after_seconds=DEFAULT_LOCK_RETRY_AFTER_SECONDS,
+            )
+        self.refresh_deadline(renewed_at=renew_started)
+
+
+class CompositeRepoLockLease:
+    """Aggregates zero or more RepoIndexLockLeases for multi-scope repository locking."""
+
+    def __init__(self, leases: Sequence[RepoIndexLockLease] = ()) -> None:
+        self._leases: list[RepoIndexLockLease] = list(leases)
+
+    @property
+    def leases(self) -> tuple[RepoIndexLockLease, ...]:
+        """Return immutable snapshot of tracked lock leases."""
+        return tuple(self._leases)
+
+    def add(self, lease: RepoIndexLockLease) -> None:
+        """Append a newly acquired lock lease to the composite guard."""
+        self._leases.append(lease)
+
+    async def ensure_held(self) -> None:
+        """Ensure every underlying lock scope is still actively owned."""
+        for lease in self._leases:
+            await lease.ensure_held()
+
+
 class AsyncRepoIndexLock:
     """Per-repository distributed Redis lock preventing concurrent push sync races."""
 
@@ -696,31 +895,58 @@ class AsyncRepoIndexLock:
         """Return canonical Redis lock key for a repository indexing scope."""
         return f"repo_index_lock:{scope_key}"
 
-    async def _renew(self, key: str, token: str) -> bool:
+    async def _renew_strict(self, key: str, token: str) -> bool:
         if self._client is None:
             return False
         eval_fn = getattr(self._client, "eval", None)
+        if callable(eval_fn):
+            res = await eval_fn(_RENEW_LOCK_LUA, 1, key, token, self._ttl_seconds)
+            return bool(int(res or 0))
+        current = await self._client.get(key)
+        if isinstance(current, (bytes, bytearray)):
+            current = current.decode("utf-8", errors="ignore")
+        if current == token:
+            expire_fn = getattr(self._client, "expire", None)
+            if callable(expire_fn):
+                return bool(await expire_fn(key, self._ttl_seconds))
+            await self._client.set(key, token, ex=self._ttl_seconds)
+            return True
+        return False
+
+    async def _renew_heartbeat_step(self, key: str, token: str) -> tuple[bool, bool]:
+        """Return `(renewed_ok, had_transient_redis_error)` for background heartbeat ticks."""
         try:
-            if callable(eval_fn):
-                res = await eval_fn(_RENEW_LOCK_LUA, 1, key, token, self._ttl_seconds)
-                return bool(int(res or 0))
-            current = await self._client.get(key)
-            if isinstance(current, (bytes, bytearray)):
-                current = current.decode("utf-8", errors="ignore")
-            if current == token:
-                expire_fn = getattr(self._client, "expire", None)
-                if callable(expire_fn):
-                    return bool(await expire_fn(key, self._ttl_seconds))
-                await self._client.set(key, token, ex=self._ttl_seconds)
-                return True
-            return False
+            return await self._renew_strict(key, token), False
         except (redis.exceptions.RedisError, OSError) as exc:
             logger.warning(
                 "repo_index_lock_renew_failed",
                 lock_key=key,
                 error_type=type(exc).__name__,
             )
-            return True
+            return False, True
+
+    async def _verify_for_write(self, key: str, token: str, *, scope_key: str) -> bool:
+        try:
+            still_owned = await self._renew_strict(key, token)
+        except (redis.exceptions.RedisError, OSError) as exc:
+            logger.warning(
+                "repo_index_lock_verify_failed",
+                lock_key=key,
+                scope_key=scope_key,
+                error_type=type(exc).__name__,
+            )
+            raise RetryableTaskError(
+                f"Redis unavailable while verifying repository index lock for '{scope_key}'; "
+                "aborting write.",
+                retry_after_seconds=DEFAULT_LOCK_RETRY_AFTER_SECONDS,
+            ) from exc
+        if not still_owned:
+            logger.warning(
+                "repo_index_lock_ownership_lost",
+                lock_key=key,
+                scope_key=scope_key,
+            )
+        return still_owned
 
     async def _release(self, key: str, token: str) -> None:
         if self._client is None:
@@ -743,30 +969,37 @@ class AsyncRepoIndexLock:
             )
 
     @asynccontextmanager
-    async def hold(self, scope_key: str) -> AsyncIterator[None]:
+    async def hold(self, scope_key: str) -> AsyncIterator[RepoIndexLockLease]:
         """Acquire exclusive repo index lock with heartbeat renewal or raise RetryableTaskError."""
         if self._client is None:
-            yield
+            yield RepoIndexLockLease(scope_key=scope_key)
             return
 
         key = self.lock_key(scope_key)
         token = uuid.uuid4().hex
         acquired = False
+        acquired_at = 0.0
         deadline = time.monotonic() + self._acquire_timeout
 
         while True:
+            attempt_started = time.monotonic()
             try:
                 ok = await self._client.set(key, token, nx=True, ex=self._ttl_seconds)
                 if ok:
                     acquired = True
+                    acquired_at = attempt_started
                     break
             except (redis.exceptions.RedisError, OSError) as exc:
                 logger.warning(
-                    "repo_index_lock_unavailable_fail_open",
+                    "repo_index_lock_unavailable",
                     lock_key=key,
+                    scope_key=scope_key,
                     error_type=type(exc).__name__,
                 )
-                break
+                raise RetryableTaskError(
+                    f"Redis unavailable while acquiring repository index lock for '{scope_key}'.",
+                    retry_after_seconds=DEFAULT_LOCK_RETRY_AFTER_SECONDS,
+                ) from exc
 
             if time.monotonic() >= deadline:
                 raise RetryableTaskError(
@@ -775,16 +1008,38 @@ class AsyncRepoIndexLock:
                 )
             await asyncio.sleep(self._poll_interval)
 
+        lease = RepoIndexLockLease(
+            scope_key=scope_key,
+            verify_fn=lambda: self._verify_for_write(key, token, scope_key=scope_key),
+            lease_deadline=acquired_at + self._ttl_seconds,
+            ttl_seconds=self._ttl_seconds,
+        )
         heartbeat_task: asyncio.Task[None] | None = None
         if acquired:
-            interval = max(0.5, self._ttl_seconds / 3.0)
+            interval = (
+                max(0.25, min(0.5, self._ttl_seconds / 3.0))
+                if self._ttl_seconds <= 1
+                else max(0.5, self._ttl_seconds / 3.0)
+            )
 
             async def _heartbeat() -> None:
                 try:
                     while True:
                         await asyncio.sleep(interval)
-                        still_owned = await self._renew(key, token)
-                        if not still_owned:
+                        renew_started = time.monotonic()
+                        renewed_ok, transient_err = await self._renew_heartbeat_step(key, token)
+                        if renewed_ok:
+                            lease.refresh_deadline(renewed_at=renew_started)
+                            continue
+                        if not transient_err:
+                            lease.mark_lost("ownership_lost")
+                            logger.warning(
+                                "repo_index_lock_ownership_lost",
+                                lock_key=key,
+                                scope_key=scope_key,
+                            )
+                            return
+                        if lease.is_lost:
                             logger.warning(
                                 "repo_index_lock_ownership_lost",
                                 lock_key=key,
@@ -794,6 +1049,7 @@ class AsyncRepoIndexLock:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    lease.mark_lost("heartbeat_failed")
                     logger.warning(
                         "repo_index_lock_heartbeat_failed",
                         lock_key=key,
@@ -804,7 +1060,7 @@ class AsyncRepoIndexLock:
             heartbeat_task = asyncio.create_task(_heartbeat())
 
         try:
-            yield
+            yield lease
         finally:
             try:
                 if heartbeat_task is not None:
@@ -1278,6 +1534,7 @@ class InitialRepoIndexer:
         allow_non_default_branch: bool = False,
         progress_callback: ProgressCallback | None = None,
         _skip_repo_lock: bool = False,
+        _lock_lease: CompositeRepoLockLease | None = None,
     ) -> InitialIndexReport:
         """Index eligible Python/TS/TSX AST chunks and architecture docs for a repository."""
         started = time.perf_counter()
@@ -1285,10 +1542,12 @@ class InitialRepoIndexer:
         if self._embed_code_chunks and self._embedder is None:
             raise EmbeddingConfigError("GEMINI_API_KEY is required when embed_code_chunks=True.")
 
+        active_lease = CompositeRepoLockLease(_lock_lease.leases if _lock_lease is not None else ())
         async with AsyncExitStack() as lock_stack:
             if self._repo_lock is not None and not _skip_repo_lock:
                 for scope_key in _repo_lock_scopes(slug, repo_id):
-                    await lock_stack.enter_async_context(self._repo_lock.hold(scope_key))
+                    lease = await lock_stack.enter_async_context(self._repo_lock.hold(scope_key))
+                    active_lease.add(lease)
             return await self._index_repository_unlocked(
                 slug=slug,
                 ref=ref,
@@ -1299,6 +1558,7 @@ class InitialRepoIndexer:
                 is_default_branch_target=is_default_branch_target,
                 allow_non_default_branch=allow_non_default_branch,
                 progress_callback=progress_callback,
+                lock_lease=active_lease,
                 started=started,
             )
 
@@ -1314,6 +1574,7 @@ class InitialRepoIndexer:
         is_default_branch_target: bool | None,
         allow_non_default_branch: bool,
         progress_callback: ProgressCallback | None,
+        lock_lease: CompositeRepoLockLease,
         started: float,
     ) -> InitialIndexReport:
         repo_meta = await self._repo_client.fetch_repo_metadata(
@@ -1343,6 +1604,7 @@ class InitialRepoIndexer:
         initial_last_indexed_sha: str | None = None
         if self._session_factory is not None:
             if effective_repo_id is None or is_default_target:
+                await lock_lease.ensure_held()
                 effective_repo_id, _ = await upsert_repository_state(
                     self._session_factory,
                     full_name=canonical_slug,
@@ -1373,9 +1635,11 @@ class InitialRepoIndexer:
         )
         file_filter = FileFilter.from_repo_config(repo_config)
 
+        await lock_lease.ensure_held()
         await self._store.ensure_collection()
         existing_refs: tuple[QdrantPointRef, ...]
         if recreate and is_default_target:
+            await lock_lease.ensure_held()
             await self._store.delete_by_repo(
                 repo_full_name=canonical_slug,
                 repo_id=effective_repo_id,
@@ -1478,6 +1742,8 @@ class InitialRepoIndexer:
             )
 
         for wave_start in range(0, total_to_fetch, self._wave_size):
+            if wave_start > 0:
+                await lock_lease.ensure_held()
             wave_entries = files_to_fetch[wave_start : wave_start + self._wave_size]
             fetched_pairs = await self._fetch_wave_blobs(
                 canonical_slug,
@@ -1530,6 +1796,7 @@ class InitialRepoIndexer:
                     )
                     total_embedded += embedded_cnt
                     if points:
+                        await lock_lease.ensure_held()
                         total_upserted += await self._store.upsert_points(points)
             finally:
                 for item in wave_items:
@@ -1568,6 +1835,7 @@ class InitialRepoIndexer:
                 elif not tree.truncated or ref_item.file_path in skipped_guard_paths:
                     stale_ids.append(ref_item.point_id)
             if stale_ids:
+                await lock_lease.ensure_held()
                 stale_points_deleted = await self._store.delete_points_by_ids(
                     stale_ids,
                     repo_full_name=canonical_slug,
@@ -1576,7 +1844,15 @@ class InitialRepoIndexer:
                 )
 
         cursor_persisted = False
-        if self._session_factory is not None and persist_cursor and is_default_target:
+        if tree.truncated:
+            logger.warning(
+                "repo_index_cursor_skipped_truncated_tree",
+                repo=canonical_slug,
+                commit_sha=commit_sha,
+                entries=len(tree.entries),
+            )
+        elif self._session_factory is not None and persist_cursor and is_default_target:
+            await lock_lease.ensure_held()
             effective_repo_id, cursor_persisted = await upsert_repository_state(
                 self._session_factory,
                 full_name=canonical_slug,
@@ -1714,6 +1990,7 @@ class IncrementalBranchSyncer:
         effective_inst_id: int | None,
         compare_status: str,
         fallback_reason: str,
+        lock_lease: CompositeRepoLockLease,
         started: float,
     ) -> IncrementalSyncReport:
         branch_head = await self._repo_client.fetch_branch_head_sha(
@@ -1748,6 +2025,7 @@ class IncrementalBranchSyncer:
                 installation_id=effective_inst_id,
                 mode="fallback_full_reconcile",
                 reason=f"{fallback_reason}_head_advanced",
+                lock_lease=lock_lease,
                 started=started,
             )
         return await self._run_full_fallback(
@@ -1758,6 +2036,7 @@ class IncrementalBranchSyncer:
             installation_id=effective_inst_id,
             mode="fallback_full_reconcile",
             reason=fallback_reason,
+            lock_lease=lock_lease,
             started=started,
         )
 
@@ -1771,6 +2050,7 @@ class IncrementalBranchSyncer:
         installation_id: int | None,
         mode: Literal["bootstrap_full_index", "fallback_full_reconcile"],
         reason: str,
+        lock_lease: CompositeRepoLockLease,
         started: float,
     ) -> IncrementalSyncReport:
         logger.info(
@@ -1790,6 +2070,7 @@ class IncrementalBranchSyncer:
             persist_cursor=True,
             is_default_branch_target=True,
             _skip_repo_lock=True,
+            _lock_lease=lock_lease,
         )
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
         return IncrementalSyncReport(
@@ -1806,6 +2087,7 @@ class IncrementalBranchSyncer:
             persisted_cursor=init_report.persisted_cursor,
             elapsed_ms=elapsed_ms,
             skipped_guard_files=init_report.skipped_guard_files,
+            truncated_tree=init_report.truncated_tree,
         )
 
     async def sync_push(
@@ -1841,9 +2123,11 @@ class IncrementalBranchSyncer:
 
         clean_repo_id = repo_id.strip() if repo_id and repo_id.strip() else None
         lock_scopes = _repo_lock_scopes(slug, clean_repo_id)
+        lease_group = CompositeRepoLockLease()
         async with AsyncExitStack() as lock_stack:
             for scope_key in lock_scopes:
-                await lock_stack.enter_async_context(self._lock.hold(scope_key))
+                lease = await lock_stack.enter_async_context(self._lock.hold(scope_key))
+                lease_group.add(lease)
 
             effective_repo_id: str | None = clean_repo_id
             effective_branch = default_branch.strip() or "main"
@@ -1925,6 +2209,7 @@ class IncrementalBranchSyncer:
                     installation_id=effective_inst_id,
                     mode="bootstrap_full_index",
                     reason="missing_last_indexed_sha",
+                    lock_lease=lease_group,
                     started=started,
                 )
 
@@ -1945,12 +2230,14 @@ class IncrementalBranchSyncer:
                     effective_inst_id=effective_inst_id,
                     compare_status="not_found",
                     fallback_reason="compare_404",
+                    lock_lease=lease_group,
                     started=started,
                 )
 
             if compare.status == "identical":
                 persisted = False
                 if self._session_factory is not None:
+                    await lease_group.ensure_held()
                     effective_repo_id, persisted = await upsert_repository_state(
                         self._session_factory,
                         full_name=slug,
@@ -1980,6 +2267,7 @@ class IncrementalBranchSyncer:
                     effective_inst_id=effective_inst_id,
                     compare_status="behind",
                     fallback_reason="force_push_behind_revert",
+                    lock_lease=lease_group,
                     started=started,
                 )
 
@@ -1993,6 +2281,7 @@ class IncrementalBranchSyncer:
                     effective_inst_id=effective_inst_id,
                     compare_status=compare.status,
                     fallback_reason=f"compare_status_{compare.status}",
+                    lock_lease=lease_group,
                     started=started,
                 )
 
@@ -2014,6 +2303,7 @@ class IncrementalBranchSyncer:
                     installation_id=effective_inst_id,
                     mode="fallback_full_reconcile",
                     reason=fallback_reason,
+                    lock_lease=lease_group,
                     started=started,
                 )
 
@@ -2029,6 +2319,7 @@ class IncrementalBranchSyncer:
                     installation_id=effective_inst_id,
                     mode="fallback_full_reconcile",
                     reason="repo_renamed",
+                    lock_lease=lease_group,
                     started=started,
                 )
 
@@ -2044,6 +2335,7 @@ class IncrementalBranchSyncer:
                 else RepoConfig()
             )
             file_filter = FileFilter.from_repo_config(repo_config)
+            await lease_group.ensure_held()
             await self._store.ensure_collection()
 
             paths_to_delete: list[str] = []
@@ -2085,6 +2377,8 @@ class IncrementalBranchSyncer:
             )
 
             for wave_start in range(0, len(entries_to_fetch), self._wave_size):
+                if wave_start > 0:
+                    await lease_group.ensure_held()
                 wave_entries = entries_to_fetch[wave_start : wave_start + self._wave_size]
                 fetched_pairs = await _fetch_blobs_bounded(
                     self._repo_client,
@@ -2137,6 +2431,7 @@ class IncrementalBranchSyncer:
                             embed_code_chunks=self._embed_code_chunks,
                         )
                         if points:
+                            await lease_group.ensure_held()
                             upserted_points += await self._store.upsert_points(points)
                 finally:
                     for item in wave_items:
@@ -2144,6 +2439,7 @@ class IncrementalBranchSyncer:
 
             # Delete 100% of old points for touched paths while keeping valid newly indexed IDs
             if paths_to_delete:
+                await lease_group.ensure_held()
                 await self._store.delete_by_file_paths(
                     paths_to_delete,
                     repo_full_name=slug,
@@ -2153,6 +2449,7 @@ class IncrementalBranchSyncer:
 
             cursor_persisted = False
             if self._session_factory is not None:
+                await lease_group.ensure_held()
                 effective_repo_id, cursor_persisted = await upsert_repository_state(
                     self._session_factory,
                     full_name=slug,

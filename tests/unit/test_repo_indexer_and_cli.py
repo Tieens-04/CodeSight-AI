@@ -959,8 +959,11 @@ async def test_blob_edge_cases_subchunk_snippet_identical_compare_and_lock_fallb
         async def set(self, *_args: Any, **_kwargs: Any) -> bool:
             raise redis.exceptions.ConnectionError("redis down")
 
-    async with AsyncRepoIndexLock(_BrokenRedis()).hold("repo-broken"):  # type: ignore[arg-type]
-        pass
+    entered_broken = False
+    with pytest.raises(RetryableTaskError):
+        async with AsyncRepoIndexLock(_BrokenRedis()).hold("repo-broken"):  # type: ignore[arg-type]
+            entered_broken = True
+    assert entered_broken is False
 
     # 2. Blob client handles 404, oversize, bad base64, transport error, and long sub-chunk snippet
     long_py_lines = ["def giant_func(x: int) -> int:"]
@@ -3355,3 +3358,462 @@ async def test_push_sync_stub_emits_missing_credentials_warning(
         assert all(w.get("level") == "warning" for w in warnings)
     finally:
         configure_logging()
+
+
+async def test_s2_01_repo_index_lock_fails_closed_on_redis_acquire_error() -> None:
+    import redis.exceptions
+
+    class _DownRedis:
+        async def set(self, *_args: Any, **_kwargs: Any) -> bool:
+            raise redis.exceptions.ConnectionError("redis connection refused")
+
+    down_lock = AsyncRepoIndexLock(_DownRedis())  # type: ignore[arg-type]
+    entered = False
+    with pytest.raises(RetryableTaskError) as exc_info:
+        async with down_lock.hold("acme/down"):
+            entered = True
+    assert entered is False
+    assert exc_info.value.retry_after_seconds == 15.0
+
+    store = _InMemoryZeroCodeStore()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    ) as http:
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            repo_lock=down_lock,
+        )
+        with pytest.raises(RetryableTaskError):
+            await indexer.index_repository("acme/down", repo_id="r-down")
+        assert store.ensured_calls == 0
+        assert store.points == {}
+
+        syncer = IncrementalBranchSyncer(
+            initial_indexer=indexer,
+            repo_client=indexer.repo_client,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            lock=down_lock,
+        )
+        with pytest.raises(RetryableTaskError):
+            await syncer.sync_push(
+                repo_full_name="acme/down",
+                after_sha="a" * 40,
+                last_indexed_sha="b" * 40,
+                repo_id="r-down",
+            )
+        assert store.ensured_calls == 0
+        assert store.points == {}
+
+
+async def test_s2_01_sync_push_and_initial_indexer_abort_writes_when_lock_lost_mid_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import redis.exceptions
+
+    from codesight.rag import indexer as indexer_mod
+
+    old_src = b"def stale_fn() -> int:\n    return 1\n"
+    new_src = b"def fresh_fn() -> int:\n    return 2\n"
+    steal_on_blob_fetch = True
+    fail_redis_on_verify = False
+
+    class _StealableRedis(_FakeRedisLockClient):
+        async def eval(
+            self,
+            script: str,
+            _numkeys: int,
+            key: str,
+            token: str,
+            *args: Any,
+        ) -> int:
+            if fail_redis_on_verify and "expire" in script.lower():
+                raise redis.exceptions.ConnectionError("redis lost mid-sync")
+            return await super().eval(script, _numkeys, key, token, *args)
+
+    redis_client = _StealableRedis()
+    lock = AsyncRepoIndexLock(
+        redis_client,  # type: ignore[arg-type]
+        ttl_seconds=60,
+        acquire_timeout_seconds=0.05,
+        poll_interval_seconds=0.01,
+    )
+    store = _InMemoryZeroCodeStore()
+    new_point_id = str(uuid.uuid4())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/race":
+            return httpx.Response(
+                200, json={"id": 88, "full_name": "acme/race", "default_branch": "main"}
+            )
+        if path.startswith("/repos/acme/race/commits/"):
+            return httpx.Response(200, json={"sha": "sha_old"})
+        if path.startswith("/repos/acme/race/contents/.codesight."):
+            return httpx.Response(404)
+        if path.startswith("/repos/acme/race/git/trees/"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "sha_old",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "src/a.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "blob_old",
+                            "size": len(old_src),
+                        }
+                    ],
+                },
+            )
+        if "/compare/" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ahead",
+                    "total_commits": 1,
+                    "files": [{"filename": "src/a.py", "status": "modified", "sha": "blob_old"}],
+                },
+            )
+        if path.endswith("/git/blobs/blob_old"):
+            if steal_on_blob_fetch:
+                # Simulate Push B stealing the expired lock and writing newer Qdrant state
+                redis_client.store["repo_index_lock:acme/race"] = "token-push-b"
+                store.points[new_point_id] = {
+                    "repo_id": "r-race",
+                    "repo_full_name": "acme/race",
+                    "file_path": "src/a.py",
+                    "blob_sha": "blob_new",
+                    "symbol_name": "fresh_fn",
+                }
+            return httpx.Response(
+                200, json={"sha": "blob_old", "encoding": "base64", "content": _b64(old_src)}
+            )
+        return httpx.Response(404)
+
+    cursor_writes: list[str | None] = []
+
+    async def _fake_upsert_state(*_args: Any, **kwargs: Any) -> tuple[str, bool]:
+        cursor_writes.append(kwargs.get("last_indexed_sha"))
+        return "r-race", True
+
+    async def _fake_read_state(*_args: Any, **_kwargs: Any) -> Any:
+        return indexer_mod._RepositorySyncState(
+            repo_id="r-race",
+            last_indexed_sha="sha_base",
+            default_branch="main",
+            installation_id=None,
+            is_stale_conflict=False,
+        )
+
+    monkeypatch.setattr(indexer_mod, "upsert_repository_state", _fake_upsert_state)
+    monkeypatch.setattr(indexer_mod, "_read_repository_sync_state", _fake_read_state)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            session_factory=object(),  # type: ignore[arg-type]
+            repo_lock=lock,
+        )
+        syncer = IncrementalBranchSyncer(
+            initial_indexer=indexer,
+            repo_client=indexer.repo_client,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            session_factory=object(),  # type: ignore[arg-type]
+            lock=lock,
+        )
+
+        # 1. Fast-path incremental_compare loses lock during blob fetch -> 0 writes/deletes!
+        with pytest.raises(RetryableTaskError, match="lock"):
+            await syncer.sync_push(
+                repo_full_name="acme/race",
+                after_sha="sha_old",
+                last_indexed_sha="sha_base",
+                repo_id="r-race",
+            )
+        assert set(store.points.keys()) == {new_point_id}
+        assert store.points[new_point_id]["symbol_name"] == "fresh_fn"
+        assert store.delete_by_file_calls == []
+        assert cursor_writes == []
+        assert redis_client.store.get("repo_index_lock:acme/race") == "token-push-b"
+
+        # 2. Fallback bootstrap_full_index (_skip_repo_lock=True) ALSO fences via parent lease!
+        redis_client.store.clear()
+        store.points.clear()
+        with pytest.raises(RetryableTaskError, match="lock"):
+            await syncer.sync_push(
+                repo_full_name="acme/race",
+                after_sha="sha_old",
+                last_indexed_sha=None,
+                repo_id="r-race",
+            )
+        assert set(store.points.keys()) == {new_point_id}
+        assert store.delete_by_ids_calls == []
+        assert [w for w in cursor_writes if w is not None] == []
+
+        # 3. Redis connection drop right before Qdrant write fails closed
+        redis_client.store.clear()
+        store.points.clear()
+        steal_on_blob_fetch = False
+        fail_redis_on_verify = True
+        with pytest.raises(RetryableTaskError):
+            await syncer.sync_push(
+                repo_full_name="acme/race",
+                after_sha="sha_old",
+                last_indexed_sha="sha_base",
+                repo_id="r-race",
+            )
+        assert store.points == {}
+        assert store.delete_by_file_calls == []
+        assert [w for w in cursor_writes if w is not None] == []
+
+        # 4. Lease expiry after repeated Redis renewal errors marks lease lost
+        short_lock = AsyncRepoIndexLock(
+            redis_client,  # type: ignore[arg-type]
+            ttl_seconds=1,
+            acquire_timeout_seconds=0.05,
+            poll_interval_seconds=0.01,
+        )
+        redis_client.store.clear()
+        async with short_lock.hold("acme/expire") as lease:
+            await asyncio.sleep(1.15)
+            assert lease.is_lost is True
+            with pytest.raises(RetryableTaskError):
+                await lease.ensure_held()
+    del new_src
+
+
+async def test_s2_06_fetch_git_tree_walks_subtrees_when_recursive_truncated_and_guards_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.rag import indexer as indexer_mod
+
+    blobs: dict[str, bytes] = {
+        "b_readme": b"# Mono Architecture\n## Services\nZero-Code RAG monorepo.\n",
+        "b_py": b"def handle_order(order_id: str) -> str:\n    return order_id.strip()\n",
+        "b_tsx": b"export function OrderCard(id: string): string { return id; }\n",
+    }
+    non_recursive_truncated = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        is_recursive = request.url.params.get("recursive") == "1"
+        if path == "/repos/acme/mono":
+            return httpx.Response(
+                200, json={"id": 303, "full_name": "acme/mono", "default_branch": "main"}
+            )
+        if path.startswith("/repos/acme/mono/commits/"):
+            return httpx.Response(200, json={"sha": "sha_mono_head"})
+        if path.startswith("/repos/acme/mono/contents/.codesight."):
+            return httpx.Response(404)
+        if path == "/repos/acme/mono/git/trees/sha_mono_head":
+            if is_recursive:
+                # Truncated recursive response omits packages/**
+                return httpx.Response(
+                    200,
+                    json={
+                        "sha": "sha_mono_head",
+                        "truncated": True,
+                        "tree": [
+                            {
+                                "path": "README.md",
+                                "mode": "100644",
+                                "type": "blob",
+                                "sha": "b_readme",
+                                "size": len(blobs["b_readme"]),
+                            }
+                        ],
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "sha_mono_head",
+                    "truncated": non_recursive_truncated,
+                    "tree": [
+                        {
+                            "path": "README.md",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "b_readme",
+                            "size": len(blobs["b_readme"]),
+                        },
+                        {
+                            "path": "vendor-submod",
+                            "mode": "160000",
+                            "type": "commit",
+                            "sha": "submod_sha",
+                        },
+                        {
+                            "path": "packages",
+                            "mode": "040000",
+                            "type": "tree",
+                            "sha": "tree_packages",
+                        },
+                    ],
+                },
+            )
+        if path == "/repos/acme/mono/git/trees/tree_packages":
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "tree_packages",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "api",
+                            "mode": "040000",
+                            "type": "tree",
+                            "sha": "tree_api",
+                        },
+                        {
+                            "path": "web",
+                            "mode": "040000",
+                            "type": "tree",
+                            "sha": "tree_web",
+                        },
+                    ],
+                },
+            )
+        if path == "/repos/acme/mono/git/trees/tree_api":
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "tree_api",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "handler.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "b_py",
+                            "size": len(blobs["b_py"]),
+                        }
+                    ],
+                },
+            )
+        if path == "/repos/acme/mono/git/trees/tree_web":
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "tree_web",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "OrderCard.tsx",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "b_tsx",
+                            "size": len(blobs["b_tsx"]),
+                        }
+                    ],
+                },
+            )
+        if path.startswith("/repos/acme/mono/git/blobs/"):
+            sha = path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200, json={"sha": sha, "encoding": "base64", "content": _b64(blobs[sha])}
+            )
+        return httpx.Response(404)
+
+    db_cursor_sha: str | None = "prev_good_sha"
+
+    async def _fake_upsert_state(*_args: Any, **kwargs: Any) -> tuple[str, bool]:
+        nonlocal db_cursor_sha
+        new_sha = kwargs.get("last_indexed_sha")
+        if new_sha is not None:
+            db_cursor_sha = new_sha
+            return "r-mono", True
+        return "r-mono", False
+
+    async def _fake_read_state(*_args: Any, **_kwargs: Any) -> Any:
+        return indexer_mod._RepositorySyncState(
+            repo_id="r-mono",
+            last_indexed_sha=db_cursor_sha,
+            default_branch="main",
+            installation_id=None,
+            is_stale_conflict=False,
+        )
+
+    monkeypatch.setattr(indexer_mod, "upsert_repository_state", _fake_upsert_state)
+    monkeypatch.setattr(indexer_mod, "_read_repository_sync_state", _fake_read_state)
+
+    fake_genai = _FakeGenAIClient()
+    store = _InMemoryZeroCodeStore()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        embedder = GeminiEmbedder(client=fake_genai)  # type: ignore[arg-type]
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+
+        # Case A: Subtree walk resolves truncated recursive tree completely -> saves SHA cursor
+        full_rep = await indexer.index_repository("acme/mono", repo_id="r-mono")
+        assert full_rep.truncated_tree is False
+        assert full_rep.persisted_cursor is True
+        assert db_cursor_sha == "sha_mono_head"
+        assert {p["file_path"] for p in store.points.values()} == {
+            "README.md",
+            "packages/api/handler.py",
+            "packages/web/OrderCard.tsx",
+        }
+
+        # Case B: Even non-recursive tree stays truncated -> cursor MUST NOT advance!
+        db_cursor_sha = "prev_good_sha"
+        non_recursive_truncated = True
+        store.points.clear()
+        trunc_rep = await indexer.index_repository("acme/mono", repo_id="r-mono")
+        assert trunc_rep.truncated_tree is True
+        assert trunc_rep.persisted_cursor is False
+        assert db_cursor_sha == "prev_good_sha"
+
+
+def test_s2_06_cli_index_exits_1_and_reports_truncated_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.rag.indexer import InitialIndexReport
+
+    async def _truncated_cli_run(*_args: Any, **_kwargs: Any) -> InitialIndexReport:
+        return InitialIndexReport(
+            repo_full_name="acme/mono",
+            repo_id="r-mono",
+            default_branch="main",
+            indexed_branch="main",
+            commit_sha="sha_mono_head_123456",
+            tree_entries=1,
+            eligible_files=1,
+            unchanged_files_skipped=0,
+            fetched_files=1,
+            skipped_files=0,
+            code_chunks=0,
+            doc_chunks=1,
+            embedded_points=1,
+            upserted_points=1,
+            stale_points_deleted=0,
+            persisted_cursor=False,
+            truncated_tree=True,
+            elapsed_ms=12.0,
+        )
+
+    monkeypatch.setattr("codesight.cli.commands.index.get_settings", lambda: _make_settings())
+    monkeypatch.setattr("codesight.cli.commands.index.run_cli_index", _truncated_cli_run)
+    cli_res = CliRunner().invoke(cli_app, ["index", "acme/mono"])
+    assert cli_res.exit_code == 1
+    assert "truncated" in (cli_res.stdout + cli_res.stderr).lower()

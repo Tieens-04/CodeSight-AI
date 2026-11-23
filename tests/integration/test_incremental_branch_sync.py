@@ -514,3 +514,203 @@ async def test_f03_upsert_repository_state_recreated_and_renamed_live_postgres(
             assert by_gh[300].last_indexed_sha == "sha_300_concurrent_newer"
     finally:
         await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_s2_01_live_redis_lua_lock_loss_blocks_stale_qdrant_delete_and_cursor_write(
+    isolated_postgres_dsn: str,
+    isolated_qdrant_collection: str,
+) -> None:
+    from codesight.core.errors import RetryableTaskError
+    from codesight.rag.indexer import (
+        AsyncRepoIndexLock,
+        IncrementalBranchSyncer,
+        InitialRepoIndexer,
+    )
+    from codesight.vcs.github_auth import GitHubAuthProvider
+
+    repo_slug = "codesight-eval/live-lock-race"
+    sha_v1 = "1" * 40
+    sha_v2_stale = "2" * 40
+    sha_v3_fresh = "3" * 40
+
+    src_v1 = b"def svc_v1() -> int:\n    return 1\n"
+    src_v2 = b"def svc_v2_stale() -> int:\n    return 2\n"
+    src_v3 = b"def svc_v3_fresh() -> int:\n    return 3\n"
+    blobs = {
+        _sha1_blob(src_v1): src_v1,
+        _sha1_blob(src_v2): src_v2,
+        _sha1_blob(src_v3): src_v3,
+    }
+    sha_blob_v1 = _sha1_blob(src_v1)
+    sha_blob_v2 = _sha1_blob(src_v2)
+    sha_blob_v3 = _sha1_blob(src_v3)
+
+    engine = create_async_engine(isolated_postgres_dsn, echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
+        engine, expire_on_commit=False, autoflush=False
+    )
+
+    settings = Settings(
+        _env_file=None,
+        qdrant_collection_name=isolated_qdrant_collection,
+        github_token=SecretStr("ghp_live_lock_race"),
+        gemini_api_key=SecretStr("gem_live_lock_race"),
+    )
+    redis_client = redis_async.from_url(settings.redis_url, decode_responses=True)
+    steal_during_v2 = False
+
+    try:
+        async with (
+            QdrantZeroCodeStore(
+                settings=settings,
+                collection_name=isolated_qdrant_collection,
+            ) as store,
+        ):
+
+            async def _handler(request: httpx.Request) -> httpx.Response:
+                path = request.url.path
+                if path == f"/repos/{repo_slug}":
+                    return httpx.Response(
+                        200,
+                        json={"id": 8801, "full_name": repo_slug, "default_branch": "main"},
+                    )
+                if path.startswith(f"/repos/{repo_slug}/commits/"):
+                    ref = path.rsplit("/", 1)[-1]
+                    return httpx.Response(200, json={"sha": sha_v1 if ref == "main" else ref})
+                if path.startswith(f"/repos/{repo_slug}/contents/.codesight."):
+                    return httpx.Response(404)
+                if path.startswith(f"/repos/{repo_slug}/git/trees/"):
+                    return httpx.Response(
+                        200,
+                        json={
+                            "sha": sha_v1,
+                            "truncated": False,
+                            "tree": [
+                                {
+                                    "path": "src/svc.py",
+                                    "mode": "100644",
+                                    "type": "blob",
+                                    "sha": sha_blob_v1,
+                                    "size": len(src_v1),
+                                }
+                            ],
+                        },
+                    )
+                if path == f"/repos/{repo_slug}/compare/{sha_v1}...{sha_v2_stale}":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "ahead",
+                            "total_commits": 1,
+                            "files": [
+                                {
+                                    "filename": "src/svc.py",
+                                    "status": "modified",
+                                    "sha": sha_blob_v2,
+                                }
+                            ],
+                        },
+                    )
+                if path == f"/repos/{repo_slug}/compare/{sha_v1}...{sha_v3_fresh}":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "ahead",
+                            "total_commits": 2,
+                            "files": [
+                                {
+                                    "filename": "src/svc.py",
+                                    "status": "modified",
+                                    "sha": sha_blob_v3,
+                                }
+                            ],
+                        },
+                    )
+                if path.startswith(f"/repos/{repo_slug}/git/blobs/"):
+                    blob_sha = path.rsplit("/", 1)[-1]
+                    if steal_during_v2 and blob_sha == sha_blob_v2:
+                        # Simulate lock expiry + Push v3 acquiring real Redis lock & finishing first
+                        await redis_client.delete(
+                            AsyncRepoIndexLock.lock_key(repo_slug.lower()),
+                            AsyncRepoIndexLock.lock_key(repo_id_str),
+                        )
+                        v3_syncer = IncrementalBranchSyncer(
+                            initial_indexer=indexer,
+                            repo_client=indexer.repo_client,
+                            embedder=None,
+                            store=store,
+                            session_factory=session_factory,
+                            lock=AsyncRepoIndexLock(redis_client),
+                        )
+                        await v3_syncer.sync_push(
+                            repo_full_name=repo_slug,
+                            after_sha=sha_v3_fresh,
+                            repo_id=repo_id_str,
+                            github_repo_id=8801,
+                        )
+                    return httpx.Response(
+                        200,
+                        json={
+                            "sha": blob_sha,
+                            "encoding": "base64",
+                            "content": _b64(blobs[blob_sha]),
+                        },
+                    )
+                return httpx.Response(404)
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as http:
+                auth = GitHubAuthProvider(settings, http_client=http)
+                lock = AsyncRepoIndexLock(redis_client)
+                indexer = InitialRepoIndexer(
+                    auth_provider=auth,
+                    embedder=None,
+                    store=store,
+                    http_client=http,
+                    session_factory=session_factory,
+                    repo_lock=lock,
+                )
+                init_rep = await indexer.index_repository(repo_slug)
+                repo_id_str = init_rep.repo_id or ""
+                assert repo_id_str
+
+                syncer = IncrementalBranchSyncer(
+                    initial_indexer=indexer,
+                    repo_client=indexer.repo_client,
+                    embedder=None,
+                    store=store,
+                    session_factory=session_factory,
+                    lock=lock,
+                )
+                steal_during_v2 = True
+                with pytest.raises(RetryableTaskError, match="lock"):
+                    await syncer.sync_push(
+                        repo_full_name=repo_slug,
+                        after_sha=sha_v2_stale,
+                        repo_id=repo_id_str,
+                        github_repo_id=8801,
+                    )
+
+                # Qdrant MUST retain Push v3's fresh_fn (never deleted by Push v2!)
+                v3_hits = await store.find_by_symbol_names(
+                    ["svc_v3_fresh"], repo_full_name=repo_slug
+                )
+                v2_hits = await store.find_by_symbol_names(
+                    ["svc_v2_stale"], repo_full_name=repo_slug
+                )
+                assert len(v3_hits) == 1
+                assert v2_hits == ()
+
+                async with session_factory() as session:
+                    row = (
+                        await session.execute(
+                            sa.select(Repository).where(Repository.full_name == repo_slug)
+                        )
+                    ).scalar_one()
+                    assert row.last_indexed_sha == sha_v3_fresh
+    finally:
+        await redis_client.aclose()
+        await engine.dispose()
