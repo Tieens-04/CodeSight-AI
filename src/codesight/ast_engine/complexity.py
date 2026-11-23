@@ -976,14 +976,15 @@ def detect_missing_test_companion(
         if not norm_path:
             continue
 
+        if Path(
+            norm_path
+        ).suffix.lower() not in _CODE_SOURCE_EXTENSIONS or is_ambient_declaration_path(norm_path):
+            continue
+
         if _matches_any(norm_path, test_matchers):
             added_test_logic += _count_added_logic_lines(parsed_file, norm_path)
             test_files.append(norm_path)
-        elif (
-            Path(norm_path).suffix.lower() in _CODE_SOURCE_EXTENSIONS
-            and not is_ambient_declaration_path(norm_path)
-            and _matches_any(norm_path, source_matchers)
-        ):
+        elif _matches_any(norm_path, source_matchers):
             added_source_logic += _count_added_logic_lines(parsed_file, norm_path)
             source_files.append(norm_path)
 
