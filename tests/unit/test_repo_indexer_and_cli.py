@@ -3817,3 +3817,128 @@ def test_s2_06_cli_index_exits_1_and_reports_truncated_tree(
     cli_res = CliRunner().invoke(cli_app, ["index", "acme/mono"])
     assert cli_res.exit_code == 1
     assert "truncated" in (cli_res.stdout + cli_res.stderr).lower()
+
+
+async def test_s2_06_subtree_walk_cancels_siblings_on_429_and_recreate_guards_truncated_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Important #1 & Minor #5: Cancel sibling subtree tasks on 429; fetch tree before recreate."""
+    import asyncio
+
+    from codesight.core.errors import RateLimitTaskError
+
+    in_flight = 0
+    cancelled_siblings = 0
+    queued_requests_started = 0
+    tree_mode = "429_on_first_sub"
+
+    async def _gh_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, cancelled_siblings, queued_requests_started
+        path = request.url.path
+        if path == "/repos/acme/mono":
+            return httpx.Response(200, json={"id": 502, "default_branch": "main"})
+        if path == "/repos/acme/mono/commits/main":
+            return httpx.Response(200, json={"sha": "sha_mono_head"})
+        if path == "/repos/acme/mono/contents/.codesight.yaml":
+            return httpx.Response(404, json={"message": "Not Found"})
+        if path == "/repos/acme/mono/git/trees/sha_mono_head":
+            if request.url.params.get("recursive") == "1":
+                return httpx.Response(
+                    200, json={"sha": "sha_mono_head", "truncated": True, "tree": []}
+                )
+            if tree_mode == "always_truncated":
+                return httpx.Response(
+                    200, json={"sha": "sha_mono_head", "truncated": True, "tree": []}
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "sha_mono_head",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": f"dir_{idx:02d}",
+                            "mode": "040000",
+                            "type": "tree",
+                            "sha": f"sub_{idx:02d}",
+                        }
+                        for idx in range(24)
+                    ],
+                },
+            )
+        if path.startswith("/repos/acme/mono/git/trees/sub_"):
+            idx = int(path.rsplit("_", 1)[-1])
+            if idx == 0:
+                await asyncio.sleep(0.01)
+                return httpx.Response(
+                    429,
+                    headers={"Retry-After": "5"},
+                    json={"message": "rate limit"},
+                )
+            if idx >= 16:
+                queued_requests_started += 1
+            in_flight += 1
+            try:
+                await asyncio.sleep(0.4)
+                return httpx.Response(
+                    200, json={"sha": f"sub_{idx:02d}", "truncated": False, "tree": []}
+                )
+            except asyncio.CancelledError:
+                cancelled_siblings += 1
+                raise
+            finally:
+                in_flight -= 1
+        return httpx.Response(404)
+
+    delete_by_repo_calls = 0
+
+    class _TrackingStore(_InMemoryZeroCodeStore):
+        async def delete_by_repo(self, **kwargs: Any) -> int:
+            nonlocal delete_by_repo_calls
+            delete_by_repo_calls += 1
+            return await super().delete_by_repo(**kwargs)
+
+    store = _TrackingStore()
+    store.points["existing-pt"] = {
+        "repo_full_name": "acme/mono",
+        "repo_id": "r-mono",
+        "file_path": "README.md",
+        "blob_sha": "sha_old",
+    }
+
+    async def _noop_upsert(_sf: Any, **kwargs: Any) -> tuple[str, bool]:
+        del kwargs
+        return "r-mono", True
+
+    monkeypatch.setattr("codesight.rag.indexer.upsert_repository_state", _noop_upsert)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(_gh_handler)) as http,
+        GeminiEmbedder(client=_FakeGenAIClient()) as embedder,  # type: ignore[arg-type]
+    ):
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+
+        # 1. Subtree #0 returns 429 -> all sibling tasks cancelled cleanly before unwind,
+        #    queued tasks #16..#23 never issue HTTP calls, and recreate=True did NOT delete Qdrant!
+        with pytest.raises(RateLimitTaskError):
+            await indexer.index_repository("acme/mono", repo_id="r-mono", recreate=True)
+        assert in_flight == 0
+        assert cancelled_siblings == 15
+        assert queued_requests_started == 0
+        assert delete_by_repo_calls == 0
+        assert "existing-pt" in store.points
+
+        # 2. Truncated tree with recreate=True -> MUST NOT wipe existing Qdrant points either!
+        tree_mode = "always_truncated"
+        trunc_rep = await indexer.index_repository("acme/mono", repo_id="r-mono", recreate=True)
+        assert trunc_rep.truncated_tree is True
+        assert trunc_rep.persisted_cursor is False
+        assert delete_by_repo_calls == 0
+        assert "existing-pt" in store.points

@@ -212,7 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ground_truth=ground_truth,
             )
         )
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 

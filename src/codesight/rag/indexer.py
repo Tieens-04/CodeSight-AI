@@ -501,28 +501,45 @@ class GitHubRepoIndexClient:
         enqueued_count = 1
         still_truncated = False
         sem = asyncio.Semaphore(DEFAULT_BLOB_CONCURRENCY)
+        aborted = False
 
         async def _fetch_dir(
             prefix: str,
             node_sha: str,
             depth: int,
         ) -> tuple[str, int, dict[str, Any]]:
+            nonlocal aborted
             async with sem:
-                encoded = quote(node_sha.strip(), safe="")
-                payload = await self._get_json(
-                    f"{self._base_url}/repos/{slug}/git/trees/{encoded}",
-                    slug=slug,
-                    context=f"git subtree '{node_sha}' for '{slug}'",
-                    installation_id=installation_id,
-                )
-                if payload is None:
-                    raise RepoIndexError(
-                        f"GitHub Git Trees response missing payload for '{slug}@{node_sha}'."
+                if aborted:
+                    raise asyncio.CancelledError()
+                try:
+                    encoded = quote(node_sha.strip(), safe="")
+                    payload = await self._get_json(
+                        f"{self._base_url}/repos/{slug}/git/trees/{encoded}",
+                        slug=slug,
+                        context=f"git subtree '{node_sha}' for '{slug}'",
+                        installation_id=installation_id,
                     )
-                return prefix, depth, payload
+                    if payload is None:
+                        raise RepoIndexError(
+                            f"GitHub Git Trees response missing payload for '{slug}@{node_sha}'."
+                        )
+                    return prefix, depth, payload
+                except BaseException:
+                    aborted = True
+                    raise
 
         while frontier:
-            dir_results = await asyncio.gather(*(_fetch_dir(p, s, d) for p, s, d in frontier))
+            tasks = [asyncio.create_task(_fetch_dir(p, s, d)) for p, s, d in frontier]
+            try:
+                dir_results = await asyncio.gather(*tasks)
+            except BaseException:
+                aborted = True
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
             next_frontier: list[tuple[str, str, int]] = []
             for prefix, depth, sub_data in dir_results:
                 if bool(sub_data.get("truncated")):
@@ -1635,10 +1652,23 @@ class InitialRepoIndexer:
         )
         file_filter = FileFilter.from_repo_config(repo_config)
 
+        tree = await self._repo_client.fetch_git_tree(
+            canonical_slug,
+            commit_sha,
+            installation_id=installation_id,
+        )
+        if tree.truncated:
+            logger.warning(
+                "repo_git_tree_truncated",
+                repo=canonical_slug,
+                commit_sha=commit_sha,
+                entries=len(tree.entries),
+            )
+
         await lock_lease.ensure_held()
         await self._store.ensure_collection()
         existing_refs: tuple[QdrantPointRef, ...]
-        if recreate and is_default_target:
+        if recreate and is_default_target and not tree.truncated:
             await lock_lease.ensure_held()
             await self._store.delete_by_repo(
                 repo_full_name=canonical_slug,
@@ -1651,19 +1681,6 @@ class InitialRepoIndexer:
                 repo_full_name=canonical_slug,
                 repo_id=effective_repo_id,
                 match_any_scope=True,
-            )
-
-        tree = await self._repo_client.fetch_git_tree(
-            canonical_slug,
-            commit_sha,
-            installation_id=installation_id,
-        )
-        if tree.truncated:
-            logger.warning(
-                "repo_git_tree_truncated",
-                repo=canonical_slug,
-                commit_sha=commit_sha,
-                entries=len(tree.entries),
             )
 
         refs_by_path: dict[str, list[QdrantPointRef]] = {}

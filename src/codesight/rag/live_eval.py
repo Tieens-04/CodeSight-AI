@@ -26,19 +26,27 @@ import redis.exceptions
 import structlog
 from qdrant_client import models
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from tree_sitter import Node, Parser
 
 from codesight import __version__
-from codesight.ast_engine.models import CodeSymbolChunk, PRFileContext, SymbolKind
+from codesight.ast_engine._ast_utils import is_ambient_declaration_path
+from codesight.ast_engine._typescript_ast import TSX_LANGUAGE, TYPESCRIPT_LANGUAGE
+from codesight.ast_engine.models import (
+    CodeSymbolChunk,
+    PRFileContext,
+    SymbolKind,
+    sanitize_signature,
+)
 from codesight.ast_engine.registry import ASTParserRegistry
 from codesight.core.config import Settings
 from codesight.db.models import Base
 from codesight.db.session import create_db_engine, create_session_factory
-from codesight.diff.file_filter import normalize_diff_path
+from codesight.diff.file_filter import FileFilter, normalize_diff_path
 from codesight.diff.models import ParsedFileDiff, ParsedPullRequestDiff
 from codesight.diff.smart_diff_parser import SmartDiffParser
 from codesight.rag.doc_chunker import is_architecture_doc_path
 from codesight.rag.embedder import GeminiEmbedder
-from codesight.rag.indexer import InitialIndexReport
+from codesight.rag.indexer import GitHubRepoIndexClient, InitialIndexReport, RepoIndexError
 from codesight.rag.models import (
     EmbeddingConfigError,
     QdrantStoredPoint,
@@ -281,12 +289,12 @@ class M2RepoEvalSummary:
     doc_threshold_used: float
     doc_max_raw_score: float | None
     doc_hits_above_threshold: int
-    caller_recall_at_5: float = 1.0
-    callee_recall_at_5: float = 1.0
-    doc_recall_at_5: float = 1.0
-    caller_cases_evaluated: int = 1
-    callee_cases_evaluated: int = 1
-    doc_cases_evaluated: int = 1
+    caller_recall_at_5: float = 0.0
+    callee_recall_at_5: float = 0.0
+    doc_recall_at_5: float = 0.0
+    caller_cases_evaluated: int = 0
+    callee_cases_evaluated: int = 0
+    doc_cases_evaluated: int = 0
     degraded_doc_cases: int = 0
     ground_truth_source: str = "independent_source_scan"
 
@@ -311,9 +319,9 @@ class M2LiveEvaluationReport:
     py_summary: M2RepoEvalSummary | None = None
     ts_summary: M2RepoEvalSummary | None = None
     cases: tuple[M2EvalCase, ...] = ()
-    caller_recall_at_5: float = 1.0
-    callee_recall_at_5: float = 1.0
-    doc_recall_at_5: float = 1.0
+    caller_recall_at_5: float = 0.0
+    callee_recall_at_5: float = 0.0
+    doc_recall_at_5: float = 0.0
     degraded_doc_cases: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -536,9 +544,15 @@ def validate_m2_kpi_thresholds(report: M2LiveEvaluationReport) -> list[str]:
             f"disk_violations={list(report.disk_violations)} (NFR-3 disk check failed)."
         )
 
-    for summary in (report.py_summary, report.ts_summary):
-        if summary is not None:
-            _validate_repo_summary_kpis(summary, violations)
+    if report.py_summary is None:
+        violations.append("py_summary is missing from evaluation report.")
+    else:
+        _validate_repo_summary_kpis(report.py_summary, violations)
+
+    if report.ts_summary is None:
+        violations.append("ts_summary is missing from evaluation report.")
+    else:
+        _validate_repo_summary_kpis(report.ts_summary, violations)
 
     if report.cases:
         degraded_cases = [
@@ -555,35 +569,15 @@ def validate_m2_kpi_thresholds(report: M2LiveEvaluationReport) -> list[str]:
                     "doc_recall_at_5 invalidated by degraded architecture doc search."
                 )
 
-        caller_scores = [
-            c.caller_recall_at_5 if c.caller_recall_at_5 is not None else c.recall_at_5
-            for c in report.cases
-            if c.expected_callers
-        ]
-        if caller_scores:
-            mean_c = sum(caller_scores) / len(caller_scores)
-            if mean_c < M2_MIN_RECALL_AT_5 and all(
-                "caller_recall_at_5" not in v for v in violations
-            ):
-                violations.append(
-                    f"cases caller_recall_at_5 {mean_c:.4f} < {M2_MIN_RECALL_AT_5:.2f}"
-                )
-
         callee_scores = [c.callee_recall_at_5 for c in report.cases if c.expected_callees]
-        if callee_scores:
-            mean_e = sum(callee_scores) / len(callee_scores)
-            if mean_e < M2_MIN_RECALL_AT_5 and all(
-                "callee_recall_at_5" not in v for v in violations
-            ):
-                violations.append(
-                    f"cases callee_recall_at_5 {mean_e:.4f} < {M2_MIN_RECALL_AT_5:.2f}"
-                )
+        if callee_scores and sum(callee_scores) / len(callee_scores) < M2_MIN_RECALL_AT_5:
+            if all("callee_recall_at_5" not in v for v in violations):
+                violations.append("cases callee_recall_at_5 below threshold.")
 
         doc_scores = [c.doc_recall_at_5 for c in report.cases if c.expected_docs]
-        if doc_scores:
-            mean_d = sum(doc_scores) / len(doc_scores)
-            if mean_d < M2_MIN_RECALL_AT_5 and all("doc_recall_at_5" not in v for v in violations):
-                violations.append(f"cases doc_recall_at_5 {mean_d:.4f} < {M2_MIN_RECALL_AT_5:.2f}")
+        if doc_scores and sum(doc_scores) / len(doc_scores) < M2_MIN_RECALL_AT_5:
+            if all("doc_recall_at_5" not in v for v in violations):
+                violations.append("cases doc_recall_at_5 below threshold.")
 
     return violations
 
@@ -1137,6 +1131,22 @@ def _scan_ts_source_independent(
     return definitions
 
 
+_DOC_PART_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(r"\s+\(part\s+\d+\)$", re.IGNORECASE)
+
+
+def _normalize_doc_target(entry: str) -> str:
+    """Normalize `(part N)` suffixes and trailing `:` on Markdown heading breadcrumbs."""
+    if "::" not in entry:
+        return entry.strip()
+    raw_file, raw_sym = entry.split("::", 1)
+    norm_file = normalize_diff_path(raw_file).rstrip("/")
+    stripped_part = _DOC_PART_SUFFIX_RE.sub("", raw_sym.strip())
+    clean_breadcrumb = " > ".join(
+        seg.strip().rstrip(": ").strip() for seg in stripped_part.split(" > ") if seg.strip()
+    )
+    return f"{norm_file}::{clean_breadcrumb or stripped_part}"
+
+
 def _scan_markdown_sections_independent(
     markdown_text: str,
     *,
@@ -1146,6 +1156,8 @@ def _scan_markdown_sections_independent(
     lines = markdown_text.splitlines()
     sections: list[tuple[str, list[str]]] = []
     heading_stack: dict[int, str] = {}
+    basename = Path(file_path).name or file_path
+    overview_title = sanitize_signature(f"Document Overview ({basename})")
     current_title = ""
     current_lines: list[str] = []
     in_fence = False
@@ -1158,23 +1170,21 @@ def _scan_markdown_sections_independent(
         if not in_fence:
             h_match = _MD_HEADING_RE.match(raw_line)
             if h_match is not None:
-                if current_title and any(ln.strip() for ln in current_lines):
-                    sections.append((current_title, list(current_lines)))
+                if any(ln.strip() for ln in current_lines):
+                    sections.append((current_title or overview_title, list(current_lines)))
                 level = len(h_match.group(1))
-                title = h_match.group(2).strip()
+                title = h_match.group(2).strip().rstrip(": ").strip() or "Section"
                 for k in [lvl for lvl in heading_stack if lvl >= level]:
                     del heading_stack[k]
                 heading_stack[level] = title
-                current_title = " > ".join(heading_stack[lvl] for lvl in sorted(heading_stack))
+                raw_crumb = " > ".join(heading_stack[lvl] for lvl in sorted(heading_stack))
+                current_title = sanitize_signature(raw_crumb)
                 current_lines = [raw_line]
                 continue
         current_lines.append(raw_line)
 
-    if current_title and any(ln.strip() for ln in current_lines):
-        sections.append((current_title, list(current_lines)))
-    elif not sections and any(ln.strip() for ln in lines):
-        stem = Path(file_path).stem or file_path
-        sections.append((stem, lines))
+    if any(ln.strip() for ln in current_lines):
+        sections.append((current_title or overview_title, list(current_lines)))
 
     return [
         (_canonical_target(file_path, sec_title), "\n".join(sec_lines))
@@ -1358,19 +1368,31 @@ def build_independent_repo_ground_truth(
     )
 
 
-def _resolve_probe_chunk_and_ast(
+def _resolve_probe_chunks_and_ast(
     *,
     file_path: str,
     symbol_name: str,
     language_hint: str,
     source_text: str,
     registry: ASTParserRegistry,
-) -> tuple[Any, CodeSymbolChunk]:
+) -> tuple[Any, tuple[CodeSymbolChunk, ...]]:
     parsed_ast = registry.parse_file(source_text, file_path=file_path)
     if parsed_ast is not None and parsed_ast.chunks:
+        matched: list[CodeSymbolChunk] = []
         for chunk in parsed_ast.chunks:
-            if chunk.symbol_name == symbol_name:
-                return parsed_ast, chunk
+            if not matched:
+                if chunk.symbol_name == symbol_name:
+                    matched.append(chunk)
+            elif (
+                chunk.is_subchunk
+                and chunk.symbol_name == symbol_name
+                and chunk.qualified_name == matched[0].qualified_name
+            ):
+                matched.append(chunk)
+            else:
+                break
+        if matched:
+            return parsed_ast, tuple(matched)
 
     ast_lang = (
         parsed_ast.language if parsed_ast is not None else registry.resolve_language(file_path)
@@ -1394,7 +1416,25 @@ def _resolve_probe_chunk_and_ast(
         cyclomatic_complexity=1,
         is_async=False,
     )
-    return parsed_ast, fallback_chunk
+    return parsed_ast, (fallback_chunk,)
+
+
+def _resolve_probe_chunk_and_ast(
+    *,
+    file_path: str,
+    symbol_name: str,
+    language_hint: str,
+    source_text: str,
+    registry: ASTParserRegistry,
+) -> tuple[Any, CodeSymbolChunk]:
+    parsed_ast, chunks = _resolve_probe_chunks_and_ast(
+        file_path=file_path,
+        symbol_name=symbol_name,
+        language_hint=language_hint,
+        source_text=source_text,
+        registry=registry,
+    )
+    return parsed_ast, chunks[0]
 
 
 def _build_probe_diff(
@@ -1446,6 +1486,46 @@ def _build_probe_diff(
     return replace(parsed, files=(synthetic_file,), annotated_diff=diff_text)
 
 
+def _resolve_ts_body_start_line(
+    source_text: str,
+    *,
+    is_tsx: bool,
+    start_line: int,
+    end_line: int,
+    lines: Sequence[str],
+) -> int | None:
+    parser = Parser(TSX_LANGUAGE if is_tsx else TYPESCRIPT_LANGUAGE)
+    tree = parser.parse(source_text.encode("utf-8", errors="replace"))
+    best_span: tuple[int, int] | None = None
+    best_line: int | None = None
+    stack: list[Node] = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        n_start = node.start_point[0] + 1
+        n_end = node.end_point[0] + 1
+        if n_end < start_line or n_start > end_line:
+            continue
+        body_node = node.child_by_field_name("body")
+        if body_node is not None and n_start <= start_line <= n_end:
+            b_start = body_node.start_point[0] + 1
+            b_end = body_node.end_point[0] + 1
+            if body_node.type in {"statement_block", "class_body"}:
+                cand = b_start + 1 if b_start < b_end else end_line + 1
+            else:
+                prefix = (
+                    lines[b_start - 1][: body_node.start_point[1]]
+                    if 1 <= b_start <= len(lines)
+                    else ""
+                )
+                cand = b_start if not prefix.strip() else b_start + 1
+            span = (abs(n_start - start_line), n_end - n_start)
+            if best_span is None or span < best_span:
+                best_span = span
+                best_line = cand
+        stack.extend(reversed(node.children))
+    return best_line
+
+
 def _resolve_body_start_line(
     source_text: str,
     *,
@@ -1454,57 +1534,59 @@ def _resolve_body_start_line(
     end_line: int,
 ) -> int:
     """Locate the first interior body line strictly past a function/method signature header."""
+    lines = source_text.splitlines()
     if language == "python":
         try:
             tree = ast.parse(source_text)
+            best_span: tuple[int, int] | None = None
             best_body_line: int | None = None
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    decl_start = min(
+                        (d.lineno for d in node.decorator_list),
+                        default=node.lineno,
+                    )
                     node_end = node.end_lineno or node.lineno
-                    if node.lineno == start_line and node.body:
-                        return node.body[0].lineno
-                    if node.lineno <= start_line <= node_end and node.body:
-                        cand_ln = node.body[0].lineno
-                        if cand_ln > start_line and (
-                            best_body_line is None or cand_ln < best_body_line
-                        ):
+                    if decl_start <= start_line <= node_end and node.body:
+                        first_stmt = node.body[0]
+                        cand_ln = first_stmt.lineno
+                        if 1 <= cand_ln <= len(lines):
+                            prefix = lines[cand_ln - 1][: first_stmt.col_offset]
+                            if prefix.strip():
+                                cand_ln = cand_ln + 1
+                        span = (abs(decl_start - start_line), node_end - decl_start)
+                        if best_span is None or span < best_span:
+                            best_span = span
                             best_body_line = cand_ln
             if best_body_line is not None:
                 return best_body_line
         except SyntaxError:
             pass
 
-        lines = source_text.splitlines()
         depth = 0
         for ln_no in range(max(1, start_line), min(len(lines), end_line) + 1):
-            raw = lines[ln_no - 1]
-            for ch in raw:
+            code_part = lines[ln_no - 1].split("#", 1)[0]
+            if depth == 0 and code_part.lstrip().startswith("@"):
+                continue
+            for ch in code_part:
                 if ch in "([{":
                     depth += 1
                 elif ch in ")]}":
                     depth = max(0, depth - 1)
                 elif ch == ":" and depth == 0:
-                    return min(end_line, ln_no + 1)
-        return min(end_line, start_line + 1)
+                    return ln_no + 1
+        return end_line + 1
 
-    masked = _mask_ts_comments_and_strings(source_text)
-    masked_lines = masked.splitlines()
-    paren_depth = 0
-    saw_open_paren = False
-    for ln_no in range(max(1, start_line), min(len(masked_lines), end_line) + 1):
-        line_txt = masked_lines[ln_no - 1]
-        for idx, ch in enumerate(line_txt):
-            if ch == "(":
-                paren_depth += 1
-                saw_open_paren = True
-            elif ch == ")":
-                paren_depth = max(0, paren_depth - 1)
-            elif paren_depth == 0 and saw_open_paren:
-                if ch == "{":
-                    return min(end_line, ln_no + 1)
-                if ch == "=" and idx + 1 < len(line_txt) and line_txt[idx + 1] == ">":
-                    return min(end_line, ln_no + 1)
-    return min(end_line, start_line + 1)
+    ts_body_line = _resolve_ts_body_start_line(
+        source_text,
+        is_tsx=(language == "tsx"),
+        start_line=start_line,
+        end_line=end_line,
+        lines=lines,
+    )
+    if ts_body_line is not None:
+        return ts_body_line
+    return end_line + 1
 
 
 def _extract_body_canaries(
@@ -1622,6 +1704,37 @@ async def _fetch_repo_blobs_for_ground_truth(
     return fetched
 
 
+async def _discover_eligible_tree_shas(
+    *,
+    repo_client: GitHubRepoIndexClient | None,
+    repo_full_name: str,
+    commit_sha: str,
+) -> dict[str, str]:
+    if repo_client is None or not commit_sha.strip():
+        return {}
+    try:
+        tree = await repo_client.fetch_git_tree(repo_full_name, commit_sha)
+    except (RepoIndexError, GitHubAuthError):
+        return {}
+    file_filter = FileFilter()
+    discovered: dict[str, str] = {}
+    for entry in tree.entries:
+        norm = normalize_diff_path(entry.path).rstrip("/")
+        if not norm or not entry.blob_sha:
+            continue
+        if is_architecture_doc_path(norm):
+            discovered[norm] = entry.blob_sha
+            continue
+        suffix = Path(norm).suffix.lower()
+        if (
+            suffix in {".py", ".ts", ".tsx"}
+            and not is_ambient_declaration_path(norm)
+            and not file_filter.evaluate(norm).should_skip
+        ):
+            discovered[norm] = entry.blob_sha
+    return discovered
+
+
 async def _evaluate_single_repo(
     *,
     repo_full_name: str,
@@ -1640,6 +1753,7 @@ async def _evaluate_single_repo(
     doc_score_threshold: float,
     scrolled_points_collector: list[QdrantStoredPoint],
     body_canary_collector: list[str],
+    repo_client: GitHubRepoIndexClient | None = None,
 ) -> tuple[M2RepoEvalSummary, list[M2EvalCase]]:
     loader = points_loader if points_loader is not None else _default_load_repo_points
     repo_points = await loader(store, repo_full_name)
@@ -1659,24 +1773,19 @@ async def _evaluate_single_repo(
         if fpath and bsha and fpath not in file_blob_shas:
             file_blob_shas[fpath] = bsha
 
-    if curated_ground_truth is None and code_count == 0:
-        raise ValueError(
-            f"Repository '{repo_full_name}' has no indexed symbols with cross-file callers."
-        )
-
-    fetched_files = await _fetch_repo_blobs_for_ground_truth(
-        repo_full_name=repo_full_name,
-        file_blob_shas=file_blob_shas,
-        blob_fetcher=blob_fetcher,
-    )
-    if not fetched_files:
-        raise ValueError(
-            f"Repository '{repo_full_name}' yielded 0 fetchable cross-file probe blobs."
-        )
-
     if curated_ground_truth is not None:
         gt_source = "curated"
         selected_probes = list(curated_ground_truth.probes[:max_probes])
+        probe_blob_shas = {
+            p.file_path: file_blob_shas[p.file_path]
+            for p in selected_probes
+            if p.file_path in file_blob_shas
+        }
+        fetched_files = await _fetch_repo_blobs_for_ground_truth(
+            repo_full_name=repo_full_name,
+            file_blob_shas=probe_blob_shas,
+            blob_fetcher=blob_fetcher,
+        )
         for gt_probe in selected_probes:
             if gt_probe.file_path not in fetched_files:
                 raise ValueError(
@@ -1685,6 +1794,26 @@ async def _evaluate_single_repo(
                 )
     else:
         gt_source = "independent_source_scan"
+        tree_shas = await _discover_eligible_tree_shas(
+            repo_client=repo_client,
+            repo_full_name=repo_full_name,
+            commit_sha=index_report.commit_sha,
+        )
+        for fpath, bsha in tree_shas.items():
+            file_blob_shas.setdefault(fpath, bsha)
+        if code_count == 0 and not tree_shas:
+            raise ValueError(
+                f"Repository '{repo_full_name}' has no indexed symbols with cross-file callers."
+            )
+        fetched_files = await _fetch_repo_blobs_for_ground_truth(
+            repo_full_name=repo_full_name,
+            file_blob_shas=file_blob_shas,
+            blob_fetcher=blob_fetcher,
+        )
+        if not fetched_files:
+            raise ValueError(
+                f"Repository '{repo_full_name}' yielded 0 fetchable cross-file probe blobs."
+            )
         derived_gt = build_independent_repo_ground_truth(
             fetched_files,
             repo_full_name=repo_full_name,
@@ -1694,36 +1823,43 @@ async def _evaluate_single_repo(
         selected_probes = list(derived_gt.probes[:max_probes])
 
     prepared_probes: list[
-        tuple[M2ProbeGroundTruth, str, PRFileContext, ParsedPullRequestDiff, CodeSymbolChunk]
+        tuple[
+            M2ProbeGroundTruth,
+            str,
+            PRFileContext,
+            ParsedPullRequestDiff,
+            tuple[CodeSymbolChunk, ...],
+        ]
     ] = []
     for gt_probe in selected_probes:
         source_text = fetched_files.get(gt_probe.file_path)
         if not source_text:
             continue
         blob_sha = file_blob_shas.get(gt_probe.file_path, "")
-        parsed_ast, target_chunk = _resolve_probe_chunk_and_ast(
+        parsed_ast, target_chunks = _resolve_probe_chunks_and_ast(
             file_path=gt_probe.file_path,
             symbol_name=gt_probe.symbol_name,
             language_hint=language_label,
             source_text=source_text,
             registry=registry,
         )
+        lead_chunk = target_chunks[0]
         parsed_diff = _build_probe_diff(
             file_path=gt_probe.file_path,
             blob_sha=blob_sha,
             language=language_label,
             source_text=source_text,
-            target_line=target_chunk.start_line,
+            target_line=lead_chunk.start_line,
             diff_parser=diff_parser,
         )
         file_ctx = PRFileContext(
             file_path=gt_probe.file_path,
             mode="ast",
-            language=target_chunk.language,
+            language=lead_chunk.language,
             parsed_file=parsed_ast,
-            touched_chunks=(target_chunk,),
+            touched_chunks=target_chunks,
         )
-        prepared_probes.append((gt_probe, source_text, file_ctx, parsed_diff, target_chunk))
+        prepared_probes.append((gt_probe, source_text, file_ctx, parsed_diff, target_chunks))
 
     if not prepared_probes:
         raise ValueError(
@@ -1744,7 +1880,7 @@ async def _evaluate_single_repo(
     cold_ms = warmup_assembled.total_ms
 
     eval_cases: list[M2EvalCase] = []
-    for gt_probe, source_text, file_ctx, parsed_diff, target_chunk in prepared_probes:
+    for gt_probe, source_text, file_ctx, parsed_diff, target_chunks in prepared_probes:
         assembled = await retriever.retrieve_and_pack(
             [file_ctx],
             repo_full_name=repo_full_name,
@@ -1764,13 +1900,15 @@ async def _evaluate_single_repo(
             _canonical_target(d.file_path, d.symbol_name)
             for d in assembled.retrieval.architecture_docs
         )
+        norm_retrieved_docs = tuple(dict.fromkeys(_normalize_doc_target(d) for d in retrieved_docs))
+        norm_expected_docs = {_normalize_doc_target(d) for d in gt_probe.expected_docs}
 
         caller_recall = compute_recall_at_k(retrieved_callers, set(gt_probe.expected_callers), k=5)
         callee_recall = compute_recall_at_k(retrieved_callees, set(gt_probe.expected_callees), k=5)
         doc_recall = (
             0.0
             if assembled.retrieval.doc_search_degraded
-            else compute_recall_at_k(retrieved_docs, set(gt_probe.expected_docs), k=5)
+            else compute_recall_at_k(norm_retrieved_docs, norm_expected_docs, k=5)
         )
 
         active_group_scores: list[float] = []
@@ -1811,9 +1949,9 @@ async def _evaluate_single_repo(
 
         _extract_body_canaries(
             source_text,
-            start_line=target_chunk.start_line,
-            end_line=target_chunk.end_line,
-            language=target_chunk.language,
+            start_line=target_chunks[0].start_line,
+            end_line=target_chunks[-1].end_line,
+            language=target_chunks[0].language,
             collected=body_canary_collector,
         )
 
@@ -2076,25 +2214,32 @@ async def run_milestone2_live_evaluation(
             )
             active_store = owned_store
 
+        eval_auth_provider = (
+            GitHubAuthProvider(
+                eval_settings,
+                redis_client=active_redis,
+                http_client=active_http,
+                base_url=api_base_url,
+            )
+            if eval_settings.has_github_credentials
+            else None
+        )
         active_blob_fetcher = blob_fetcher
         if active_blob_fetcher is None:
-            auth_provider = (
-                GitHubAuthProvider(
-                    eval_settings,
-                    redis_client=active_redis,
-                    http_client=active_http,
-                    base_url=api_base_url,
-                )
-                if eval_settings.has_github_credentials
-                else None
-            )
             owned_blob_fetcher = GitHubBlobFetcher(
-                auth_provider,
+                eval_auth_provider,
                 http_client=active_http,
                 base_url=api_base_url,
                 allow_public_fallback=True,
             )
             active_blob_fetcher = owned_blob_fetcher
+
+        eval_repo_client = GitHubRepoIndexClient(
+            eval_auth_provider,
+            http_client=active_http,
+            base_url=api_base_url,
+            allow_public_fallback=True,
+        )
 
         indexer = index_fn if index_fn is not None else _default_index_repo
         py_index_report = await indexer(
@@ -2154,6 +2299,7 @@ async def run_milestone2_live_evaluation(
             doc_score_threshold=doc_score_threshold,
             scrolled_points_collector=scrolled_points,
             body_canary_collector=py_body_canaries,
+            repo_client=eval_repo_client,
         )
         ts_summary, ts_cases = await _evaluate_single_repo(
             repo_full_name=canonical_ts_slug,
@@ -2172,6 +2318,7 @@ async def run_milestone2_live_evaluation(
             doc_score_threshold=doc_score_threshold,
             scrolled_points_collector=scrolled_points,
             body_canary_collector=ts_body_canaries,
+            repo_client=eval_repo_client,
         )
 
         # S2-05: Select body markers purely from source syntax (never filtered against payloads!)
