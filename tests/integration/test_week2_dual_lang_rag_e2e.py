@@ -45,6 +45,7 @@ from codesight.diff.smart_diff_parser import SmartDiffParser
 from codesight.rag.embedder import GeminiEmbedder
 from codesight.rag.live_eval import (
     DEFAULT_LIVE_PY_REPO,
+    load_m2_ground_truth,
     run_milestone2_live_evaluation,
     validate_m2_kpi_thresholds,
 )
@@ -1740,6 +1741,13 @@ async def test_week2_dual_repo_cli_index_recall_latency_and_token_band(
             assert disk_leaks == [], f"NFR-3 disk persistence violations: {disk_leaks}"
 
 
+def _load_curated_ground_truth() -> Any:
+    from pathlib import Path
+
+    manifest = Path(__file__).resolve().parents[2] / "evals" / "m2_ground_truth.json"
+    return load_m2_ground_truth(manifest) if manifest.is_file() else None
+
+
 @pytest.mark.skipif(
     os.getenv("CODESIGHT_RUN_LIVE_M2_EVAL") != "1",
     reason=(
@@ -1772,6 +1780,7 @@ async def test_week2_opt_in_live_github_and_gemini_rag_smoke(
     live_ts_repo = (settings.codesight_live_ts_repo or "").strip() or os.getenv(
         "CODESIGHT_LIVE_TS_REPO", ""
     ).strip()
+    curated_gt = _load_curated_ground_truth()
 
     async with _isolated_session_factory(isolated_postgres_dsn) as session_factory:
         report = await run_milestone2_live_evaluation(
@@ -1781,12 +1790,17 @@ async def test_week2_opt_in_live_github_and_gemini_rag_smoke(
             collection_name=isolated_qdrant_collection,
             session_factory=session_factory,
             auditor_module=zerocode_auditor,
+            ground_truth=curated_gt,
         )
 
     print(json.dumps(report.to_dict(), indent=2))
     assert report.py_repo
     assert report.ts_repo
     assert report.recall_at_5 >= 0.85
+    assert report.caller_recall_at_5 >= 0.85
+    assert report.callee_recall_at_5 >= 0.85
+    assert report.doc_recall_at_5 >= 0.85
+    assert report.degraded_doc_cases == 0
     assert report.p50_retrieval_ms < 850.0
     assert report.tokens_saved_pct >= 45.0
     assert report.zerocode_violations == 0

@@ -431,7 +431,7 @@ def _build_synthetic_repo_blobs() -> tuple[dict[str, dict[str, bytes]], dict[str
         b"def compute_invoice_total(subtotal_cents: int, fee_bps: int) -> int:\n"
         b'    """Compute total cents including gateway processing fees."""\n'
         b"    normalized_fee = (subtotal_cents * fee_bps) // 10_000\n"
-        b"    return subtotal_cents + normalized_fee\n\n\n"
+        b"    return subtotal_cents + dispatch_charge(normalized_fee)\n\n\n"
         + b"\n\n".join(
             f"def aux_py_helper_{i}(val: int) -> int:\n"
             f"    step_one = val + {i}\n"
@@ -439,6 +439,11 @@ def _build_synthetic_repo_blobs() -> tuple[dict[str, dict[str, bytes]], dict[str
             f"    return step_two\n".encode()
             for i in range(1, 14)
         )
+    )
+    py_gateway = (
+        b'"""Gateway client."""\n\n'
+        b"def dispatch_charge(fee_cents: int) -> int:\n"
+        b"    return max(0, fee_cents)\n"
     )
     py_router = (
         b'"""Orders HTTP router."""\n\n'
@@ -467,7 +472,11 @@ def _build_synthetic_repo_blobs() -> tuple[dict[str, dict[str, bytes]], dict[str
             for i in range(1, 14)
         )
     )
-    py_readme = b"# Billing Architecture\n\n## Invoice Fees\nAlways use compute_invoice_total.\n"
+    py_readme = (
+        b"# Billing Architecture\n\n"
+        b"## Invoice Fees\nAlways use compute_invoice_total.\n\n"
+        b"## Archive Notes\nHistorical ledger background.\n"
+    )
 
     ts_hook = (
         b"import { formatCurrencyValue } from './moneyFormat';\n\n"
@@ -482,6 +491,11 @@ def _build_synthetic_repo_blobs() -> tuple[dict[str, dict[str, bytes]], dict[str
             f"}}\n".encode()
             for i in range(1, 14)
         )
+    )
+    ts_money = (
+        b"export function formatCurrencyValue(cents: number): string {\n"
+        b"  return `$${(cents / 100).toFixed(2)}`;\n"
+        b"}\n"
     )
     ts_page = (
         b"import { buildCheckoutSummary } from './checkoutSummary';\n\n"
@@ -510,17 +524,23 @@ def _build_synthetic_repo_blobs() -> tuple[dict[str, dict[str, bytes]], dict[str
             for i in range(1, 14)
         )
     )
-    ts_readme = b"# Web Checkout\n\n## Summary Rendering\nUse buildCheckoutSummary.\n"
+    ts_readme = (
+        b"# Web Checkout\n\n"
+        b"## Summary Rendering\nUse buildCheckoutSummary.\n\n"
+        b"## Legacy Styling\nOld CSS notes.\n"
+    )
 
     repo_files = {
         "Tieens-04/CodeSight-AI": {
             "src/services/billing.py": py_service,
+            "src/clients/gateway.py": py_gateway,
             "src/routers/orders.py": py_router,
             "src/workers/settlement.py": py_worker,
             "README.md": py_readme,
         },
         "acme/react-dashboard": {
             "src/hooks/checkoutSummary.ts": ts_hook,
+            "src/hooks/moneyFormat.ts": ts_money,
             "src/pages/CheckoutScreen.tsx": ts_page,
             "src/components/CartPreviewDrawer.tsx": ts_drawer,
             "README.md": ts_readme,
@@ -571,8 +591,26 @@ async def test_run_milestone2_live_evaluation_auto_discovers_ts_and_captures_raw
                     "signature": (
                         "def compute_invoice_total(subtotal_cents: int, fee_bps: int) -> int"
                     ),
-                    "called_symbols": [],
+                    "called_symbols": ["dispatch_charge"],
                     "imports": ["src.clients.gateway.dispatch_charge"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/clients/gateway.py",
+                    "blob_sha": _sha1_blob(files["src/clients/gateway.py"]),
+                    "chunk_type": "code",
+                    "language": "python",
+                    "symbol_name": "dispatch_charge",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 4,
+                    "signature": "def dispatch_charge(fee_cents: int) -> int",
+                    "called_symbols": [],
+                    "imports": [],
                     "cyclomatic_complexity": 1,
                 },
                 vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
@@ -650,7 +688,25 @@ async def test_run_milestone2_live_evaluation_auto_discovers_ts_and_captures_raw
                     "imports": [],
                     "cyclomatic_complexity": 0,
                 },
-                # Dot product against _unit_vec(0, 2, 0.0) == 1 / sqrt(1 + 1.4^2) ~= 0.5812 (< 0.65)
+                vector=_unit_vec(0, 1, 0.4),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "README.md",
+                    "blob_sha": _sha1_blob(files["README.md"]),
+                    "chunk_type": "architecture_doc",
+                    "language": "markdown",
+                    "symbol_name": "Billing Architecture > Archive Notes",
+                    "symbol_kind": "section",
+                    "start_line": 6,
+                    "end_line": 7,
+                    "signature": "## Archive Notes",
+                    "called_symbols": [],
+                    "imports": [],
+                    "cyclomatic_complexity": 0,
+                },
+                # Sub-threshold (~0.5812 < 0.65) diagnostic score captured alongside prod hit
                 vector=_unit_vec(0, 1, 1.4),
             )
         else:
@@ -671,6 +727,24 @@ async def test_run_milestone2_live_evaluation_auto_discovers_ts_and_captures_raw
                     ),
                     "called_symbols": ["formatCurrencyValue"],
                     "imports": ["./moneyFormat.formatCurrencyValue"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/hooks/moneyFormat.ts",
+                    "blob_sha": _sha1_blob(files["src/hooks/moneyFormat.ts"]),
+                    "chunk_type": "code",
+                    "language": "typescript",
+                    "symbol_name": "formatCurrencyValue",
+                    "symbol_kind": "function",
+                    "start_line": 1,
+                    "end_line": 3,
+                    "signature": "export function formatCurrencyValue(cents: number): string",
+                    "called_symbols": [],
+                    "imports": [],
                     "cyclomatic_complexity": 1,
                 },
                 vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
@@ -741,6 +815,24 @@ async def test_run_milestone2_live_evaluation_auto_discovers_ts_and_captures_raw
                     "start_line": 1,
                     "end_line": 4,
                     "signature": "## Summary Rendering",
+                    "called_symbols": [],
+                    "imports": [],
+                    "cyclomatic_complexity": 0,
+                },
+                vector=_unit_vec(0, 1, 0.4),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "README.md",
+                    "blob_sha": _sha1_blob(files["README.md"]),
+                    "chunk_type": "architecture_doc",
+                    "language": "markdown",
+                    "symbol_name": "Web Checkout > Legacy Styling",
+                    "symbol_kind": "section",
+                    "start_line": 6,
+                    "end_line": 7,
+                    "signature": "## Legacy Styling",
                     "called_symbols": [],
                     "imports": [],
                     "cyclomatic_complexity": 0,
@@ -853,12 +945,15 @@ async def test_run_milestone2_live_evaluation_auto_discovers_ts_and_captures_raw
     assert report.disk_violations == ()
     assert validate_m2_kpi_thresholds(report) == []
 
-    # Diagnostic raw cosine similarity (~0.5812) captured below DEFAULT_DOC_SCORE_THRESHOLD=0.65
+    # Both prod hits (>= 0.65) and sub-threshold diagnostic raw scores (~0.5812) captured
     assert report.py_summary is not None
     assert report.ts_summary is not None
-    assert report.py_summary.doc_hits_above_threshold == 0
+    assert report.caller_recall_at_5 == 1.0
+    assert report.callee_recall_at_5 == 1.0
+    assert report.doc_recall_at_5 == 1.0
+    assert report.py_summary.doc_hits_above_threshold >= 1
     assert report.py_summary.doc_max_raw_score is not None
-    assert 0.55 <= report.py_summary.doc_max_raw_score <= 0.62
+    assert report.py_summary.doc_max_raw_score >= 0.90
     assert any(0.55 <= s <= 0.62 for s in report.doc_raw_scores_observed)
 
     # Audit & container /qdrant/storage disk checks ran with strict parameters
@@ -1442,7 +1537,7 @@ async def test_discover_live_ts_repo_edge_errors_and_archived_fallback(
 
 
 def test_probe_selection_helpers_callees_test_paths_and_fallback_ast() -> None:
-    """Test helper branches: _is_test_path, callee extraction, backfill, and fallback AST."""
+    """Test independent ground-truth builder, fallback AST, and syntax-aware body canaries."""
     from codesight.ast_engine.registry import ASTParserRegistry
     from codesight.diff.smart_diff_parser import SmartDiffParser
     from codesight.rag.live_eval import (
@@ -1451,7 +1546,8 @@ def test_probe_selection_helpers_callees_test_paths_and_fallback_ast() -> None:
         _is_test_path,
         _load_zerocode_auditor_module,
         _resolve_probe_chunk_and_ast,
-        _select_cross_file_probes,
+        build_independent_repo_ground_truth,
+        load_m2_ground_truth,
     )
 
     assert _is_test_path("tests/unit/test_a.py") is True
@@ -1459,114 +1555,93 @@ def test_probe_selection_helpers_callees_test_paths_and_fallback_ast() -> None:
     assert _is_test_path("src/app.test.tsx") is True
     assert _is_test_path("src/services/billing.py") is False
 
-    pts = [
-        # Malformed point ignored
-        QdrantStoredPoint(point_id="0", payload={"chunk_type": "code", "file_path": ""}),
-        # Target 1 & 2 in same file_a (multi-chunk)
-        QdrantStoredPoint(
-            point_id="1",
-            payload={
-                "file_path": "src/a.py",
-                "blob_sha": "a" * 40,
-                "chunk_type": "code",
-                "language": "python",
-                "symbol_name": "alpha_fn",
-                "symbol_kind": "function",
-                "start_line": 2,
-                "end_line": 6,
-                "signature": "def alpha_fn() -> None",
-                "called_symbols": ["beta_fn", "svc.beta_fn", "list.append", "get"],
-                "imports": [],
-                "cyclomatic_complexity": 1,
-            },
+    raw_py_files = {
+        "src/a.py": (
+            "from src.b import beta_fn\n\n"
+            "def alpha_fn() -> None:\n"
+            "    beta_fn()\n\n"
+            "def gamma_fn() -> None:\n"
+            "    return None\n"
         ),
-        QdrantStoredPoint(
-            point_id="2",
-            payload={
-                "file_path": "src/a.py",
-                "blob_sha": "a" * 40,
-                "chunk_type": "code",
-                "language": "python",
-                "symbol_name": "gamma_fn",
-                "symbol_kind": "function",
-                "start_line": 8,
-                "end_line": 12,
-                "signature": "def gamma_fn() -> None",
-                "called_symbols": [],
-                "imports": [],
-                "cyclomatic_complexity": 1,
-            },
+        "src/b.py": (
+            "from src.a import alpha_fn, gamma_fn\n\n"
+            "def beta_fn() -> None:\n"
+            "    alpha_fn()\n"
+            "    gamma_fn()\n"
         ),
-        # Callee & caller in src/b.py
-        QdrantStoredPoint(
-            point_id="3",
-            payload={
-                "file_path": "src/b.py",
-                "blob_sha": "b" * 40,
-                "chunk_type": "code",
-                "language": "python",
-                "symbol_name": "beta_fn",
-                "symbol_kind": "function",
-                "start_line": 2,
-                "end_line": 6,
-                "signature": "def beta_fn() -> None",
-                "called_symbols": ["alpha_fn", "gamma_fn"],
-                "imports": [],
-                "cyclomatic_complexity": 1,
-            },
-        ),
-    ]
-    # max_probes=3 exercises both distinct-file pass (a.py, b.py) and backfill (a.py::gamma_fn)
-    probes, code_cnt, doc_cnt = _select_cross_file_probes(
-        pts,
+        "README.md": "# Service Architecture\n\n## Alpha Flow\nalpha_fn coordinates beta_fn.\n",
+    }
+    gt = build_independent_repo_ground_truth(
+        raw_py_files,
         repo_full_name="org/repo",
+        language="python",
         max_probes=3,
     )
-    assert code_cnt == 4
-    assert doc_cnt == 0
-    assert len(probes) == 3
-
-    probes_one, _, _ = _select_cross_file_probes(pts, repo_full_name="org/repo", max_probes=1)
-    assert len(probes_one) == 1
-    alpha_probe = next(p for p in probes if p.symbol_name == "alpha_fn")
+    assert len(gt.probes) == 3
+    alpha_probe = next(p for p in gt.probes if p.symbol_name == "alpha_fn")
+    assert alpha_probe.expected_callers == ("src/b.py::beta_fn",)
     assert alpha_probe.expected_callees == ("src/b.py::beta_fn",)
+    assert alpha_probe.expected_docs == ("README.md::Service Architecture > Alpha Flow",)
 
-    # Fallback chunk resolution when file extension is unsupported by ASTParserRegistry
-    unknown_probe = alpha_probe
     registry = ASTParserRegistry()
-    # Matching by symbol name when start_line shifted
     _ast, matched_by_name = _resolve_probe_chunk_and_ast(
-        unknown_probe,
+        file_path="src/a.py",
+        symbol_name="alpha_fn",
+        language_hint="python",
         source_text="\n\n\ndef alpha_fn() -> None:\n    return None\n",
         registry=registry,
     )
     assert matched_by_name.symbol_name == "alpha_fn"
-    # Fallback to payload chunk when source has no AST chunks
+
     _ast_none, fallback_chunk = _resolve_probe_chunk_and_ast(
-        unknown_probe,
+        file_path="src/a.py",
+        symbol_name="alpha_fn",
+        language_hint="python",
         source_text="",
         registry=registry,
     )
     assert fallback_chunk.symbol_name == "alpha_fn"
 
     empty_diff = _build_probe_diff(
-        unknown_probe,
+        file_path="src/a.py",
+        blob_sha="a" * 40,
+        language="python",
         source_text="",
         target_line=1,
         diff_parser=SmartDiffParser(),
     )
     assert empty_diff.files == ()
 
-    # Body canary extraction filters short/existing/over-cap lines cleanly
+    # Multi-line signature header parameter lines MUST NOT be chosen as body canaries
     canaries: list[str] = []
     _extract_body_canaries(
-        "def f():\n    x = 1\n    secret_interior_line_for_disk_scan = 42\n",
+        (
+            "def multi_line_header(\n"
+            "    long_parameter_name_in_signature: str,\n"
+            "    second_parameter_in_signature: int,\n"
+            ") -> int:\n"
+            "    x = 1\n"
+            "    secret_interior_line_for_disk_scan = 42\n"
+        ),
         start_line=1,
-        end_line=3,
-        payload_json_blobs=['{"signature": "def f()"}'],
+        end_line=6,
+        language="python",
         collected=canaries,
     )
     assert canaries == ["secret_interior_line_for_disk_scan = 42"]
+
+    # Curated evals/m2_ground_truth.json loads cleanly and matches real CodeSight-AI files
+    manifest_path = Path(__file__).resolve().parents[2] / "evals" / "m2_ground_truth.json"
+    loaded_gt = load_m2_ground_truth(manifest_path)
+    assert "tieens-04/codesight-ai" in loaded_gt
+    cs_gt = loaded_gt["tieens-04/codesight-ai"]
+    assert len(cs_gt.probes) >= 3
+    repo_root = Path(__file__).resolve().parents[2]
+    for probe in cs_gt.probes:
+        assert (repo_root / probe.file_path).is_file()
+        assert probe.expected_callers
+        assert probe.expected_callees
+        assert probe.expected_docs
 
     auditor = _load_zerocode_auditor_module()
     assert callable(auditor.audit_live_collection)
@@ -2002,13 +2077,560 @@ def test_eval_cli_passes_settings_dotenv_repos_when_cli_flags_omitted(
         *,
         py_repo: str,
         ts_repo: str,
+        ground_truth: Any = None,
     ) -> int:
         del args, settings
         captured_args["py_repo"] = py_repo
         captured_args["ts_repo"] = ts_repo
+        captured_args["has_gt"] = bool(ground_truth)
         return 0
 
     monkeypatch.setattr(cli_mod, "_run_async", _fake_run_async)
     rc = cli_mod.main(["--collection", "env_test_col"])
     assert rc == 0
-    assert captured_args == {"py_repo": "org/dotenv-py", "ts_repo": "org/dotenv-ts"}
+    assert captured_args == {
+        "py_repo": "org/dotenv-py",
+        "ts_repo": "org/dotenv-ts",
+        "has_gt": True,
+    }
+
+
+def test_s2_04_validator_rejects_zero_callee_recall_low_doc_recall_and_degraded_doc_search() -> (
+    None
+):
+    """S2-04: Passing callers must never mask 0 callee/doc Recall@5 or degraded docs."""
+    from codesight.rag.live_eval import M2EvalCase
+
+    degraded_py_case = M2EvalCase(
+        repo_full_name="Tieens-04/CodeSight-AI",
+        language="python",
+        file_path="src/services/billing.py",
+        symbol_name="compute_invoice_total",
+        expected_callers=("src/routers/orders.py::submit_order_route",),
+        retrieved_callers=("src/routers/orders.py::submit_order_route",),
+        expected_callees=("src/clients/gateway.py::dispatch_charge",),
+        retrieved_callees=(),
+        recall_at_5=1.0,
+        callee_recall_at_5=0.0,
+        cold_retrieval_ms=120.0,
+        warm_retrieval_ms=80.0,
+        qdrant_ms=10.0,
+        blob_fetch_ms=40.0,
+        pack_ms=5.0,
+        packed_aux_tokens=900,
+        baseline_tokens=3000,
+        codesight_tokens=1200,
+        tokens_saved_pct=60.0,
+        doc_hits_at_prod_threshold=0,
+        doc_max_raw_score=None,
+        doc_raw_scores=(),
+        doc_search_degraded=True,
+        blobs_fetched=2,
+    )
+    degraded_ts_case = M2EvalCase(
+        repo_full_name="acme/react-dashboard",
+        language="typescript",
+        file_path="src/hooks/checkoutSummary.ts",
+        symbol_name="buildCheckoutSummary",
+        expected_callers=("src/pages/CheckoutScreen.tsx::CheckoutScreen",),
+        retrieved_callers=("src/pages/CheckoutScreen.tsx::CheckoutScreen",),
+        expected_callees=("src/hooks/moneyFormat.ts::formatCurrencyValue",),
+        retrieved_callees=(),
+        recall_at_5=1.0,
+        callee_recall_at_5=0.0,
+        cold_retrieval_ms=130.0,
+        warm_retrieval_ms=85.0,
+        qdrant_ms=12.0,
+        blob_fetch_ms=45.0,
+        pack_ms=5.0,
+        packed_aux_tokens=950,
+        baseline_tokens=3200,
+        codesight_tokens=1300,
+        tokens_saved_pct=59.3,
+        doc_hits_at_prod_threshold=0,
+        doc_max_raw_score=None,
+        doc_raw_scores=(),
+        doc_search_degraded=True,
+        blobs_fetched=2,
+    )
+    report = _make_sample_report(
+        recall_at_5=1.0,
+        py_summary=_make_repo_summary(
+            repo_full_name="Tieens-04/CodeSight-AI",
+            language="python",
+            recall_at_5=1.0,
+        ),
+        ts_summary=_make_repo_summary(
+            repo_full_name="acme/react-dashboard",
+            language="typescript",
+            recall_at_5=1.0,
+        ),
+        cases=(degraded_py_case, degraded_ts_case),
+    )
+    violations = validate_m2_kpi_thresholds(report)
+    assert any("callee_recall_at_5" in v for v in violations), violations
+    assert any("doc_recall_at_5" in v or "doc" in v for v in violations), violations
+    assert any("doc_search_degraded" in v for v in violations), violations
+
+
+@pytest.mark.asyncio
+async def test_s2_04_independent_ground_truth_catches_missing_ast_called_symbols_edge() -> None:
+    """S2-04: Missing Qdrant `called_symbols` edge must still fail expected_callers."""
+    py_target = (
+        b"from src.clients.gateway import dispatch_charge\n\n"
+        b"def compute_invoice_total(subtotal_cents: int, fee_bps: int) -> int:\n"
+        b"    fee = dispatch_charge(subtotal_cents, fee_bps)\n"
+        b"    return subtotal_cents + fee\n\n"
+        + b"\n".join(
+            f"def pad_target_{i}(x: int) -> int:\n    return x + {i}\n".encode()
+            for i in range(1, 15)
+        )
+    )
+    py_callee = b"def dispatch_charge(subtotal_cents: int, fee_bps: int) -> int:\n    return 10\n"
+    py_caller_broken_index = (
+        b"from src.services.billing import compute_invoice_total\n\n"
+        b"def submit_order_route(subtotal_cents: int) -> int:\n"
+        b"    return compute_invoice_total(subtotal_cents, 250)\n\n"
+        + b"\n".join(
+            f"def pad_caller_{i}(x: int) -> int:\n    return x * {i}\n".encode()
+            for i in range(1, 15)
+        )
+    )
+    py_doc = b"# Billing Architecture\n\n## Invoice Fees\nAlways call compute_invoice_total.\n"
+
+    ts_target = (
+        b"import { formatCurrencyValue } from './moneyFormat';\n\n"
+        b"export function buildCheckoutSummary(cents: number): string {\n"
+        b"  return formatCurrencyValue(cents);\n"
+        b"}\n\n"
+        + b"\n".join(
+            f"export function padTs_{i}(n: number): number {{ return n + {i}; }}\n".encode()
+            for i in range(1, 15)
+        )
+    )
+    ts_callee = (
+        b"export function formatCurrencyValue(cents: number): string { return `${cents}`; }\n"
+    )
+    ts_caller = (
+        b"import { buildCheckoutSummary } from './checkoutSummary';\n\n"
+        b"export function CheckoutScreen(cents: number): string {\n"
+        b"  return buildCheckoutSummary(cents);\n"
+        b"}\n\n"
+        + b"\n".join(
+            f"export function padPage_{i}(n: number): number {{ return n + {i}; }}\n".encode()
+            for i in range(1, 15)
+        )
+    )
+    ts_doc = b"# Web Checkout\n\n## Summary Rendering\nUse buildCheckoutSummary.\n"
+
+    blobs_by_sha = {
+        _sha1_blob(raw): raw
+        for raw in (
+            py_target,
+            py_callee,
+            py_caller_broken_index,
+            py_doc,
+            ts_target,
+            ts_callee,
+            ts_caller,
+            ts_doc,
+        )
+    }
+    store = _InMemoryEvalStore(collection_name="s2_04_col")
+
+    async def _broken_parser_index_fn(repo_full_name: str, **kwargs: Any) -> InitialIndexReport:
+        del kwargs
+        if repo_full_name == DEFAULT_LIVE_PY_REPO:
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/services/billing.py",
+                    "blob_sha": _sha1_blob(py_target),
+                    "chunk_type": "code",
+                    "language": "python",
+                    "symbol_name": "compute_invoice_total",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 5,
+                    "signature": (
+                        "def compute_invoice_total(subtotal_cents: int, fee_bps: int) -> int"
+                    ),
+                    "called_symbols": ["dispatch_charge"],
+                    "imports": ["src.clients.gateway.dispatch_charge"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/clients/gateway.py",
+                    "blob_sha": _sha1_blob(py_callee),
+                    "chunk_type": "code",
+                    "language": "python",
+                    "symbol_name": "dispatch_charge",
+                    "symbol_kind": "function",
+                    "start_line": 1,
+                    "end_line": 2,
+                    "signature": "def dispatch_charge(subtotal_cents: int, fee_bps: int) -> int",
+                    "called_symbols": [],
+                    "imports": [],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            # BUG SIMULATION: AST parser missed `compute_invoice_total` in `called_symbols`!
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/routers/orders.py",
+                    "blob_sha": _sha1_blob(py_caller_broken_index),
+                    "chunk_type": "code",
+                    "language": "python",
+                    "symbol_name": "submit_order_route",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 4,
+                    "signature": "def submit_order_route(subtotal_cents: int) -> int",
+                    "called_symbols": [],
+                    "imports": ["src.services.billing.compute_invoice_total"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "README.md",
+                    "blob_sha": _sha1_blob(py_doc),
+                    "chunk_type": "architecture_doc",
+                    "language": "markdown",
+                    "symbol_name": "Billing Architecture > Invoice Fees",
+                    "symbol_kind": "section",
+                    "start_line": 1,
+                    "end_line": 4,
+                    "signature": "## Invoice Fees",
+                    "called_symbols": [],
+                    "imports": [],
+                    "cyclomatic_complexity": 0,
+                },
+                vector=_unit_vec(0, 1, 0.2),
+            )
+        else:
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/hooks/checkoutSummary.ts",
+                    "blob_sha": _sha1_blob(ts_target),
+                    "chunk_type": "code",
+                    "language": "typescript",
+                    "symbol_name": "buildCheckoutSummary",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 5,
+                    "signature": "export function buildCheckoutSummary(cents: number): string",
+                    "called_symbols": ["formatCurrencyValue"],
+                    "imports": ["./moneyFormat.formatCurrencyValue"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/hooks/moneyFormat.ts",
+                    "blob_sha": _sha1_blob(ts_callee),
+                    "chunk_type": "code",
+                    "language": "typescript",
+                    "symbol_name": "formatCurrencyValue",
+                    "symbol_kind": "function",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "signature": "export function formatCurrencyValue(cents: number): string",
+                    "called_symbols": [],
+                    "imports": [],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/pages/CheckoutScreen.tsx",
+                    "blob_sha": _sha1_blob(ts_caller),
+                    "chunk_type": "code",
+                    "language": "tsx",
+                    "symbol_name": "CheckoutScreen",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 5,
+                    "signature": "export function CheckoutScreen(cents: number): string",
+                    "called_symbols": ["buildCheckoutSummary"],
+                    "imports": ["./checkoutSummary.buildCheckoutSummary"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "README.md",
+                    "blob_sha": _sha1_blob(ts_doc),
+                    "chunk_type": "architecture_doc",
+                    "language": "markdown",
+                    "symbol_name": "Web Checkout > Summary Rendering",
+                    "symbol_kind": "section",
+                    "start_line": 1,
+                    "end_line": 4,
+                    "signature": "## Summary Rendering",
+                    "called_symbols": [],
+                    "imports": [],
+                    "cyclomatic_complexity": 0,
+                },
+                vector=_unit_vec(0, 1, 0.2),
+            )
+        return InitialIndexReport(
+            repo_full_name=repo_full_name,
+            repo_id="r",
+            default_branch="main",
+            indexed_branch="main",
+            commit_sha="a" * 40,
+            tree_entries=4,
+            eligible_files=4,
+            unchanged_files_skipped=0,
+            fetched_files=4,
+            skipped_files=0,
+            code_chunks=3,
+            doc_chunks=1,
+            embedded_points=1,
+            upserted_points=4,
+            stale_points_deleted=0,
+            persisted_cursor=True,
+            truncated_tree=False,
+            elapsed_ms=5.0,
+        )
+
+    async def _gh_handler(request: httpx.Request) -> httpx.Response:
+        if "/git/blobs/" in request.url.path:
+            sha = request.url.path.rsplit("/", 1)[-1]
+            raw = blobs_by_sha.get(sha)
+            if raw is not None:
+                return httpx.Response(200, json=_blob_json(raw, sha))
+        return httpx.Response(404)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(_gh_handler)) as http_client,
+        GeminiEmbedder(client=_FakeEvalGenAIClient()) as embedder,  # type: ignore[arg-type]
+    ):
+        report = await run_milestone2_live_evaluation(
+            settings=Settings(
+                _env_file=None,
+                qdrant_collection_name="s2_04_col",
+                github_token=SecretStr("ghp_ok"),
+                gemini_api_key=SecretStr("gem_ok"),
+            ),
+            py_repo=DEFAULT_LIVE_PY_REPO,
+            ts_repo="acme/react-dashboard",
+            collection_name="s2_04_col",
+            session_factory=object(),  # type: ignore[arg-type]
+            http_client=http_client,
+            redis_client=SimpleNamespace(),  # type: ignore[arg-type]
+            store=store,  # type: ignore[arg-type]
+            embedder=embedder,
+            index_fn=_broken_parser_index_fn,
+            auditor_fn=lambda *_a, **_kw: 0,
+            disk_scanner_fn=lambda _c, _col, markers: (
+                ["NFR-3 disk breach — positive control"]
+                if tuple(markers) == (DEFAULT_LIVE_PY_REPO,)
+                else []
+            ),
+        )
+
+    billing_cases = [c for c in report.cases if c.symbol_name == "compute_invoice_total"]
+    assert len(billing_cases) == 1
+    assert billing_cases[0].expected_callers == ("src/routers/orders.py::submit_order_route",)
+    assert billing_cases[0].caller_recall_at_5 == 0.0
+    assert report.py_summary is not None
+    assert report.py_summary.caller_recall_at_5 == 0.5
+    violations = validate_m2_kpi_thresholds(report)
+    assert any("caller_recall_at_5" in v for v in violations), violations
+
+
+@pytest.mark.asyncio
+async def test_s2_05_canary_selector_ignores_payload_and_catches_body_leak_inside_imports() -> None:
+    """S2-05: Body line leaked into `payload['imports']` must be retained as canary and flagged."""
+    repo_files, blobs_by_sha = _build_synthetic_repo_blobs()
+    store = _InMemoryEvalStore(collection_name="s2_05_col")
+    leaked_body_line = "normalized_fee = (subtotal_cents * fee_bps) // 10_000"
+
+    async def _leaky_imports_index_fn(repo_full_name: str, **kwargs: Any) -> InitialIndexReport:
+        del kwargs
+        files = repo_files[repo_full_name]
+        if repo_full_name == DEFAULT_LIVE_PY_REPO:
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/services/billing.py",
+                    "blob_sha": _sha1_blob(files["src/services/billing.py"]),
+                    "chunk_type": "code",
+                    "language": "python",
+                    "symbol_name": "compute_invoice_total",
+                    "symbol_kind": "function",
+                    "start_line": 6,
+                    "end_line": 9,
+                    "signature": (
+                        "def compute_invoice_total(subtotal_cents: int, fee_bps: int) -> int"
+                    ),
+                    "called_symbols": [],
+                    # Valid metadata field `imports` contaminated with a raw function body line!
+                    "imports": ["src.clients.gateway.dispatch_charge", leaked_body_line],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/routers/orders.py",
+                    "blob_sha": _sha1_blob(files["src/routers/orders.py"]),
+                    "chunk_type": "code",
+                    "language": "python",
+                    "symbol_name": "submit_order_route",
+                    "symbol_kind": "function",
+                    "start_line": 6,
+                    "end_line": 9,
+                    "signature": (
+                        "def submit_order_route("
+                        "order_id: str, subtotal_cents: int) -> dict[str, int]"
+                    ),
+                    "called_symbols": ["compute_invoice_total"],
+                    "imports": ["src.services.billing.compute_invoice_total"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+        else:
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/hooks/checkoutSummary.ts",
+                    "blob_sha": _sha1_blob(files["src/hooks/checkoutSummary.ts"]),
+                    "chunk_type": "code",
+                    "language": "typescript",
+                    "symbol_name": "buildCheckoutSummary",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 6,
+                    "signature": (
+                        "export function buildCheckoutSummary("
+                        "cents: number, taxBps: number): string"
+                    ),
+                    "called_symbols": [],
+                    "imports": [],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+            store.add_point(
+                payload={
+                    "repo_full_name": repo_full_name,
+                    "file_path": "src/pages/CheckoutScreen.tsx",
+                    "blob_sha": _sha1_blob(files["src/pages/CheckoutScreen.tsx"]),
+                    "chunk_type": "code",
+                    "language": "tsx",
+                    "symbol_name": "CheckoutScreen",
+                    "symbol_kind": "function",
+                    "start_line": 3,
+                    "end_line": 6,
+                    "signature": "export function CheckoutScreen(props: { cents: number }): string",
+                    "called_symbols": ["buildCheckoutSummary"],
+                    "imports": ["./checkoutSummary.buildCheckoutSummary"],
+                    "cyclomatic_complexity": 1,
+                },
+                vector=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+            )
+        return InitialIndexReport(
+            repo_full_name=repo_full_name,
+            repo_id="r",
+            default_branch="main",
+            indexed_branch="main",
+            commit_sha="a" * 40,
+            tree_entries=2,
+            eligible_files=2,
+            unchanged_files_skipped=0,
+            fetched_files=2,
+            skipped_files=0,
+            code_chunks=2,
+            doc_chunks=0,
+            embedded_points=0,
+            upserted_points=2,
+            stale_points_deleted=0,
+            persisted_cursor=True,
+            truncated_tree=False,
+            elapsed_ms=5.0,
+        )
+
+    async def _gh_handler(request: httpx.Request) -> httpx.Response:
+        if "/git/blobs/" in request.url.path:
+            sha = request.url.path.rsplit("/", 1)[-1]
+            raw = blobs_by_sha.get(sha)
+            if raw is not None:
+                return httpx.Response(200, json=_blob_json(raw, sha))
+        return httpx.Response(404)
+
+    auditor_canaries_received: list[tuple[str, ...]] = []
+    disk_canaries_received: list[tuple[str, ...]] = []
+
+    def _capturing_auditor(
+        _base_url: str,
+        _collection: str,
+        _sample_limit: int = 200,
+        *,
+        scan_all: bool = False,
+        strict_indexes: bool = False,
+        canary_substrings: Sequence[str] = (),
+    ) -> int:
+        del scan_all, strict_indexes
+        auditor_canaries_received.append(tuple(canary_substrings))
+        return 0
+
+    def _capturing_disk_scan(
+        _container_name: str,
+        _collection: str,
+        canary_substrings: Sequence[str],
+    ) -> list[str]:
+        markers = tuple(canary_substrings)
+        disk_canaries_received.append(markers)
+        if markers == (DEFAULT_LIVE_PY_REPO,):
+            return ["NFR-3 disk breach — positive control"]
+        return []
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(_gh_handler)) as http_client,
+        GeminiEmbedder(client=_FakeEvalGenAIClient()) as embedder,  # type: ignore[arg-type]
+    ):
+        report = await run_milestone2_live_evaluation(
+            settings=Settings(
+                _env_file=None,
+                qdrant_collection_name="s2_05_col",
+                github_token=SecretStr("ghp_ok"),
+                gemini_api_key=SecretStr("gem_ok"),
+            ),
+            py_repo=DEFAULT_LIVE_PY_REPO,
+            ts_repo="acme/react-dashboard",
+            collection_name="s2_05_col",
+            session_factory=object(),  # type: ignore[arg-type]
+            http_client=http_client,
+            redis_client=SimpleNamespace(),  # type: ignore[arg-type]
+            store=store,  # type: ignore[arg-type]
+            embedder=embedder,
+            index_fn=_leaky_imports_index_fn,
+            auditor_fn=_capturing_auditor,
+            disk_scanner_fn=_capturing_disk_scan,
+        )
+
+    assert len(auditor_canaries_received) == 1
+    assert leaked_body_line in auditor_canaries_received[0]
+    assert auditor_canaries_received[0] == disk_canaries_received[1]
+    assert report.zerocode_violations >= 1
+    assert any("zerocode_violations" in v for v in validate_m2_kpi_thresholds(report))

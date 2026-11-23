@@ -9,6 +9,7 @@ import os
 import sys
 import uuid
 from collections.abc import Sequence
+from pathlib import Path
 
 from qdrant_client import AsyncQdrantClient
 
@@ -17,13 +18,17 @@ from codesight.core.logging import configure_logging
 from codesight.rag.live_eval import (
     DEFAULT_LIVE_PY_REPO,
     DEFAULT_PROBES_PER_REPO,
+    M2RepoGroundTruth,
     isolated_eval_session_factory,
+    load_m2_ground_truth,
     run_milestone2_live_evaluation,
     validate_eval_collection_name,
     validate_m2_kpi_thresholds,
 )
 from codesight.rag.qdrant_store import QdrantZeroCodeStore
 from codesight.rag.retriever import DEFAULT_DOC_SCORE_THRESHOLD
+
+DEFAULT_GROUND_TRUTH_PATH = Path(__file__).resolve().with_name("m2_ground_truth.json")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -59,6 +64,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Retain the evaluation Qdrant collection after completion instead of deleting it.",
     )
     parser.add_argument(
+        "--ground-truth",
+        default=None,
+        help=(
+            "Optional path to curated Milestone 2 ground-truth JSON manifest "
+            f"(defaults to {DEFAULT_GROUND_TRUTH_PATH.name} when present)."
+        ),
+    )
+    parser.add_argument(
         "--max-probes-per-repo",
         type=int,
         default=DEFAULT_PROBES_PER_REPO,
@@ -76,12 +89,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_ground_truth(raw_arg: str | None) -> dict[str, M2RepoGroundTruth]:
+    if raw_arg is not None and raw_arg.strip():
+        return load_m2_ground_truth(raw_arg.strip())
+    env_path = os.getenv("CODESIGHT_M2_GROUND_TRUTH", "").strip()
+    if env_path:
+        return load_m2_ground_truth(env_path)
+    if DEFAULT_GROUND_TRUTH_PATH.is_file():
+        return load_m2_ground_truth(DEFAULT_GROUND_TRUTH_PATH)
+    return {}
+
+
 async def _run_async(
     args: argparse.Namespace,
     settings: Settings,
     *,
     py_repo: str,
     ts_repo: str,
+    ground_truth: dict[str, M2RepoGroundTruth] | None = None,
 ) -> int:
     collection_name = validate_eval_collection_name(args.collection)
     qdrant_cleanup = AsyncQdrantClient(
@@ -112,6 +137,7 @@ async def _run_async(
                 collection_name=collection_name,
                 session_factory=session_factory,
                 store=eval_store,
+                ground_truth=ground_truth,
                 max_probes_per_repo=args.max_probes_per_repo,
                 doc_score_threshold=args.doc_threshold,
             )
@@ -176,12 +202,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     try:
+        ground_truth = _resolve_ground_truth(args.ground_truth)
         return asyncio.run(
             _run_async(
                 args,
                 settings,
                 py_repo=resolved_py_repo,
                 ts_repo=resolved_ts_repo,
+                ground_truth=ground_truth,
             )
         )
     except ValueError as exc:
