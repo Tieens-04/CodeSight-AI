@@ -19,6 +19,7 @@ import redis.asyncio as redis_async
 import redis.exceptions
 import structlog
 from celery import Celery, Task
+from celery.exceptions import SoftTimeLimitExceeded
 from celery.signals import (
     before_task_publish,
     setup_logging,
@@ -56,8 +57,10 @@ from codesight.worker.supersede_lock import (
     is_pr_event_superseded as _is_pr_superseded_impl,
 )
 from codesight.worker.tasks.indexing_tasks import (
+    can_run_live_push_sync,
     extract_push_coords,
     has_indexing_credentials,
+    log_push_stub_fallback,
     run_push_webhook_task,
 )
 
@@ -248,9 +251,17 @@ def _typed_task(
     app_instance: Celery,
     *,
     name: str,
+    soft_time_limit: int | None = None,
+    time_limit: int | None = None,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    task_opts: dict[str, Any] = {"name": name, "base": CodeSightTask}
+    if soft_time_limit is not None:
+        task_opts["soft_time_limit"] = soft_time_limit
+    if time_limit is not None:
+        task_opts["time_limit"] = time_limit
+
     def _decorator(fn: Callable[_P, _R]) -> Callable[_P, _R]:
-        registered = app_instance.task(name=name, base=CodeSightTask)(fn)
+        registered = app_instance.task(**task_opts)(fn)
         return cast(Callable[_P, _R], registered)
 
     return _decorator
@@ -416,11 +427,16 @@ class _WorkerAsyncRuntime:
 
         try:
             return result_future.result()
-        except BaseException:
+        except BaseException as exc:
+            cancel_msg = (
+                f"Cancelled due to {type(exc).__name__}"
+                if isinstance(exc, SoftTimeLimitExceeded)
+                else None
+            )
 
             def _cancel_running() -> None:
                 if task_holder and not task_holder[0].done():
-                    task_holder[0].cancel()
+                    task_holder[0].cancel(cancel_msg)
                 else:
                     result_future.cancel()
 
@@ -664,7 +680,9 @@ class _WorkerAsyncRuntime:
             active_settings = settings if settings is not None else get_settings()
             coords = extract_push_coords(payload)
             has_creds = has_indexing_credentials(active_settings)
-            if coords is not None and (has_creds or active_settings.app_env == "production"):
+            if coords is not None and (
+                can_run_live_push_sync(active_settings) or active_settings.app_env == "production"
+            ):
                 http_client, redis_client, session_factory = await self._ensure_pools(
                     active_settings
                 )
@@ -778,7 +796,7 @@ def _dispatch_push_task(task_obj: Any, payload: dict[str, Any]) -> dict[str, str
     active_settings = get_settings()
     coords = extract_push_coords(payload)
     if coords is not None and (
-        has_indexing_credentials(active_settings) or active_settings.app_env == "production"
+        can_run_live_push_sync(active_settings) or active_settings.app_env == "production"
     ):
         req = getattr(task_obj, "request", None)
         is_worker_delivery = not bool(getattr(req, "called_directly", True)) and bool(
@@ -792,22 +810,30 @@ def _dispatch_push_task(task_obj: Any, payload: dict[str, Any]) -> dict[str, str
             is_final_attempt=is_final_attempt,
         )
 
-    logger.info(
-        "webhook_push_stub_received",
-        trace_id=trace_id,
-        repo=str(payload.get("repo_full_name", "")),
-        ref=str(payload.get("ref", "")),
-    )
+    log_push_stub_fallback(payload, settings=active_settings, trace_id=trace_id)
     return {"status": "accepted", "trace_id": trace_id}
 
 
-@_typed_task(celery_app, name="codesight.webhook.handle_push_event")
+_PUSH_TASK_SETTINGS = get_settings()
+
+
+@_typed_task(
+    celery_app,
+    name="codesight.webhook.handle_push_event",
+    soft_time_limit=_PUSH_TASK_SETTINGS.index_task_soft_time_limit_seconds,
+    time_limit=_PUSH_TASK_SETTINGS.index_task_hard_time_limit_seconds,
+)
 def handle_push_event(payload: dict[str, Any]) -> dict[str, str]:
     """Handle default-branch push webhook events via FR-07 IncrementalBranchSyncer."""
     return _dispatch_push_task(handle_push_event, payload)
 
 
-@_typed_task(celery_app, name="codesight.indexing.sync_default_branch")
+@_typed_task(
+    celery_app,
+    name="codesight.indexing.sync_default_branch",
+    soft_time_limit=_PUSH_TASK_SETTINGS.index_task_soft_time_limit_seconds,
+    time_limit=_PUSH_TASK_SETTINGS.index_task_hard_time_limit_seconds,
+)
 def sync_default_branch(payload: dict[str, Any]) -> dict[str, str]:
     """Named Celery entrypoint for incremental default-branch Qdrant synchronization."""
     return _dispatch_push_task(sync_default_branch, payload)

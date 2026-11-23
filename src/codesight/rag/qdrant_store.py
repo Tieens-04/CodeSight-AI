@@ -94,6 +94,7 @@ class QdrantZeroCodeStore:
             else cfg.qdrant_collection_name
         )
         validate_positive_int(timeout_seconds, name="timeout_seconds")
+        self._created_collection = False
 
         if client is not None:
             self._client = client
@@ -117,6 +118,11 @@ class QdrantZeroCodeStore:
     def collection_name(self) -> str:
         """Return target Qdrant collection name."""
         return self._collection_name
+
+    @property
+    def created_collection(self) -> bool:
+        """Return True iff `ensure_collection()` created this collection on the server."""
+        return self._created_collection
 
     async def aclose(self) -> None:
         """Close the underlying gRPC/HTTP client when owned by this store instance."""
@@ -160,6 +166,7 @@ class QdrantZeroCodeStore:
                         distance=models.Distance.COSINE,
                     ),
                 )
+                self._created_collection = True
             except Exception:
                 # Handle benign concurrent creation race across workers
                 if not await self._client.collection_exists(self._collection_name):

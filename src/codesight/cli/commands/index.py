@@ -34,6 +34,7 @@ from codesight.core.errors import RateLimitTaskError, RetryableTaskError
 from codesight.db.session import create_db_engine, create_session_factory
 from codesight.rag.embedder import GeminiEmbedder
 from codesight.rag.indexer import (
+    AsyncRepoIndexLock,
     IndexProgressSnapshot,
     InitialIndexReport,
     InitialRepoIndexer,
@@ -104,6 +105,8 @@ async def run_cli_index(
     *,
     branch: str | None = None,
     recreate: bool = False,
+    allow_non_default_branch: bool = False,
+    embed_code_chunks: bool | None = None,
     settings: Settings | None = None,
     http_client: httpx.AsyncClient | None = None,
     redis_client: redis_async.Redis | None = None,
@@ -115,6 +118,9 @@ async def run_cli_index(
 ) -> InitialIndexReport:
     """Execute initial repository indexing against PostgreSQL and Qdrant in RAM waves."""
     active_settings = settings if settings is not None else get_settings()
+    effective_embed_code = (
+        active_settings.index_embed_code_chunks if embed_code_chunks is None else embed_code_chunks
+    )
     owned_http: httpx.AsyncClient | None = None
     owned_redis: redis_async.Redis | None = None
     owned_engine: AsyncEngine | None = None
@@ -133,7 +139,7 @@ async def run_cli_index(
             active_http = owned_http
 
         active_redis = redis_client
-        if active_redis is None and active_settings.has_github_app_credentials:
+        if active_redis is None:
             owned_redis = redis_async.from_url(
                 active_settings.redis_url,
                 decode_responses=True,
@@ -154,8 +160,13 @@ async def run_cli_index(
 
         active_embedder = embedder
         if active_embedder is None:
-            owned_embedder = GeminiEmbedder(settings=active_settings)
-            active_embedder = owned_embedder
+            if active_settings.has_gemini_api_key:
+                owned_embedder = GeminiEmbedder(settings=active_settings)
+                active_embedder = owned_embedder
+            elif effective_embed_code:
+                raise EmbeddingConfigError(
+                    "GEMINI_API_KEY is required when embed_code_chunks=True."
+                )
 
         auth: GitHubAuthProvider | None = (
             GitHubAuthProvider(
@@ -168,14 +179,17 @@ async def run_cli_index(
             else None
         )
 
+        repo_lock = AsyncRepoIndexLock(active_redis)
         indexer = InitialRepoIndexer(
             auth_provider=auth,
             embedder=active_embedder,
             store=active_store,
             http_client=active_http,
             session_factory=active_session_factory,
+            repo_lock=repo_lock,
             base_url=api_base_url,
             allow_public_fallback=True,
+            embed_code_chunks=effective_embed_code,
         )
         try:
             return await indexer.index_repository(
@@ -183,6 +197,7 @@ async def run_cli_index(
                 ref=branch,
                 recreate=recreate,
                 persist_cursor=True,
+                allow_non_default_branch=allow_non_default_branch,
                 progress_callback=progress_callback,
             )
         finally:
@@ -206,11 +221,14 @@ async def run_cli_index(
 def render_index_report(console: Console, report: InitialIndexReport) -> None:
     """Render structured Zero-Code indexing summary Panel and metrics Table to stdout."""
     short_sha = report.commit_sha[:12]
-    cursor_label = (
-        f"[bold green]saved ({escape(short_sha)})[/bold green]"
-        if report.persisted_cursor
-        else "[yellow]not updated (non-default branch)[/yellow]"
-    )
+    if report.persisted_cursor:
+        cursor_label = f"[bold green]saved ({escape(short_sha)})[/bold green]"
+    elif report.truncated_tree:
+        cursor_label = "[bold yellow]not updated (incomplete: truncated Git tree)[/bold yellow]"
+    elif report.indexed_branch != report.default_branch:
+        cursor_label = "[yellow]not updated (non-default branch)[/yellow]"
+    else:
+        cursor_label = "[yellow]not updated (cursor not advanced)[/yellow]"
     summary_lines = [
         f"[bold cyan]{escape(report.repo_full_name)}[/bold cyan] "
         f"([green]{escape(report.indexed_branch)}[/green] @ [dim]{escape(short_sha)}[/dim])",
@@ -253,6 +271,22 @@ def index_command(
         "--recreate",
         help="Delete existing Qdrant points for this repository before indexing from scratch.",
     ),
+    allow_non_default_branch: bool = typer.Option(
+        False,
+        "--allow-non-default-branch",
+        help=(
+            "Allow indexing a non-default branch via `--branch`. "
+            "Non-default runs skip PostgreSQL cursor updates and stale pruning."
+        ),
+    ),
+    embed_code_chunks: bool | None = typer.Option(
+        None,
+        "--embed-code-chunks/--no-embed-code-chunks",
+        help=(
+            "Embed AST code chunks via Gemini instead of using zero-API placeholder vectors "
+            "(defaults to INDEX_EMBED_CODE_CHUNKS)."
+        ),
+    ),
 ) -> None:
     """Index a GitHub repository into Qdrant (Zero-Code) and save last_indexed_sha in Postgres."""
     err_console = Console(file=sys.stderr, soft_wrap=True)
@@ -264,7 +298,7 @@ def index_command(
         raise typer.Exit(code=2) from exc
 
     settings = get_settings()
-    if settings.gemini_api_key is None or not settings.gemini_api_key.get_secret_value().strip():
+    if not settings.has_gemini_api_key:
         err_console.print(
             "[red]Missing configuration:[/red] Set [bold]GEMINI_API_KEY[/bold] in `.env` "
             "before running `codesight index`."
@@ -301,6 +335,8 @@ def index_command(
                     repo_slug,
                     branch=branch,
                     recreate=recreate,
+                    allow_non_default_branch=allow_non_default_branch,
+                    embed_code_chunks=embed_code_chunks,
                     settings=settings,
                     progress_callback=_on_progress,
                 )
@@ -335,6 +371,13 @@ def index_command(
 
     out_console = Console(file=sys.stdout)
     render_index_report(out_console, report)
+    if report.truncated_tree:
+        err_console.print(
+            f"[red]Incomplete index:[/red] Git tree for '{escape(report.repo_full_name)}' @ "
+            f"{escape(report.commit_sha[:12])} remained truncated after subtree traversal; "
+            "PostgreSQL `last_indexed_sha` was preserved."
+        )
+        raise typer.Exit(code=1)
     logger.debug(
         "cli_index_completed",
         repo=report.repo_full_name,

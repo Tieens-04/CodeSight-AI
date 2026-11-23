@@ -78,6 +78,7 @@ class _InMemoryZeroCodeStore:
     """In-memory fake matching QdrantZeroCodeStore's tenant-scoped contract."""
 
     points: dict[str, dict[str, Any]] = field(default_factory=dict)
+    vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
     ensured_calls: int = 0
     delete_by_repo_calls: int = 0
     delete_by_file_calls: list[tuple[tuple[str, ...], frozenset[str]]] = field(default_factory=list)
@@ -126,6 +127,7 @@ class _InMemoryZeroCodeStore:
     async def upsert_points(self, points: Sequence[QdrantZeroCodePoint]) -> int:
         for pt in points:
             self.points[pt.point_id] = dict(pt.payload)
+            self.vectors[pt.point_id] = tuple(pt.vector)
         return len(points)
 
     async def list_repo_point_refs(
@@ -261,7 +263,16 @@ class _FakeRedisLockClient:
         self.store[key] = value
         return True
 
-    async def eval(self, _script: str, _numkeys: int, key: str, token: str) -> int:
+    async def eval(
+        self,
+        script: str,
+        _numkeys: int,
+        key: str,
+        token: str,
+        *_args: Any,
+    ) -> int:
+        if "expire" in script.lower():
+            return 1 if self.store.get(key) == token else 0
         if self.store.get(key) == token:
             del self.store[key]
             return 1
@@ -948,8 +959,11 @@ async def test_blob_edge_cases_subchunk_snippet_identical_compare_and_lock_fallb
         async def set(self, *_args: Any, **_kwargs: Any) -> bool:
             raise redis.exceptions.ConnectionError("redis down")
 
-    async with AsyncRepoIndexLock(_BrokenRedis()).hold("repo-broken"):  # type: ignore[arg-type]
-        pass
+    entered_broken = False
+    with pytest.raises(RetryableTaskError):
+        async with AsyncRepoIndexLock(_BrokenRedis()).hold("repo-broken"):  # type: ignore[arg-type]
+            entered_broken = True
+    assert entered_broken is False
 
     # 2. Blob client handles 404, oversize, bad base64, transport error, and long sub-chunk snippet
     long_py_lines = ["def giant_func(x: int) -> int:"]
@@ -1025,6 +1039,7 @@ async def test_blob_edge_cases_subchunk_snippet_identical_compare_and_lock_fallb
             store=store,  # type: ignore[arg-type]
             repo_client=repo_client,
             http_client=http,
+            embed_code_chunks=True,
         )
         rep = await indexer.index_repository("acme/sub", repo_id="r-sub")
         assert rep.code_chunks >= 2
@@ -1085,7 +1100,7 @@ async def test_push_sync_runner_failure_classification_and_celery_entrypoint(
         await runner.execute(payload, is_final_attempt=True)
     assert recorded_statuses == ["failed"]
 
-    # CancelledError marks webhook failed
+    # CancelledError defers without marking failed on retry; marks failed only on final attempt
     async def _raise_cancel(*_args: Any, **_kwargs: Any) -> Any:
         raise asyncio.CancelledError()
 
@@ -1094,7 +1109,10 @@ async def test_push_sync_runner_failure_classification_and_celery_entrypoint(
         _raise_cancel,
     )
     with pytest.raises(asyncio.CancelledError):
-        await runner.execute(payload)
+        await runner.execute(payload, is_final_attempt=False)
+    assert recorded_statuses == ["failed"]
+    with pytest.raises(asyncio.CancelledError):
+        await runner.execute(payload, is_final_attempt=True)
     assert recorded_statuses == ["failed", "failed"]
 
     # Dev stub on sync_default_branch and run_push_webhook_task
@@ -1175,7 +1193,9 @@ async def test_f01_out_of_order_diverged_push_and_non_default_ref_guard() -> Non
         )
 
         # Seed index at live main HEAD sha_B
-        await indexer.index_repository("acme/f01", ref="sha_B", repo_id="r-f01")
+        await indexer.index_repository(
+            "acme/f01", ref="sha_B", repo_id="r-f01", is_default_branch_target=True
+        )
         assert {p["symbol_name"] for p in store.points.values()} == {"live_b"}
 
         # 1. Late retry of sha_A returning "diverged" while main HEAD is still sha_B -> skip!
@@ -1458,7 +1478,7 @@ async def test_f03_upsert_repository_state_handles_recreated_and_renamed_collisi
     factory = lambda: _FakeSession()  # noqa: E731
 
     # 1. Repo 200 renamed from acme/old-slug -> acme/api while stale repo 100 still holds acme/api
-    renamed_id, renamed_sha = await upsert_repository_state(
+    renamed_id, renamed_updated = await upsert_repository_state(
         factory,  # type: ignore[arg-type]
         full_name="acme/api",
         default_branch="main",
@@ -1466,11 +1486,12 @@ async def test_f03_upsert_repository_state_handles_recreated_and_renamed_collisi
         last_indexed_sha="sha_200_new",
     )
     assert renamed_id == str(rows[1].id)
-    assert renamed_sha == "sha_200_new"
+    assert renamed_updated is True
+    assert rows[1].last_indexed_sha == "sha_200_new"
     assert rows[0].full_name == "acme/api__stale_100"
 
     # 2. Recreated repo: same slug acme/api gets brand-new github_repo_id=300
-    new_id, new_sha = await upsert_repository_state(
+    new_id, new_updated = await upsert_repository_state(
         factory,  # type: ignore[arg-type]
         full_name="acme/api",
         default_branch="main",
@@ -1478,7 +1499,8 @@ async def test_f03_upsert_repository_state_handles_recreated_and_renamed_collisi
         last_indexed_sha="sha_300_new",
     )
     assert new_id != str(rows[1].id)
-    assert new_sha == "sha_300_new"
+    assert new_updated is True
+    assert rows[2].last_indexed_sha == "sha_300_new"
     assert rows[1].full_name == "acme/api__stale_200"
 
 
@@ -1790,7 +1812,16 @@ async def test_f08_cli_non_default_branch_isolation_recreate_guard_and_owned_cle
             http_client=http,
         )
         await indexer.index_repository("acme/branch", repo_id="r-b1")
-        feat_rep = await indexer.index_repository("acme/branch", ref="feat/demo", repo_id="r-b1")
+        with pytest.raises(ValueError, match="non-default branch"):
+            await indexer.index_repository("acme/branch", ref="feat/demo", repo_id="r-b1")
+        assert {p["symbol_name"] for p in store.points.values()} == {"main_only"}
+
+        feat_rep = await indexer.index_repository(
+            "acme/branch",
+            ref="feat/demo",
+            repo_id="r-b1",
+            allow_non_default_branch=True,
+        )
         assert feat_rep.persisted_cursor is False
         assert feat_rep.stale_points_deleted == 0
         assert {p["symbol_name"] for p in store.points.values()} == {"main_only", "feat_only"}
@@ -2191,7 +2222,10 @@ async def test_fr02_recreated_repo_rotates_qdrant_repo_id_and_skips_stale_repo_p
 
         # Exercise non-default branch indexing & direct read_repository_state helper
         feat_rep = await indexer.index_repository(
-            "acme/api", ref="feat/check", repo_id=str(new_row.id)
+            "acme/api",
+            ref="feat/check",
+            repo_id=str(new_row.id),
+            allow_non_default_branch=True,
         )
         assert feat_rep.persisted_cursor is False
         assert await read_repository_state(
@@ -2231,3 +2265,1680 @@ async def test_fr02_recreated_repo_rotates_qdrant_repo_id_and_skips_stale_repo_p
                     repo_id=str(old_uuid),
                 )
         assert lock_exc.value.retry_after_seconds == 15.0
+
+
+async def test_indexer_isolates_zerocode_guard_errors_per_file_and_skipped_guard_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.ast_engine.models import CodeSymbolChunk, ParsedASTFile
+    from codesight.ast_engine.registry import ASTParserRegistry
+    from codesight.rag import indexer as indexer_mod
+
+    blobs: dict[str, bytes] = {
+        "sha_good1": b"def good_one() -> int:\n    return 1\n",
+        "sha_bad_v1": b"def old_leaky() -> int:\n    return 0\n",
+        "sha_bad_v2": b"def bad_leaky() -> int:\n    return 99\n",
+        "sha_good2": b"def good_two() -> int:\n    return 2\n",
+        "sha_good3": b"def good_three() -> int:\n    return 3\n",
+    }
+    tree_entries = [
+        {"path": "src/good1.py", "mode": "100644", "type": "blob", "sha": "sha_good1", "size": 36},
+        {"path": "src/leaky.py", "mode": "100644", "type": "blob", "sha": "sha_bad_v2", "size": 37},
+        {"path": "src/good2.py", "mode": "100644", "type": "blob", "sha": "sha_good2", "size": 36},
+    ]
+    current_sha = "sha_head_guard"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/guard":
+            return httpx.Response(
+                200,
+                json={"id": 77, "full_name": "acme/guard", "default_branch": "main"},
+            )
+        if path.startswith("/repos/acme/guard/commits/"):
+            return httpx.Response(200, json={"sha": current_sha})
+        if path.startswith("/repos/acme/guard/contents/.codesight."):
+            return httpx.Response(404)
+        if path.startswith("/repos/acme/guard/git/trees/"):
+            return httpx.Response(
+                200,
+                json={"sha": current_sha, "truncated": False, "tree": tree_entries},
+            )
+        if path.startswith("/repos/acme/guard/git/blobs/"):
+            sha = path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={"sha": sha, "encoding": "base64", "content": _b64(blobs[sha])},
+            )
+        if "/compare/" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ahead",
+                    "total_commits": 1,
+                    "files": [
+                        {"filename": "src/good1.py", "status": "modified", "sha": "sha_good1"},
+                        {"filename": "src/leaky.py", "status": "modified", "sha": "sha_bad_v2"},
+                        {"filename": "src/good3.py", "status": "added", "sha": "sha_good3"},
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    orig_parse_file = ASTParserRegistry.parse_file
+
+    def _inject_leaky_parse(
+        self: ASTParserRegistry,
+        source: str | bytes,
+        *,
+        file_path: str,
+    ) -> ParsedASTFile | None:
+        if file_path == "src/leaky.py":
+            return ParsedASTFile(
+                file_path=file_path,
+                language="python",
+                imports=(),
+                chunks=(
+                    CodeSymbolChunk(
+                        file_path=file_path,
+                        language="python",
+                        symbol_name="bad_leaky",
+                        qualified_name="bad_leaky",
+                        symbol_kind="function",
+                        start_line=1,
+                        end_line=2,
+                        signature="def bad_leaky(): return secret_token",
+                    ),
+                ),
+            )
+        return orig_parse_file(self, source, file_path=file_path)
+
+    monkeypatch.setattr(ASTParserRegistry, "parse_file", _inject_leaky_parse)
+
+    persisted_shas: list[str | None] = []
+
+    async def _fake_upsert_repository_state(
+        _session_factory: Any,
+        *,
+        full_name: str,
+        default_branch: str,
+        github_repo_id: int | None = None,
+        installation_id: int | None = None,
+        last_indexed_sha: str | None = None,
+        expected_previous_sha: Any = None,
+    ) -> tuple[str, bool]:
+        persisted_shas.append(last_indexed_sha)
+        return "repo-guard-1", last_indexed_sha is not None
+
+    async def _fake_read_sync_state(*_args: Any, **_kwargs: Any) -> Any:
+        return indexer_mod._RepositorySyncState(
+            repo_id="repo-guard-1",
+            last_indexed_sha=current_sha,
+            default_branch="main",
+            installation_id=None,
+            is_stale_conflict=False,
+        )
+
+    monkeypatch.setattr(indexer_mod, "upsert_repository_state", _fake_upsert_repository_state)
+    monkeypatch.setattr(indexer_mod, "_read_repository_sync_state", _fake_read_sync_state)
+
+    settings = _make_settings()
+    fake_genai = _FakeGenAIClient()
+    store = _InMemoryZeroCodeStore()
+    # Seed a stale point for src/leaky.py so we verify it gets pruned on guard skip
+    store.points["00000000-0000-5000-8000-000000000999"] = {
+        "repo_id": "repo-guard-1",
+        "repo_full_name": "acme/guard",
+        "file_path": "src/leaky.py",
+        "blob_sha": "sha_bad_v1",
+        "symbol_name": "old_leaky",
+    }
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(settings, http_client=http)
+        embedder = GeminiEmbedder(client=fake_genai)  # type: ignore[arg-type]
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+
+        report = await indexer.index_repository("acme/guard", repo_id="repo-guard-1")
+        assert report.skipped_guard_files == 1
+        assert report.persisted_cursor is True
+        assert persisted_shas[-1] == current_sha
+        assert {p["symbol_name"] for p in store.points.values()} == {"good_one", "good_two"}
+
+        # Incremental compare path also isolates guard failures per file and prunes stale points
+        store.points["00000000-0000-5000-8000-000000000998"] = {
+            "repo_id": "repo-guard-1",
+            "repo_full_name": "acme/guard",
+            "file_path": "src/leaky.py",
+            "blob_sha": "sha_bad_v1",
+            "symbol_name": "old_leaky",
+        }
+        syncer = IncrementalBranchSyncer(
+            initial_indexer=indexer,
+            repo_client=indexer.repo_client,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+        sync_report = await syncer.sync_push(
+            repo_full_name="acme/guard",
+            after_sha="sha_next_guard",
+            last_indexed_sha=current_sha,
+            repo_id="repo-guard-1",
+        )
+        assert sync_report.mode == "incremental_compare"
+        assert sync_report.skipped_guard_files == 1
+        assert sync_report.indexed_files == 2
+        assert sync_report.persisted_cursor is True
+        assert persisted_shas[-1] == "sha_next_guard"
+        assert {p["symbol_name"] for p in store.points.values()} == {
+            "good_one",
+            "good_two",
+            "good_three",
+        }
+
+
+async def test_placeholder_vector_default_skips_code_gemini_calls_and_embeds_docs_only() -> None:
+    from codesight.rag.models import CODE_CHUNK_PLACEHOLDER_VECTOR
+
+    blobs: dict[str, bytes] = {
+        "sha_py_1": b"def py_one() -> int:\n    return 1\n",
+        "sha_py_1_v2": b"def py_one_v2() -> int:\n    return 10\n",
+        "sha_py_2": b"def py_two() -> int:\n    return 2\n",
+        "sha_py_3": b"def py_three() -> int:\n    return 3\n",
+        "sha_ts_1": b"export function tsOne(): number { return 1; }\n",
+        "sha_tsx_1": b"export function TsxComp(): string { return 'ok'; }\n",
+        "sha_doc_1": b"# Architecture\n## ADR 001\nZero-Code persistence invariant.\n",
+    }
+    tree_entries = [
+        {"path": "src/one.py", "mode": "100644", "type": "blob", "sha": "sha_py_1", "size": 32},
+        {"path": "src/two.py", "mode": "100644", "type": "blob", "sha": "sha_py_2", "size": 32},
+        {"path": "src/three.py", "mode": "100644", "type": "blob", "sha": "sha_py_3", "size": 34},
+        {"path": "web/one.ts", "mode": "100644", "type": "blob", "sha": "sha_ts_1", "size": 46},
+        {"path": "web/comp.tsx", "mode": "100644", "type": "blob", "sha": "sha_tsx_1", "size": 50},
+        {
+            "path": "docs/adr/001.md",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "sha_doc_1",
+            "size": len(blobs["sha_doc_1"]),
+        },
+    ]
+    current_tree = list(tree_entries)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/placeholder":
+            return httpx.Response(
+                200,
+                json={"id": 501, "full_name": "acme/placeholder", "default_branch": "main"},
+            )
+        if path.startswith("/repos/acme/placeholder/commits/"):
+            return httpx.Response(200, json={"sha": "sha_main_1"})
+        if path.startswith("/repos/acme/placeholder/contents/.codesight."):
+            return httpx.Response(404)
+        if path.startswith("/repos/acme/placeholder/git/trees/"):
+            return httpx.Response(
+                200, json={"sha": "sha_main_1", "truncated": False, "tree": current_tree}
+            )
+        if path.startswith("/repos/acme/placeholder/git/blobs/"):
+            sha = path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200, json={"sha": sha, "encoding": "base64", "content": _b64(blobs[sha])}
+            )
+        if "/compare/" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ahead",
+                    "total_commits": 1,
+                    "files": [
+                        {"filename": "src/one.py", "status": "modified", "sha": "sha_py_1_v2"},
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    settings = _make_settings()
+    fake_genai = _FakeGenAIClient()
+    store = _InMemoryZeroCodeStore()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(settings, http_client=http)
+        embedder = GeminiEmbedder(client=fake_genai)  # type: ignore[arg-type]
+
+        # 1. Mixed repo (5 code + 1 architecture_doc) -> Gemini receives ONLY architecture_doc
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+        )
+        rep = await indexer.index_repository("acme/placeholder", repo_id="r-ph")
+        assert rep.code_chunks == 5
+        assert rep.doc_chunks >= 1
+        assert rep.embedded_points == rep.doc_chunks
+        assert rep.upserted_points == rep.code_chunks + rep.doc_chunks
+        assert fake_genai.batch_calls == 1
+        assert all("ADR 001" in txt or "Architecture" in txt for txt in fake_genai.embedded_inputs)
+        assert not any("py_one" in txt or "tsOne" in txt for txt in fake_genai.embedded_inputs)
+
+        for pid, payload in store.points.items():
+            if payload["chunk_type"] == "code":
+                assert store.vectors[pid] == CODE_CHUNK_PLACEHOLDER_VECTOR
+            else:
+                assert store.vectors[pid] != CODE_CHUNK_PLACEHOLDER_VECTOR
+
+        # 2. Code-only repo -> 0 Gemini calls and works with embedder=None
+        current_tree[:] = tree_entries[:5]
+        store.points.clear()
+        store.vectors.clear()
+        fake_genai.batch_calls = 0
+        fake_genai.embedded_inputs.clear()
+
+        no_key_indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+        )
+        code_only_rep = await no_key_indexer.index_repository("acme/placeholder", repo_id="r-ph")
+        assert code_only_rep.code_chunks == 5
+        assert code_only_rep.doc_chunks == 0
+        assert code_only_rep.embedded_points == 0
+        assert code_only_rep.upserted_points == 5
+        assert fake_genai.batch_calls == 0
+
+        # Code-only IncrementalBranchSyncer also works with embedder=None
+        no_key_syncer = IncrementalBranchSyncer(
+            initial_indexer=no_key_indexer,
+            repo_client=no_key_indexer.repo_client,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+        )
+        sync_rep = await no_key_syncer.sync_push(
+            repo_full_name="acme/placeholder",
+            after_sha="sha_main_2",
+            last_indexed_sha="sha_main_1",
+            repo_id="r-ph",
+        )
+        assert sync_rep.mode == "incremental_compare"
+        assert sync_rep.upserted_points == 1
+
+        # 3. embedder=None raises EmbeddingConfigError on docs or embed_code_chunks=True
+        current_tree[:] = tree_entries
+        with pytest.raises(EmbeddingConfigError):
+            await no_key_indexer.index_repository("acme/placeholder", repo_id="r-ph")
+
+        opt_in_no_key = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            embed_code_chunks=True,
+        )
+        with pytest.raises(EmbeddingConfigError):
+            await opt_in_no_key.index_repository("acme/placeholder", repo_id="r-ph")
+
+
+async def test_cli_embed_code_chunks_flag_and_worker_no_gemini_key_code_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.cli.commands.index import run_cli_index
+
+    captured_kwargs: list[dict[str, Any]] = []
+
+    class _FakeOwnedHttp:
+        async def aclose(self) -> None:
+            return None
+
+    class _FakeOwnedEngine:
+        async def dispose(self) -> None:
+            return None
+
+    class _FakeOwnedStore:
+        async def aclose(self) -> None:
+            return None
+
+    class _FakeIndexer:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.append(kwargs)
+
+        async def index_repository(self, *_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                repo_full_name="acme/flag",
+                repo_id="r-flag",
+                default_branch="main",
+                indexed_branch="main",
+                commit_sha="1" * 40,
+                tree_entries=1,
+                eligible_files=1,
+                unchanged_files_skipped=0,
+                fetched_files=1,
+                skipped_files=0,
+                code_chunks=1,
+                doc_chunks=0,
+                embedded_points=0,
+                upserted_points=1,
+                stale_points_deleted=0,
+                persisted_cursor=True,
+                truncated_tree=False,
+                elapsed_ms=5.0,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "codesight.cli.commands.index.httpx.AsyncClient", lambda **_k: _FakeOwnedHttp()
+    )
+    monkeypatch.setattr(
+        "codesight.cli.commands.index.create_db_engine", lambda _s: _FakeOwnedEngine()
+    )
+    monkeypatch.setattr("codesight.cli.commands.index.create_session_factory", lambda _e: object())
+    monkeypatch.setattr(
+        "codesight.cli.commands.index.QdrantZeroCodeStore", lambda **_k: _FakeOwnedStore()
+    )
+    monkeypatch.setattr("codesight.cli.commands.index.InitialRepoIndexer", _FakeIndexer)
+
+    # Code-only run_cli_index without GEMINI_API_KEY defaults embedder=None, embed_code_chunks=False
+    await run_cli_index("acme/flag", settings=_make_settings(gemini_key=""))
+    assert captured_kwargs[-1]["embedder"] is None
+    assert captured_kwargs[-1]["embed_code_chunks"] is False
+
+    # Passing embed_code_chunks=True without GEMINI_API_KEY fails fast
+    with pytest.raises(EmbeddingConfigError):
+        await run_cli_index(
+            "acme/flag",
+            embed_code_chunks=True,
+            settings=_make_settings(gemini_key=""),
+        )
+
+    # Worker push sync with github_token set and gemini_key="" runs PushSyncRunner in dev/CI
+    runner_calls: list[tuple[Any, bool]] = []
+
+    class _FakePushSyncRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            runner_calls.append(
+                (kwargs.get("embedder"), kwargs["settings"].index_embed_code_chunks)
+            )
+
+        async def execute(self, _payload: Any, *, is_final_attempt: bool = False) -> dict[str, str]:
+            return {"status": "completed", "mode": "incremental_compare", "trace_id": "t-no-gem"}
+
+    monkeypatch.setattr("codesight.worker.tasks.indexing_tasks.PushSyncRunner", _FakePushSyncRunner)
+    push_res = await run_push_webhook_task(
+        {
+            "repo_id": str(uuid.uuid4()),
+            "repo_full_name": "acme/flag",
+            "after_sha": "abc1234",
+        },
+        settings=_make_settings(gemini_key=""),
+    )
+    assert push_res["status"] == "completed"
+    assert runner_calls == [(None, False)]
+
+    # PushSyncRunner.execute without GEMINI_API_KEY leaves embedder=None when opt-in is False,
+    # and raises EmbeddingConfigError when index_embed_code_chunks=True.
+    monkeypatch.undo()
+    observed_syncer_kwargs: list[dict[str, Any]] = []
+
+    class _FakeSyncer:
+        def __init__(self, **kwargs: Any) -> None:
+            observed_syncer_kwargs.append(kwargs)
+
+        async def sync_push(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                mode="incremental_compare",
+                changed_files=1,
+                upserted_points=1,
+                elapsed_ms=2.0,
+            )
+
+    monkeypatch.setattr(
+        "codesight.worker.tasks.indexing_tasks.IncrementalBranchSyncer", _FakeSyncer
+    )
+    no_gem_runner = PushSyncRunner(
+        settings=_make_settings(gemini_key=""),
+        http_client=SimpleNamespace(),  # type: ignore[arg-type]
+        redis_client=SimpleNamespace(),  # type: ignore[arg-type]
+        store=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    exec_res = await no_gem_runner.execute(
+        {
+            "repo_id": str(uuid.uuid4()),
+            "repo_full_name": "acme/flag",
+            "after_sha": "abc1234",
+        }
+    )
+    assert exec_res["status"] == "completed"
+    assert observed_syncer_kwargs[-1]["embedder"] is None
+    assert observed_syncer_kwargs[-1]["embed_code_chunks"] is False
+
+    opt_in_runner = PushSyncRunner(
+        settings=Settings(
+            _env_file=None,
+            github_token=SecretStr("ghp_test"),
+            gemini_api_key=None,
+            index_embed_code_chunks=True,
+        ),
+        http_client=SimpleNamespace(),  # type: ignore[arg-type]
+        redis_client=SimpleNamespace(),  # type: ignore[arg-type]
+        store=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(EmbeddingConfigError):
+        await opt_in_runner.execute(
+            {
+                "repo_id": str(uuid.uuid4()),
+                "repo_full_name": "acme/flag",
+                "after_sha": "abc1234",
+            }
+        )
+
+
+def test_cli_embed_code_chunks_flag_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli_calls: list[bool | None] = []
+
+    async def _capture_cli_run(*_args: Any, **kwargs: Any) -> Any:
+        cli_calls.append(kwargs.get("embed_code_chunks"))
+        return SimpleNamespace(
+            repo_full_name="acme/flag",
+            repo_id="r-flag",
+            default_branch="main",
+            indexed_branch="main",
+            commit_sha="1" * 40,
+            tree_entries=1,
+            eligible_files=1,
+            unchanged_files_skipped=0,
+            fetched_files=1,
+            skipped_files=0,
+            code_chunks=1,
+            doc_chunks=0,
+            embedded_points=1,
+            upserted_points=1,
+            stale_points_deleted=0,
+            persisted_cursor=True,
+            truncated_tree=False,
+            elapsed_ms=5.0,
+        )
+
+    monkeypatch.setattr("codesight.cli.commands.index.get_settings", lambda: _make_settings())
+    monkeypatch.setattr("codesight.cli.commands.index.run_cli_index", _capture_cli_run)
+    runner = CliRunner()
+    res_on = runner.invoke(cli_app, ["index", "acme/flag", "--embed-code-chunks"])
+    assert res_on.exit_code == 0
+    res_off = runner.invoke(cli_app, ["index", "acme/flag", "--no-embed-code-chunks"])
+    assert res_off.exit_code == 0
+    assert cli_calls == [True, False]
+
+
+async def test_non_default_branch_guard_blocks_before_qdrant_and_cli_forwards_flag() -> None:
+    feat_src = b"def feature_only() -> int:\n    return 7\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/guard-branch":
+            return httpx.Response(
+                200, json={"id": 911, "full_name": "acme/guard-branch", "default_branch": "main"}
+            )
+        if path.endswith("/commits/feat/demo") or path.endswith("/commits/feat%2Fdemo"):
+            return httpx.Response(200, json={"sha": "sha_feat_911"})
+        if path.startswith("/repos/acme/guard-branch/contents/.codesight."):
+            return httpx.Response(404)
+        if path.endswith("/git/trees/sha_feat_911"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "sha_feat_911",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "src/feat.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "b_feat_911",
+                            "size": len(feat_src),
+                        }
+                    ],
+                },
+            )
+        if path.endswith("/git/blobs/b_feat_911"):
+            return httpx.Response(
+                200, json={"sha": "b_feat_911", "encoding": "base64", "content": _b64(feat_src)}
+            )
+        return httpx.Response(404)
+
+    settings = _make_settings()
+    store = _InMemoryZeroCodeStore()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(settings, http_client=http)
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+        )
+        with pytest.raises(ValueError, match="non-default branch"):
+            await indexer.index_repository("acme/guard-branch", ref="feat/demo", repo_id="r-gb")
+        assert store.points == {}
+
+        report = await indexer.index_repository(
+            "acme/guard-branch",
+            ref="feat/demo",
+            repo_id="r-gb",
+            allow_non_default_branch=True,
+        )
+        assert report.persisted_cursor is False
+        assert {p["symbol_name"] for p in store.points.values()} == {"feature_only"}
+
+
+def test_cli_allow_non_default_branch_flag_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forwarded_flags: list[bool | None] = []
+
+    async def _capture_cli(*_args: Any, **kwargs: Any) -> Any:
+        forwarded_flags.append(kwargs.get("allow_non_default_branch"))
+        return SimpleNamespace(
+            repo_full_name="acme/guard-branch",
+            repo_id="r-gb",
+            default_branch="main",
+            indexed_branch="feat/demo",
+            commit_sha="1" * 40,
+            tree_entries=1,
+            eligible_files=1,
+            unchanged_files_skipped=0,
+            fetched_files=1,
+            skipped_files=0,
+            code_chunks=1,
+            doc_chunks=0,
+            embedded_points=0,
+            upserted_points=1,
+            stale_points_deleted=0,
+            persisted_cursor=False,
+            truncated_tree=False,
+            elapsed_ms=4.0,
+        )
+
+    monkeypatch.setattr("codesight.cli.commands.index.get_settings", lambda: _make_settings())
+    monkeypatch.setattr("codesight.cli.commands.index.run_cli_index", _capture_cli)
+    cli_runner = CliRunner()
+    res_default = cli_runner.invoke(
+        cli_app, ["index", "acme/guard-branch", "--branch", "feat/demo"]
+    )
+    assert res_default.exit_code == 0
+    res_allow = cli_runner.invoke(
+        cli_app,
+        ["index", "acme/guard-branch", "--branch", "feat/demo", "--allow-non-default-branch"],
+    )
+    assert res_allow.exit_code == 0
+    assert forwarded_flags == [False, True]
+
+
+async def test_async_repo_index_lock_renew_extends_ttl_and_stops_when_token_replaced() -> None:
+    import asyncio
+    import io
+    import json
+
+    from codesight.core.logging import configure_logging
+
+    class _TTLTrackingRedis:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+            self.ttls: dict[str, int] = {}
+            self.renew_attempts: list[tuple[str, str, int, int]] = []
+
+        async def set(
+            self,
+            key: str,
+            value: str,
+            *,
+            nx: bool = False,
+            ex: int | None = None,
+        ) -> bool:
+            if nx and key in self.store:
+                return False
+            self.store[key] = value
+            if ex is not None:
+                self.ttls[key] = ex
+            return True
+
+        async def eval(
+            self,
+            script: str,
+            _numkeys: int,
+            key: str,
+            token: str,
+            *args: Any,
+        ) -> int:
+            lowered = script.lower()
+            if "expire" in lowered:
+                ttl_val = int(args[0])
+                if self.store.get(key) == token:
+                    self.ttls[key] = ttl_val
+                    self.renew_attempts.append((key, token, ttl_val, 1))
+                    return 1
+                self.renew_attempts.append((key, token, ttl_val, 0))
+                return 0
+            if self.store.get(key) == token:
+                del self.store[key]
+                self.ttls.pop(key, None)
+                return 1
+            return 0
+
+    log_buf = io.StringIO()
+    configure_logging(level="INFO", service_name="codesight-test", stream=log_buf)
+    try:
+        redis_client = _TTLTrackingRedis()
+        lock = AsyncRepoIndexLock(
+            redis_client,  # type: ignore[arg-type]
+            ttl_seconds=3,
+            acquire_timeout_seconds=0.1,
+            poll_interval_seconds=0.01,
+        )
+
+        async with lock.hold("repo:1"):
+            assert redis_client.ttls["repo_index_lock:repo:1"] == 3
+            redis_client.ttls["repo_index_lock:repo:1"] = 1
+            await asyncio.sleep(2.25)
+            assert len([call for call in redis_client.renew_attempts if call[3] == 1]) >= 2
+            assert redis_client.ttls["repo_index_lock:repo:1"] == 3
+
+        assert "repo_index_lock:repo:1" not in redis_client.store
+
+        # Replaced token must NEVER be renewed or released and logs repo_index_lock_ownership_lost
+        redis_client.renew_attempts.clear()
+        async with lock.hold("repo:1"):
+            await asyncio.sleep(0.1)
+            redis_client.store["repo_index_lock:repo:1"] = "replaced-owner-token"
+            redis_client.ttls["repo_index_lock:repo:1"] = 99
+            await asyncio.sleep(1.2)
+            assert redis_client.ttls["repo_index_lock:repo:1"] == 99
+            assert any(call[3] == 0 for call in redis_client.renew_attempts)
+
+        assert redis_client.store.get("repo_index_lock:repo:1") == "replaced-owner-token"
+        assert redis_client.ttls.get("repo_index_lock:repo:1") == 99
+
+        events = [json.loads(line) for line in log_buf.getvalue().strip().splitlines()]
+        assert any(
+            e.get("event") == "repo_index_lock_ownership_lost" and e.get("level") == "warning"
+            for e in events
+        )
+
+        # Unexpected exception in heartbeat (e.g., RuntimeError/TypeError) never masks body outcome
+        class _ExplodingHeartbeatRedis:
+            def __init__(self) -> None:
+                self.store: dict[str, str] = {}
+
+            async def set(
+                self,
+                key: str,
+                value: str,
+                *,
+                nx: bool = False,
+                ex: int | None = None,
+            ) -> bool:
+                if nx and key in self.store:
+                    return False
+                self.store[key] = value
+                return True
+
+            async def eval(
+                self,
+                script: str,
+                _numkeys: int,
+                key: str,
+                token: str,
+                *_args: Any,
+            ) -> int:
+                if "expire" in script.lower():
+                    raise RuntimeError("closed redis transport")
+                if self.store.get(key) == token:
+                    del self.store[key]
+                    return 1
+                return 0
+
+        exploding_redis = _ExplodingHeartbeatRedis()
+        exploding_lock = AsyncRepoIndexLock(
+            exploding_redis,  # type: ignore[arg-type]
+            ttl_seconds=1,
+            acquire_timeout_seconds=0.1,
+            poll_interval_seconds=0.01,
+        )
+        body_completed = False
+        async with exploding_lock.hold("repo:boom"):
+            await asyncio.sleep(0.7)
+            body_completed = True
+        assert body_completed is True
+        assert "repo_index_lock:repo:boom" not in exploding_redis.store
+
+        with pytest.raises(ValueError, match="body-failure"):
+            async with exploding_lock.hold("repo:boom2"):
+                await asyncio.sleep(0.7)
+                raise ValueError("body-failure")
+        assert "repo_index_lock:repo:boom2" not in exploding_redis.store
+    finally:
+        configure_logging()
+
+
+async def test_run_cli_index_contends_on_lock_and_syncer_fallback_avoids_self_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.cli.commands.index import run_cli_index
+
+    redis_client = _FakeRedisLockClient()
+    active_lock = AsyncRepoIndexLock(
+        redis_client,  # type: ignore[arg-type]
+        ttl_seconds=60,
+        acquire_timeout_seconds=0.05,
+        poll_interval_seconds=0.01,
+    )
+    monkeypatch.setattr("codesight.rag.indexer.DEFAULT_LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.05)
+
+    # 1. run_cli_index contends when a concurrent push sync holds repo_index_lock:acme/contend
+    async with active_lock.hold("acme/contend"):
+        with pytest.raises(RetryableTaskError, match="busy"):
+            await run_cli_index(
+                "Acme/Contend",
+                settings=_make_settings(),
+                http_client=httpx.AsyncClient(
+                    transport=httpx.MockTransport(lambda _r: httpx.Response(404))
+                ),
+                redis_client=redis_client,  # type: ignore[arg-type]
+                session_factory=object(),  # type: ignore[arg-type]
+                store=_InMemoryZeroCodeStore(),  # type: ignore[arg-type]
+                embedder=None,
+            )
+
+    # 2. IncrementalBranchSyncer holding the same AsyncRepoIndexLock during full bootstrap
+    #    must not deadlock when calling InitialRepoIndexer.index_repository(...)
+    src_bytes = b"def bootstrap_ok() -> int:\n    return 42\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/boot":
+            return httpx.Response(
+                200, json={"id": 424, "full_name": "acme/boot", "default_branch": "main"}
+            )
+        if path.startswith("/repos/acme/boot/commits/"):
+            return httpx.Response(200, json={"sha": "sha_boot_1"})
+        if path.startswith("/repos/acme/boot/contents/.codesight."):
+            return httpx.Response(404)
+        if path.startswith("/repos/acme/boot/git/trees/"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "sha_boot_1",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "src/boot.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "b_boot",
+                            "size": len(src_bytes),
+                        }
+                    ],
+                },
+            )
+        if path.startswith("/repos/acme/boot/git/blobs/b_boot"):
+            return httpx.Response(
+                200, json={"sha": "b_boot", "encoding": "base64", "content": _b64(src_bytes)}
+            )
+        return httpx.Response(404)
+
+    store = _InMemoryZeroCodeStore()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            repo_lock=active_lock,
+        )
+        syncer = IncrementalBranchSyncer(
+            initial_indexer=indexer,
+            repo_client=indexer.repo_client,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            lock=active_lock,
+        )
+        boot_report = await syncer.sync_push(
+            repo_full_name="acme/boot",
+            after_sha="sha_boot_1",
+            last_indexed_sha=None,
+            repo_id="repo-boot-1",
+        )
+        assert boot_report.mode == "bootstrap_full_index"
+        assert {p["symbol_name"] for p in store.points.values()} == {"bootstrap_ok"}
+        assert redis_client.store == {}
+
+
+async def test_upsert_repository_state_expected_previous_sha_prevents_cursor_rollback() -> None:
+    from sqlalchemy.dialects import postgresql
+
+    from codesight.db.models import Repository
+    from codesight.rag.indexer import upsert_repository_state
+
+    existing_id = uuid.uuid4()
+    rows: list[Repository] = [
+        Repository(
+            id=existing_id,
+            github_repo_id=606,
+            full_name="acme/cursor",
+            default_branch="main",
+            last_indexed_sha="newer_sha",
+        )
+    ]
+
+    class _FakeScalarResult:
+        def __init__(self, items: list[Repository]) -> None:
+            self._items = items
+
+        def scalar_one_or_none(self) -> Repository | None:
+            return self._items[0] if self._items else None
+
+        def scalars(self) -> _FakeScalarResult:
+            return self
+
+        def all(self) -> list[Repository]:
+            return list(self._items)
+
+    class _NoopCtx:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self._pending: list[Repository] = []
+            self.executed_sql: list[str] = []
+
+        async def __aenter__(self) -> _FakeSession:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def begin_nested(self) -> _NoopCtx:
+            return _NoopCtx()
+
+        def add(self, obj: Repository) -> None:
+            if obj.id is None:
+                obj.id = uuid.uuid4()
+            self._pending.append(obj)
+
+        async def execute(self, stmt: Any) -> _FakeScalarResult:
+            compiled = stmt.compile(dialect=postgresql.dialect())
+            sql_text = str(compiled)
+            self.executed_sql.append(sql_text)
+            where_sql = sql_text.split("WHERE", 1)[1] if "WHERE" in sql_text else sql_text
+            params = compiled.params
+            id_val = next(
+                (
+                    v
+                    for k, v in params.items()
+                    if "github_repo_id" not in k and (k == "id" or k.startswith("id_"))
+                ),
+                None,
+            )
+            gh_id = next((v for k, v in params.items() if "github_repo_id" in k), None)
+            slug_val = next((v for k, v in params.items() if "full_name" in k), None)
+            matched: list[Repository] = []
+            for r in rows:
+                if "repositories.id" in where_sql:
+                    if r.id == id_val:
+                        matched.append(r)
+                elif "github_repo_id" in where_sql and "full_name" in where_sql:
+                    if r.github_repo_id == gh_id or r.full_name == slug_val:
+                        matched.append(r)
+                elif "full_name" in where_sql:
+                    if r.full_name == slug_val:
+                        matched.append(r)
+            return _FakeScalarResult(matched)
+
+        async def flush(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            for obj in self._pending:
+                if obj not in rows:
+                    rows.append(obj)
+            self._pending.clear()
+
+        async def rollback(self) -> None:
+            self._pending.clear()
+
+    recorded_sql: list[str] = []
+
+    def factory() -> _FakeSession:
+        sess = _FakeSession()
+        orig_exec = sess.execute
+
+        async def _tracking_exec(stmt: Any) -> _FakeScalarResult:
+            res = await orig_exec(stmt)
+            recorded_sql.extend(sess.executed_sql[-1:])
+            return res
+
+        sess.execute = _tracking_exec  # type: ignore[method-assign]
+        return sess
+
+    repo_id, updated = await upsert_repository_state(
+        factory,  # type: ignore[arg-type]
+        full_name="acme/cursor",
+        default_branch="main",
+        github_repo_id=606,
+        last_indexed_sha="old_sha",
+        expected_previous_sha="prior_sha",
+    )
+    assert repo_id == str(existing_id)
+    assert updated is False
+    assert rows[0].last_indexed_sha == "newer_sha"
+    assert any("FOR UPDATE" in sql for sql in recorded_sql)
+
+    repo_id2, updated2 = await upsert_repository_state(
+        factory,  # type: ignore[arg-type]
+        full_name="acme/cursor",
+        default_branch="main",
+        github_repo_id=606,
+        last_indexed_sha="next_sha",
+        expected_previous_sha="newer_sha",
+    )
+    assert repo_id2 == str(existing_id)
+    assert updated2 is True
+    assert rows[0].last_indexed_sha == "next_sha"
+
+    # End-to-end InitialRepoIndexer: mid-index advance refuses rollback unless recreate=True
+    src = b"def cursor_guard() -> int:\n    return 1\n"
+    simulate_concurrent_advance = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/cursor":
+            return httpx.Response(
+                200, json={"id": 606, "full_name": "acme/cursor", "default_branch": "main"}
+            )
+        if path.startswith("/repos/acme/cursor/commits/"):
+            return httpx.Response(200, json={"sha": "sha_older_run"})
+        if path.startswith("/repos/acme/cursor/contents/.codesight."):
+            return httpx.Response(404)
+        if path.startswith("/repos/acme/cursor/git/trees/"):
+            if simulate_concurrent_advance:
+                rows[0].last_indexed_sha = "concurrent_newer_sha"
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "sha_older_run",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "src/c.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "b_cursor",
+                            "size": len(src),
+                        }
+                    ],
+                },
+            )
+        if path.endswith("/git/blobs/b_cursor"):
+            return httpx.Response(
+                200, json={"sha": "b_cursor", "encoding": "base64", "content": _b64(src)}
+            )
+        return httpx.Response(404)
+
+    store = _InMemoryZeroCodeStore()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            session_factory=factory,  # type: ignore[arg-type]
+        )
+        stale_report = await indexer.index_repository("acme/cursor", repo_id=str(existing_id))
+        assert stale_report.persisted_cursor is False
+        assert rows[0].last_indexed_sha == "concurrent_newer_sha"
+
+        simulate_concurrent_advance = False
+        recreate_report = await indexer.index_repository(
+            "acme/cursor", repo_id=str(existing_id), recreate=True
+        )
+        assert recreate_report.persisted_cursor is True
+        assert rows[0].last_indexed_sha == "sha_older_run"
+
+
+async def test_push_sync_stub_emits_missing_credentials_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import json
+
+    from codesight.core.logging import configure_logging
+
+    buf = io.StringIO()
+    configure_logging(level="INFO", service_name="codesight-test", stream=buf)
+    try:
+        no_creds_settings = Settings(
+            _env_file=None,
+            github_app_id=None,
+            github_private_key=None,
+            github_token=None,
+            gemini_api_key=None,
+        )
+        payload = {
+            "delivery_id": "deliv-stub-warn",
+            "repo_id": str(uuid.uuid4()),
+            "repo_full_name": "acme/stub-warn",
+            "after_sha": "abc1234",
+            "ref": "refs/heads/main",
+        }
+        res = await run_push_webhook_task(payload, settings=no_creds_settings)
+        assert res["status"] == "accepted"
+
+        monkeypatch.setattr("codesight.worker.celery_app.get_settings", lambda: no_creds_settings)
+        celery_res = handle_push_event(payload)
+        assert celery_res["status"] == "accepted"
+
+        events = [json.loads(line) for line in buf.getvalue().strip().splitlines()]
+        warnings = [e for e in events if e.get("event") == "push_sync_skipped_missing_credentials"]
+        assert len(warnings) == 2
+        assert all(w.get("level") == "warning" for w in warnings)
+    finally:
+        configure_logging()
+
+
+async def test_s2_01_repo_index_lock_fails_closed_on_redis_acquire_error() -> None:
+    import redis.exceptions
+
+    class _DownRedis:
+        async def set(self, *_args: Any, **_kwargs: Any) -> bool:
+            raise redis.exceptions.ConnectionError("redis connection refused")
+
+    down_lock = AsyncRepoIndexLock(_DownRedis())  # type: ignore[arg-type]
+    entered = False
+    with pytest.raises(RetryableTaskError) as exc_info:
+        async with down_lock.hold("acme/down"):
+            entered = True
+    assert entered is False
+    assert exc_info.value.retry_after_seconds == 15.0
+
+    store = _InMemoryZeroCodeStore()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    ) as http:
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            repo_lock=down_lock,
+        )
+        with pytest.raises(RetryableTaskError):
+            await indexer.index_repository("acme/down", repo_id="r-down")
+        assert store.ensured_calls == 0
+        assert store.points == {}
+
+        syncer = IncrementalBranchSyncer(
+            initial_indexer=indexer,
+            repo_client=indexer.repo_client,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            lock=down_lock,
+        )
+        with pytest.raises(RetryableTaskError):
+            await syncer.sync_push(
+                repo_full_name="acme/down",
+                after_sha="a" * 40,
+                last_indexed_sha="b" * 40,
+                repo_id="r-down",
+            )
+        assert store.ensured_calls == 0
+        assert store.points == {}
+
+
+async def test_s2_01_sync_push_and_initial_indexer_abort_writes_when_lock_lost_mid_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import redis.exceptions
+
+    from codesight.rag import indexer as indexer_mod
+
+    old_src = b"def stale_fn() -> int:\n    return 1\n"
+    new_src = b"def fresh_fn() -> int:\n    return 2\n"
+    steal_on_blob_fetch = True
+    fail_redis_on_verify = False
+
+    class _StealableRedis(_FakeRedisLockClient):
+        async def eval(
+            self,
+            script: str,
+            _numkeys: int,
+            key: str,
+            token: str,
+            *args: Any,
+        ) -> int:
+            if fail_redis_on_verify and "expire" in script.lower():
+                raise redis.exceptions.ConnectionError("redis lost mid-sync")
+            return await super().eval(script, _numkeys, key, token, *args)
+
+    redis_client = _StealableRedis()
+    lock = AsyncRepoIndexLock(
+        redis_client,  # type: ignore[arg-type]
+        ttl_seconds=60,
+        acquire_timeout_seconds=0.05,
+        poll_interval_seconds=0.01,
+    )
+    store = _InMemoryZeroCodeStore()
+    new_point_id = str(uuid.uuid4())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/race":
+            return httpx.Response(
+                200, json={"id": 88, "full_name": "acme/race", "default_branch": "main"}
+            )
+        if path.startswith("/repos/acme/race/commits/"):
+            return httpx.Response(200, json={"sha": "sha_old"})
+        if path.startswith("/repos/acme/race/contents/.codesight."):
+            return httpx.Response(404)
+        if path.startswith("/repos/acme/race/git/trees/"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "sha_old",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "src/a.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "blob_old",
+                            "size": len(old_src),
+                        }
+                    ],
+                },
+            )
+        if "/compare/" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ahead",
+                    "total_commits": 1,
+                    "files": [{"filename": "src/a.py", "status": "modified", "sha": "blob_old"}],
+                },
+            )
+        if path.endswith("/git/blobs/blob_old"):
+            if steal_on_blob_fetch:
+                # Simulate Push B stealing the expired lock and writing newer Qdrant state
+                redis_client.store["repo_index_lock:acme/race"] = "token-push-b"
+                store.points[new_point_id] = {
+                    "repo_id": "r-race",
+                    "repo_full_name": "acme/race",
+                    "file_path": "src/a.py",
+                    "blob_sha": "blob_new",
+                    "symbol_name": "fresh_fn",
+                }
+            return httpx.Response(
+                200, json={"sha": "blob_old", "encoding": "base64", "content": _b64(old_src)}
+            )
+        return httpx.Response(404)
+
+    cursor_writes: list[str | None] = []
+
+    async def _fake_upsert_state(*_args: Any, **kwargs: Any) -> tuple[str, bool]:
+        cursor_writes.append(kwargs.get("last_indexed_sha"))
+        return "r-race", True
+
+    async def _fake_read_state(*_args: Any, **_kwargs: Any) -> Any:
+        return indexer_mod._RepositorySyncState(
+            repo_id="r-race",
+            last_indexed_sha="sha_base",
+            default_branch="main",
+            installation_id=None,
+            is_stale_conflict=False,
+        )
+
+    monkeypatch.setattr(indexer_mod, "upsert_repository_state", _fake_upsert_state)
+    monkeypatch.setattr(indexer_mod, "_read_repository_sync_state", _fake_read_state)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            session_factory=object(),  # type: ignore[arg-type]
+            repo_lock=lock,
+        )
+        syncer = IncrementalBranchSyncer(
+            initial_indexer=indexer,
+            repo_client=indexer.repo_client,
+            embedder=None,
+            store=store,  # type: ignore[arg-type]
+            session_factory=object(),  # type: ignore[arg-type]
+            lock=lock,
+        )
+
+        # 1. Fast-path incremental_compare loses lock during blob fetch -> 0 writes/deletes!
+        with pytest.raises(RetryableTaskError, match="lock"):
+            await syncer.sync_push(
+                repo_full_name="acme/race",
+                after_sha="sha_old",
+                last_indexed_sha="sha_base",
+                repo_id="r-race",
+            )
+        assert set(store.points.keys()) == {new_point_id}
+        assert store.points[new_point_id]["symbol_name"] == "fresh_fn"
+        assert store.delete_by_file_calls == []
+        assert cursor_writes == []
+        assert redis_client.store.get("repo_index_lock:acme/race") == "token-push-b"
+
+        # 2. Fallback bootstrap_full_index (_skip_repo_lock=True) ALSO fences via parent lease!
+        redis_client.store.clear()
+        store.points.clear()
+        with pytest.raises(RetryableTaskError, match="lock"):
+            await syncer.sync_push(
+                repo_full_name="acme/race",
+                after_sha="sha_old",
+                last_indexed_sha=None,
+                repo_id="r-race",
+            )
+        assert set(store.points.keys()) == {new_point_id}
+        assert store.delete_by_ids_calls == []
+        assert [w for w in cursor_writes if w is not None] == []
+
+        # 3. Redis connection drop right before Qdrant write fails closed
+        redis_client.store.clear()
+        store.points.clear()
+        steal_on_blob_fetch = False
+        fail_redis_on_verify = True
+        with pytest.raises(RetryableTaskError):
+            await syncer.sync_push(
+                repo_full_name="acme/race",
+                after_sha="sha_old",
+                last_indexed_sha="sha_base",
+                repo_id="r-race",
+            )
+        assert store.points == {}
+        assert store.delete_by_file_calls == []
+        assert [w for w in cursor_writes if w is not None] == []
+
+        # 4. Lease expiry after repeated Redis renewal errors marks lease lost
+        short_lock = AsyncRepoIndexLock(
+            redis_client,  # type: ignore[arg-type]
+            ttl_seconds=1,
+            acquire_timeout_seconds=0.05,
+            poll_interval_seconds=0.01,
+        )
+        redis_client.store.clear()
+        async with short_lock.hold("acme/expire") as lease:
+            await asyncio.sleep(1.15)
+            assert lease.is_lost is True
+            with pytest.raises(RetryableTaskError):
+                await lease.ensure_held()
+    del new_src
+
+
+async def test_s2_06_fetch_git_tree_walks_subtrees_when_recursive_truncated_and_guards_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.rag import indexer as indexer_mod
+
+    blobs: dict[str, bytes] = {
+        "b_readme": b"# Mono Architecture\n## Services\nZero-Code RAG monorepo.\n",
+        "b_py": b"def handle_order(order_id: str) -> str:\n    return order_id.strip()\n",
+        "b_tsx": b"export function OrderCard(id: string): string { return id; }\n",
+    }
+    non_recursive_truncated = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        is_recursive = request.url.params.get("recursive") == "1"
+        if path == "/repos/acme/mono":
+            return httpx.Response(
+                200, json={"id": 303, "full_name": "acme/mono", "default_branch": "main"}
+            )
+        if path.startswith("/repos/acme/mono/commits/"):
+            return httpx.Response(200, json={"sha": "sha_mono_head"})
+        if path.startswith("/repos/acme/mono/contents/.codesight."):
+            return httpx.Response(404)
+        if path == "/repos/acme/mono/git/trees/sha_mono_head":
+            if is_recursive:
+                # Truncated recursive response omits packages/**
+                return httpx.Response(
+                    200,
+                    json={
+                        "sha": "sha_mono_head",
+                        "truncated": True,
+                        "tree": [
+                            {
+                                "path": "README.md",
+                                "mode": "100644",
+                                "type": "blob",
+                                "sha": "b_readme",
+                                "size": len(blobs["b_readme"]),
+                            }
+                        ],
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "sha_mono_head",
+                    "truncated": non_recursive_truncated,
+                    "tree": [
+                        {
+                            "path": "README.md",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "b_readme",
+                            "size": len(blobs["b_readme"]),
+                        },
+                        {
+                            "path": "vendor-submod",
+                            "mode": "160000",
+                            "type": "commit",
+                            "sha": "submod_sha",
+                        },
+                        {
+                            "path": "packages",
+                            "mode": "040000",
+                            "type": "tree",
+                            "sha": "tree_packages",
+                        },
+                    ],
+                },
+            )
+        if path == "/repos/acme/mono/git/trees/tree_packages":
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "tree_packages",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "api",
+                            "mode": "040000",
+                            "type": "tree",
+                            "sha": "tree_api",
+                        },
+                        {
+                            "path": "web",
+                            "mode": "040000",
+                            "type": "tree",
+                            "sha": "tree_web",
+                        },
+                    ],
+                },
+            )
+        if path == "/repos/acme/mono/git/trees/tree_api":
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "tree_api",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "handler.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "b_py",
+                            "size": len(blobs["b_py"]),
+                        }
+                    ],
+                },
+            )
+        if path == "/repos/acme/mono/git/trees/tree_web":
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "tree_web",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "OrderCard.tsx",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "b_tsx",
+                            "size": len(blobs["b_tsx"]),
+                        }
+                    ],
+                },
+            )
+        if path.startswith("/repos/acme/mono/git/blobs/"):
+            sha = path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200, json={"sha": sha, "encoding": "base64", "content": _b64(blobs[sha])}
+            )
+        return httpx.Response(404)
+
+    db_cursor_sha: str | None = "prev_good_sha"
+
+    async def _fake_upsert_state(*_args: Any, **kwargs: Any) -> tuple[str, bool]:
+        nonlocal db_cursor_sha
+        new_sha = kwargs.get("last_indexed_sha")
+        if new_sha is not None:
+            db_cursor_sha = new_sha
+            return "r-mono", True
+        return "r-mono", False
+
+    async def _fake_read_state(*_args: Any, **_kwargs: Any) -> Any:
+        return indexer_mod._RepositorySyncState(
+            repo_id="r-mono",
+            last_indexed_sha=db_cursor_sha,
+            default_branch="main",
+            installation_id=None,
+            is_stale_conflict=False,
+        )
+
+    monkeypatch.setattr(indexer_mod, "upsert_repository_state", _fake_upsert_state)
+    monkeypatch.setattr(indexer_mod, "_read_repository_sync_state", _fake_read_state)
+
+    fake_genai = _FakeGenAIClient()
+    store = _InMemoryZeroCodeStore()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        embedder = GeminiEmbedder(client=fake_genai)  # type: ignore[arg-type]
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+
+        # Case A: Subtree walk resolves truncated recursive tree completely -> saves SHA cursor
+        full_rep = await indexer.index_repository("acme/mono", repo_id="r-mono")
+        assert full_rep.truncated_tree is False
+        assert full_rep.persisted_cursor is True
+        assert db_cursor_sha == "sha_mono_head"
+        assert {p["file_path"] for p in store.points.values()} == {
+            "README.md",
+            "packages/api/handler.py",
+            "packages/web/OrderCard.tsx",
+        }
+
+        # Case B: Even non-recursive tree stays truncated -> cursor MUST NOT advance!
+        db_cursor_sha = "prev_good_sha"
+        non_recursive_truncated = True
+        store.points.clear()
+        trunc_rep = await indexer.index_repository("acme/mono", repo_id="r-mono")
+        assert trunc_rep.truncated_tree is True
+        assert trunc_rep.persisted_cursor is False
+        assert db_cursor_sha == "prev_good_sha"
+
+
+def test_s2_06_cli_index_exits_1_and_reports_truncated_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.rag.indexer import InitialIndexReport
+
+    async def _truncated_cli_run(*_args: Any, **_kwargs: Any) -> InitialIndexReport:
+        return InitialIndexReport(
+            repo_full_name="acme/mono",
+            repo_id="r-mono",
+            default_branch="main",
+            indexed_branch="main",
+            commit_sha="sha_mono_head_123456",
+            tree_entries=1,
+            eligible_files=1,
+            unchanged_files_skipped=0,
+            fetched_files=1,
+            skipped_files=0,
+            code_chunks=0,
+            doc_chunks=1,
+            embedded_points=1,
+            upserted_points=1,
+            stale_points_deleted=0,
+            persisted_cursor=False,
+            truncated_tree=True,
+            elapsed_ms=12.0,
+        )
+
+    monkeypatch.setattr("codesight.cli.commands.index.get_settings", lambda: _make_settings())
+    monkeypatch.setattr("codesight.cli.commands.index.run_cli_index", _truncated_cli_run)
+    cli_res = CliRunner().invoke(cli_app, ["index", "acme/mono"])
+    assert cli_res.exit_code == 1
+    assert "truncated" in (cli_res.stdout + cli_res.stderr).lower()
+
+
+async def test_s2_06_subtree_walk_cancels_siblings_on_429_and_recreate_guards_truncated_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Important #1 & Minor #5: Cancel sibling subtree tasks on 429; fetch tree before recreate."""
+    import asyncio
+
+    from codesight.core.errors import RateLimitTaskError
+
+    in_flight = 0
+    cancelled_siblings = 0
+    queued_requests_started = 0
+    tree_mode = "429_on_first_sub"
+
+    async def _gh_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, cancelled_siblings, queued_requests_started
+        path = request.url.path
+        if path == "/repos/acme/mono":
+            return httpx.Response(200, json={"id": 502, "default_branch": "main"})
+        if path == "/repos/acme/mono/commits/main":
+            return httpx.Response(200, json={"sha": "sha_mono_head"})
+        if path == "/repos/acme/mono/contents/.codesight.yaml":
+            return httpx.Response(404, json={"message": "Not Found"})
+        if path == "/repos/acme/mono/git/trees/sha_mono_head":
+            if request.url.params.get("recursive") == "1":
+                return httpx.Response(
+                    200, json={"sha": "sha_mono_head", "truncated": True, "tree": []}
+                )
+            if tree_mode == "always_truncated":
+                return httpx.Response(
+                    200, json={"sha": "sha_mono_head", "truncated": True, "tree": []}
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "sha_mono_head",
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": f"dir_{idx:02d}",
+                            "mode": "040000",
+                            "type": "tree",
+                            "sha": f"sub_{idx:02d}",
+                        }
+                        for idx in range(24)
+                    ],
+                },
+            )
+        if path.startswith("/repos/acme/mono/git/trees/sub_"):
+            idx = int(path.rsplit("_", 1)[-1])
+            if idx == 0:
+                await asyncio.sleep(0.01)
+                return httpx.Response(
+                    429,
+                    headers={"Retry-After": "5"},
+                    json={"message": "rate limit"},
+                )
+            if idx >= 16:
+                queued_requests_started += 1
+            in_flight += 1
+            try:
+                await asyncio.sleep(0.4)
+                return httpx.Response(
+                    200, json={"sha": f"sub_{idx:02d}", "truncated": False, "tree": []}
+                )
+            except asyncio.CancelledError:
+                cancelled_siblings += 1
+                raise
+            finally:
+                in_flight -= 1
+        return httpx.Response(404)
+
+    delete_by_repo_calls = 0
+
+    class _TrackingStore(_InMemoryZeroCodeStore):
+        async def delete_by_repo(self, **kwargs: Any) -> int:
+            nonlocal delete_by_repo_calls
+            delete_by_repo_calls += 1
+            return await super().delete_by_repo(**kwargs)
+
+    store = _TrackingStore()
+    store.points["existing-pt"] = {
+        "repo_full_name": "acme/mono",
+        "repo_id": "r-mono",
+        "file_path": "README.md",
+        "blob_sha": "sha_old",
+    }
+
+    async def _noop_upsert(_sf: Any, **kwargs: Any) -> tuple[str, bool]:
+        del kwargs
+        return "r-mono", True
+
+    monkeypatch.setattr("codesight.rag.indexer.upsert_repository_state", _noop_upsert)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(_gh_handler)) as http,
+        GeminiEmbedder(client=_FakeGenAIClient()) as embedder,  # type: ignore[arg-type]
+    ):
+        auth = GitHubAuthProvider(_make_settings(), http_client=http)
+        indexer = InitialRepoIndexer(
+            auth_provider=auth,
+            embedder=embedder,
+            store=store,  # type: ignore[arg-type]
+            http_client=http,
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+
+        # 1. Subtree #0 returns 429 -> all sibling tasks cancelled cleanly before unwind,
+        #    queued tasks #16..#23 never issue HTTP calls, and recreate=True did NOT delete Qdrant!
+        with pytest.raises(RateLimitTaskError):
+            await indexer.index_repository("acme/mono", repo_id="r-mono", recreate=True)
+        assert in_flight == 0
+        assert cancelled_siblings == 15
+        assert queued_requests_started == 0
+        assert delete_by_repo_calls == 0
+        assert "existing-pt" in store.points
+
+        # 2. Truncated tree with recreate=True -> MUST NOT wipe existing Qdrant points either!
+        tree_mode = "always_truncated"
+        trunc_rep = await indexer.index_repository("acme/mono", repo_id="r-mono", recreate=True)
+        assert trunc_rep.truncated_tree is True
+        assert trunc_rep.persisted_cursor is False
+        assert delete_by_repo_calls == 0
+        assert "existing-pt" in store.points

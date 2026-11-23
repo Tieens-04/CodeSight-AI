@@ -419,3 +419,306 @@ async def test_hybrid_retriever_dual_lang_live_qdrant_latency_and_token_savings(
             500,
         )
         assert audit_rc == 0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_hybrid_retriever_doc_search_degraded_and_ambiguous_crud_affinity_live_qdrant(
+    isolated_qdrant_collection: str,
+    zerocode_auditor: Any,
+) -> None:
+    """[M3/N3/M5] Fault-tolerant doc search + Python/TS receiver-qualified & ambiguous CRUD."""
+    import grpc
+
+    from codesight.rag.models import EmbeddingConfigError
+
+    repo_slug = "Tieens-04/codesight-ambiguous-crud"
+    repo_files: dict[str, bytes] = {
+        "src/repos/user_repository.py": (
+            b"class UserRepository:\n"
+            b"    def update(self, user: dict[str, str]) -> dict[str, str]:\n"
+            b"        return user\n"
+        ),
+        "src/routers/user_router.py": (
+            b"from src.repos.user_repository import UserRepository\n\n"
+            b"class UserRouter:\n"
+            b"    def patch_user(\n"
+            b"        self, repo: UserRepository, u: dict[str, str]\n"
+            b"    ) -> dict[str, str]:\n"
+            b"        return repo.update(u)\n"
+        ),
+        "src/audit/store.py": (
+            b"class AuditStore:\n"
+            b"    def update(self, event: dict[str, str]) -> None:\n"
+            b"        return None\n"
+        ),
+        "src/jobs/cron_job.py": (
+            b"from src.cache.redis_cache import RedisCache\n\n"
+            b"class CronJob:\n"
+            b"    def run_cleanup(self, cache: RedisCache) -> None:\n"
+            b"        cache.update()\n"
+        ),
+        "src/billing/worker.py": (
+            b"class BillingWorker:\n"
+            b"    def save(self, invoice_id: str) -> None:\n"
+            b"        return None\n"
+        ),
+        "src/billing/handler.py": (
+            b"def handle_billing_webhook(billing_worker) -> None:\n"
+            b"    billing_worker.save('inv-1')\n"
+        ),
+        "src/session/cache.py": (
+            b"class SessionCache:\n    def save(self, sid: str) -> None:\n        return None\n"
+        ),
+        "src/session/middleware.py": (
+            b"from src.session.cache import SessionCache\n\n"
+            b"def refresh_session(session_cache: SessionCache, sid: str) -> None:\n"
+            b"    session_cache.save(sid)\n"
+        ),
+        "web/src/repos/accountRepository.ts": (
+            b"export class AccountRepository {\n"
+            b"  update(account: { id: string }) {\n"
+            b"    return account;\n"
+            b"  }\n"
+            b"}\n"
+        ),
+        "web/src/routers/accountRouter.ts": (
+            b"import { AccountRepository } from '../repos/accountRepository';\n\n"
+            b"export class AccountRouter {\n"
+            b"  patchAccount(repo: AccountRepository, a: { id: string }) {\n"
+            b"    return repo.update(a);\n"
+            b"  }\n"
+            b"}\n"
+        ),
+        "web/src/jobs/cronJob.ts": (
+            b"import { RedisCache } from '../cache/redisCache';\n\n"
+            b"export class CronJob {\n"
+            b"  runCleanup(cache: RedisCache) {\n"
+            b"    return cache.update();\n"
+            b"  }\n"
+            b"}\n"
+        ),
+        "web/src/billing/tsBillingWorker.ts": (
+            b"export class TsBillingWorker {\n"
+            b"  save(invoiceId: string) {\n"
+            b"    return invoiceId;\n"
+            b"  }\n"
+            b"}\n"
+        ),
+        "web/src/session/sessionCache.ts": (
+            b"export class TsSessionCache {\n  save(sid: string) {\n    return sid;\n  }\n}\n"
+        ),
+        "web/src/session/sessionMiddleware.ts": (
+            b"import { TsSessionCache } from './sessionCache';\n\n"
+            b"export function refreshSession(sessionCache: TsSessionCache, sid: string) {\n"
+            b"  return sessionCache.save(sid);\n"
+            b"}\n"
+        ),
+    }
+
+    registry = ASTParserRegistry()
+    embedder = GeminiEmbedder(client=_TopicGenAIClient())  # type: ignore[arg-type]
+    items: list[TransientEmbeddingItem] = []
+    for file_path, content in repo_files.items():
+        sha = _sha1_blob(content)
+        parsed = registry.parse_file(content, file_path=file_path)
+        assert parsed is not None
+        for chunk in parsed.chunks:
+            items.append(
+                TransientEmbeddingItem.from_code_chunk(
+                    chunk,
+                    repo_full_name=repo_slug,
+                    blob_sha=sha,
+                )
+            )
+
+    settings = Settings(github_token=SecretStr("ghp_integration_test"))
+    async with QdrantZeroCodeStore(
+        settings=settings,
+        collection_name=isolated_qdrant_collection,
+    ) as store:
+        await store.ensure_collection()
+        embed_res = await embedder.embed_items(items)
+        await store.upsert_points(embed_res.points)
+
+        retriever = HybridContextRetriever(store=store, embedder=embedder)
+
+        # 1. Python N3 + M5: Modifying UserRepository.update returns UserRouter.patch_user,
+        #    excludes CronJob.run_cleanup (cache.update without user_repository import)
+        py_update_diff = SmartDiffParser().parse_diff(
+            "diff --git a/src/repos/user_repository.py b/src/repos/user_repository.py\n"
+            "--- a/src/repos/user_repository.py\n"
+            "+++ b/src/repos/user_repository.py\n"
+            "@@ -2,2 +2,2 @@ class UserRepository:\n"
+            "     def update(self, user: dict[str, str]) -> dict[str, str]:\n"
+            "-        return user\n"
+            "+        return {**user, 'updated': '1'}\n"
+        )
+        py_update_ctx = registry.resolve_pr_file(
+            py_update_diff.files[0],
+            after_source=repo_files["src/repos/user_repository.py"],
+        )
+        py_update_res = await retriever.retrieve(
+            [py_update_ctx],
+            repo_full_name=repo_slug,
+            parsed_diff=py_update_diff,
+        )
+        assert [c.symbol_name for c in py_update_res.callers] == ["patch_user"]
+
+        # 2. Python M5: BillingWorker.save excludes SessionCache caller (session_cache.save)
+        #    while keeping BillingHandler (billing_worker.save) via snake_case receiver match
+        py_save_diff = SmartDiffParser().parse_diff(
+            "diff --git a/src/billing/worker.py b/src/billing/worker.py\n"
+            "--- a/src/billing/worker.py\n"
+            "+++ b/src/billing/worker.py\n"
+            "@@ -2,2 +2,2 @@ class BillingWorker:\n"
+            "     def save(self, invoice_id: str) -> None:\n"
+            "-        return None\n"
+            "+        return None\n"
+        )
+        py_save_ctx = registry.resolve_pr_file(
+            py_save_diff.files[0],
+            after_source=repo_files["src/billing/worker.py"],
+        )
+        py_save_res = await retriever.retrieve(
+            [py_save_ctx],
+            repo_full_name=repo_slug,
+            parsed_diff=py_save_diff,
+        )
+        save_caller_names = {c.symbol_name for c in py_save_res.callers}
+        assert "handle_billing_webhook" in save_caller_names
+        assert "refresh_session" not in save_caller_names
+
+        # 3. Python M5 callee affinity: UserRouter.patch_user returns UserRepository.update
+        #    and excludes AuditStore.update
+        py_router_diff = SmartDiffParser().parse_diff(
+            "diff --git a/src/routers/user_router.py b/src/routers/user_router.py\n"
+            "--- a/src/routers/user_router.py\n"
+            "+++ b/src/routers/user_router.py\n"
+            "@@ -6,2 +6,2 @@ class UserRouter:\n"
+            "     ) -> dict[str, str]:\n"
+            "-        return repo.update(u)\n"
+            "+        return repo.update({**u, 'patched': '1'})\n"
+        )
+        py_router_ctx = registry.resolve_pr_file(
+            py_router_diff.files[0],
+            after_source=repo_files["src/routers/user_router.py"],
+        )
+        py_router_res = await retriever.retrieve(
+            [py_router_ctx],
+            repo_full_name=repo_slug,
+            parsed_diff=py_router_diff,
+        )
+        assert [c.file_path for c in py_router_res.callees] == ["src/repos/user_repository.py"]
+
+        # 4. TypeScript N3 + M5: AccountRepository.update -> patchAccount (excludes runCleanup)
+        ts_update_diff = SmartDiffParser().parse_diff(
+            "diff --git a/web/src/repos/accountRepository.ts b/web/src/repos/accountRepository.ts\n"
+            "--- a/web/src/repos/accountRepository.ts\n"
+            "+++ b/web/src/repos/accountRepository.ts\n"
+            "@@ -2,3 +2,3 @@ export class AccountRepository {\n"
+            "   update(account: { id: string }) {\n"
+            "-    return account;\n"
+            "+    return { ...account };\n"
+            "   }\n"
+        )
+        ts_update_ctx = registry.resolve_pr_file(
+            ts_update_diff.files[0],
+            after_source=repo_files["web/src/repos/accountRepository.ts"],
+        )
+        ts_update_res = await retriever.retrieve(
+            [ts_update_ctx],
+            repo_full_name=repo_slug,
+            parsed_diff=ts_update_diff,
+        )
+        assert [c.symbol_name for c in ts_update_res.callers] == ["patchAccount"]
+
+        # 5. TypeScript M5: TsBillingWorker.save excludes refreshSession (sessionCache.save)
+        ts_save_diff = SmartDiffParser().parse_diff(
+            "diff --git a/web/src/billing/tsBillingWorker.ts b/web/src/billing/tsBillingWorker.ts\n"
+            "--- a/web/src/billing/tsBillingWorker.ts\n"
+            "+++ b/web/src/billing/tsBillingWorker.ts\n"
+            "@@ -2,3 +2,3 @@ export class TsBillingWorker {\n"
+            "   save(invoiceId: string) {\n"
+            "-    return invoiceId;\n"
+            "+    return invoiceId.trim();\n"
+            "   }\n"
+        )
+        ts_save_ctx = registry.resolve_pr_file(
+            ts_save_diff.files[0],
+            after_source=repo_files["web/src/billing/tsBillingWorker.ts"],
+        )
+        ts_save_res = await retriever.retrieve(
+            [ts_save_ctx],
+            repo_full_name=repo_slug,
+            parsed_diff=ts_save_diff,
+        )
+        assert "refreshSession" not in {c.symbol_name for c in ts_save_res.callers}
+
+        # 6. M3: Doc search failure (EmbeddingConfigError, ValueError, grpc.RpcError) degrades docs
+        #    while preserving live Qdrant callers & callees
+        class _ConfigFailEmbedder:
+            async def embed_query(self, _text: str) -> tuple[float, ...]:
+                raise EmbeddingConfigError("missing key")
+
+        degraded_cfg_ret = HybridContextRetriever(
+            store=store,
+            embedder=_ConfigFailEmbedder(),  # type: ignore[arg-type]
+        )
+        degraded_cfg = await degraded_cfg_ret.retrieve(
+            [py_router_ctx],
+            repo_full_name=repo_slug,
+            parsed_diff=py_router_diff,
+        )
+        assert degraded_cfg.doc_search_degraded is True
+        assert [c.file_path for c in degraded_cfg.callees] == ["src/repos/user_repository.py"]
+
+        class _ValueFailEmbedder:
+            async def embed_query(self, _text: str) -> tuple[float, ...]:
+                raise ValueError("empty query")
+
+        degraded_val_ret = HybridContextRetriever(
+            store=store,
+            embedder=_ValueFailEmbedder(),  # type: ignore[arg-type]
+        )
+        degraded_val = await degraded_val_ret.retrieve(
+            [py_update_ctx],
+            repo_full_name=repo_slug,
+            parsed_diff=py_update_diff,
+        )
+        assert degraded_val.doc_search_degraded is True
+        assert [c.symbol_name for c in degraded_val.callers] == ["patch_user"]
+
+        class _RpcErrorStoreProxy:
+            def __init__(self, inner: QdrantZeroCodeStore) -> None:
+                self._inner = inner
+
+            async def find_by_called_symbols(self, *args: Any, **kwargs: Any) -> Any:
+                return await self._inner.find_by_called_symbols(*args, **kwargs)
+
+            async def find_by_symbol_names(self, *args: Any, **kwargs: Any) -> Any:
+                return await self._inner.find_by_symbol_names(*args, **kwargs)
+
+            async def search_similar(self, *args: Any, **kwargs: Any) -> Any:
+                raise grpc.RpcError("simulated grpc error")
+
+        degraded_rpc_ret = HybridContextRetriever(
+            store=_RpcErrorStoreProxy(store),  # type: ignore[arg-type]
+            embedder=embedder,
+        )
+        degraded_rpc = await degraded_rpc_ret.retrieve(
+            [py_update_ctx],
+            repo_full_name=repo_slug,
+            parsed_diff=py_update_diff,
+        )
+        assert degraded_rpc.doc_search_degraded is True
+        assert [c.symbol_name for c in degraded_rpc.callers] == ["patch_user"]
+
+        assert (
+            zerocode_auditor.audit_live_collection(
+                settings.qdrant_http_url,
+                isolated_qdrant_collection,
+                500,
+            )
+            == 0
+        )

@@ -5,18 +5,24 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections import defaultdict
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Final
 
 import structlog
 
-from codesight.ast_engine.models import PRFileContext
+from codesight.ast_engine.models import CodeSymbolChunk, PRFileContext
 from codesight.core.errors import RateLimitTaskError, RetryableTaskError
 from codesight.diff.file_filter import estimate_tokens, normalize_diff_path
 from codesight.diff.models import ParsedFileDiff, ParsedPullRequestDiff
 from codesight.rag.embedder import GeminiEmbedder
-from codesight.rag.models import QdrantStoredPoint, validate_positive_int
+from codesight.rag.models import (
+    EmbeddingConfigError,
+    QdrantStoredPoint,
+    ZeroCodeViolationError,
+    validate_positive_int,
+)
 from codesight.rag.qdrant_store import QdrantZeroCodeStore
 from codesight.rag.token_packer import (
     ContextCandidateSlice,
@@ -45,21 +51,17 @@ _MAX_LOOKUP_SYMBOLS: Final[int] = 200
 _MIN_SCROLL_WINDOW: Final[int] = 256
 _MAX_SCROLL_WINDOW: Final[int] = 512
 
-COMMON_NOISE_SYMBOLS: Final[frozenset[str]] = frozenset(
+BUILTIN_NOISE_SYMBOLS: Final[frozenset[str]] = frozenset(
     {
-        # Python builtins / ubiquitous container & logging methods
-        "get",
-        "set",
+        # Python builtins / types / ubiquitous container & logging methods
         "items",
         "keys",
         "values",
         "append",
         "extend",
         "pop",
-        "remove",
         "clear",
         "copy",
-        "update",
         "strip",
         "lstrip",
         "rstrip",
@@ -69,15 +71,10 @@ COMMON_NOISE_SYMBOLS: Final[frozenset[str]] = frozenset(
         "replace",
         "lower",
         "upper",
-        "format",
         "encode",
         "decode",
         "startswith",
         "endswith",
-        "read",
-        "write",
-        "close",
-        "open",
         "len",
         "str",
         "int",
@@ -111,12 +108,23 @@ COMMON_NOISE_SYMBOLS: Final[frozenset[str]] = frozenset(
         "exception",
         "critical",
         "log",
-        # TypeScript / JavaScript / React ubiquitous methods & hooks
+        # TypeScript / JavaScript / React builtins & ubiquitous array/promise/hook APIs
+        "console",
+        "Math",
+        "JSON",
+        "Promise",
+        "Array",
+        "Object",
+        "String",
+        "Number",
+        "Boolean",
+        "Date",
+        "RegExp",
+        "Error",
+        "Symbol",
         "map",
-        "filter",
         "reduce",
         "forEach",
-        "find",
         "some",
         "every",
         "includes",
@@ -135,16 +143,12 @@ COMMON_NOISE_SYMBOLS: Final[frozenset[str]] = frozenset(
         "then",
         "catch",
         "finally",
-        "resolve",
         "reject",
         "stringify",
-        "parse",
         "assign",
         "entries",
         "fromEntries",
         "trim",
-        "match",
-        "test",
         "exec",
         "preventDefault",
         "stopPropagation",
@@ -157,10 +161,48 @@ COMMON_NOISE_SYMBOLS: Final[frozenset[str]] = frozenset(
         "default",
     }
 )
+AMBIGUOUS_METHOD_SYMBOLS: Final[frozenset[str]] = frozenset(
+    {
+        "get",
+        "set",
+        "update",
+        "delete",
+        "remove",
+        "find",
+        "parse",
+        "read",
+        "write",
+        "open",
+        "close",
+        "match",
+        "resolve",
+        "filter",
+        "format",
+        "test",
+        "save",
+        "create",
+        "run",
+        "execute",
+        "handle",
+        "process",
+        "build",
+        "load",
+        "init",
+        "validate",
+        "send",
+        "fetch",
+    }
+)
+COMMON_NOISE_SYMBOLS: Final[frozenset[str]] = BUILTIN_NOISE_SYMBOLS
 _GENERIC_FILE_STEMS: Final[frozenset[str]] = frozenset(
     {"__init__", "index", "main", "mod", "types", "models", "utils", "helpers", "common"}
 )
+_GENERIC_PARENT_DIRS: Final[frozenset[str]] = frozenset(
+    {"", "src", "lib", "app", "packages", "web"}
+)
 _IMPORT_SPLIT_RE: Final[re.Pattern[str]] = re.compile(r"[./\\:@]+")
+_SNAKE_ACRONYM_RE: Final[re.Pattern[str]] = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_SNAKE_CAMEL_RE: Final[re.Pattern[str]] = re.compile(r"([a-z0-9])([A-Z])")
 
 logger = structlog.get_logger("codesight.rag.retriever")
 
@@ -168,15 +210,34 @@ logger = structlog.get_logger("codesight.rag.retriever")
 def is_noise_symbol(
     symbol_name: str,
     *,
-    noise_symbols: frozenset[str] = COMMON_NOISE_SYMBOLS,
+    noise_symbols: frozenset[str] = BUILTIN_NOISE_SYMBOLS,
 ) -> bool:
-    """Return True when a bare identifier is too ubiquitous for high-signal Qdrant lookup."""
+    """Return True when a bare identifier is a language builtin/noise token to drop."""
     cleaned = symbol_name.strip()
     if len(cleaned) < _MIN_SYMBOL_LEN:
         return True
     if cleaned.startswith("__") and cleaned.endswith("__"):
         return True
     return cleaned in noise_symbols
+
+
+def _to_snake_case(name: str) -> str:
+    step1 = _SNAKE_ACRONYM_RE.sub(r"\1_\2", name.strip())
+    return _SNAKE_CAMEL_RE.sub(r"\1_\2", step1).lower()
+
+
+def _to_camel_case(name: str) -> str:
+    cleaned = name.strip()
+    if not cleaned:
+        return ""
+    return cleaned[0].lower() + cleaned[1:]
+
+
+def _extract_chunk_enclosing_class(chunk: CodeSymbolChunk) -> str | None:
+    if chunk.symbol_kind != "method" or "." not in chunk.qualified_name:
+        return None
+    parent = chunk.qualified_name.rsplit(".", 1)[0].rsplit(".", 1)[-1].strip()
+    return parent or None
 
 
 def _extract_file_stem(file_path: str) -> str:
@@ -381,6 +442,13 @@ class _ModifiedFootprint:
     modified_root_dirs: frozenset[str]
     modified_stems: frozenset[str]
     modified_import_sets: tuple[set[str], ...]
+    modified_enclosing_classes: frozenset[str] = field(default_factory=frozenset)
+    ambiguous_caller_files: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    ambiguous_caller_stems: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    ambiguous_caller_classes: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    ambiguous_callee_files: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    ambiguous_callee_receivers: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    ambiguous_callee_import_sets: Mapping[str, tuple[set[str], ...]] = field(default_factory=dict)
 
 
 def _score_code_affinity(
@@ -399,8 +467,12 @@ def _score_code_affinity(
         matched_lower = {sym.lower() for sym in matched_symbols}
         if caller_import_tokens & footprint.modified_stems:
             score += 3.0
+        if caller_import_tokens & footprint.modified_enclosing_classes:
+            score += 2.0
         if caller_import_tokens & matched_lower:
             score += 1.5
+        if any("." in sym for sym in matched_symbols):
+            score += 2.0
     else:
         callee_stem = _extract_file_stem(cand_file_path)
         has_specific_stem = bool(callee_stem and callee_stem not in _GENERIC_FILE_STEMS)
@@ -469,8 +541,9 @@ class HybridContextRetriever:
         self._caller_limit = validate_positive_int(caller_limit, name="caller_limit")
         self._callee_limit = validate_positive_int(callee_limit, name="callee_limit")
         self._doc_limit = validate_positive_int(doc_limit, name="doc_limit")
-        extra_clean = {sym.strip() for sym in extra_noise_symbols if sym.strip()}
-        self._noise_symbols = COMMON_NOISE_SYMBOLS | frozenset(extra_clean)
+        extra_clean = frozenset(sym.strip() for sym in extra_noise_symbols if sym.strip())
+        self._noise_symbols = BUILTIN_NOISE_SYMBOLS | extra_clean
+        self._ambiguous_symbols = AMBIGUOUS_METHOD_SYMBOLS - extra_clean
 
     async def _search_architecture_docs(
         self,
@@ -492,12 +565,18 @@ class HybridContextRetriever:
                 limit=self._doc_limit,
             )
             return points, False
+        except ZeroCodeViolationError:
+            raise
         except (
+            EmbeddingConfigError,
             RetryableTaskError,
             RateLimitTaskError,
+            ValueError,
             TimeoutError,
             ConnectionError,
             OSError,
+            RuntimeError,
+            Exception,
         ) as exc:
             logger.warning(
                 "hybrid_retriever_doc_search_degraded",
@@ -535,15 +614,24 @@ class HybridContextRetriever:
                         renamed_old_paths.add(norm_old)
 
         enclosing: list[RetrievedContextCandidate] = []
-        raw_modified_symbols: list[str] = []
-        raw_called_symbols: list[str] = []
+        raw_specific_caller_symbols: list[str] = []
+        raw_ambiguous_caller_symbols: list[str] = []
+        raw_specific_callee_symbols: list[str] = []
+        raw_ambiguous_callee_symbols: list[str] = []
         modified_symbol_keys: set[tuple[str, str]] = set()
         modified_file_paths: set[str] = set()
         modified_dirs: set[str] = set()
         modified_top_pkgs: set[str] = set()
         modified_root_dirs: set[str] = set()
         modified_stems: set[str] = set()
+        modified_enclosing_classes: set[str] = set()
         modified_imports: list[str] = []
+        ambiguous_caller_files: dict[str, set[str]] = defaultdict(set)
+        ambiguous_caller_stems: dict[str, set[str]] = defaultdict(set)
+        ambiguous_caller_classes: dict[str, set[str]] = defaultdict(set)
+        ambiguous_callee_files: dict[str, set[str]] = defaultdict(set)
+        ambiguous_callee_receivers: dict[str, set[str]] = defaultdict(set)
+        ambiguous_callee_import_sets: dict[str, list[set[str]]] = defaultdict(list)
         ast_live_entries: list[tuple[str, PRFileContext, str | None]] = []
         ast_live_paths: set[str] = set()
         touched_chunk_ids: set[tuple[str, str, int]] = set()
@@ -570,8 +658,9 @@ class HybridContextRetriever:
             if root_dir:
                 modified_root_dirs.add(root_dir)
             stem = _extract_file_stem(norm_path)
-            if stem and stem not in _GENERIC_FILE_STEMS:
-                modified_stems.add(stem)
+            specific_stem = stem if (stem and stem not in _GENERIC_FILE_STEMS) else ""
+            if specific_stem:
+                modified_stems.add(specific_stem)
 
             if file_diff is not None and file_diff.change_type == "renamed" and file_diff.old_path:
                 old_norm = _safe_norm_path(file_diff.old_path)
@@ -586,27 +675,78 @@ class HybridContextRetriever:
                 tuple(sorted(file_diff.changed_right_lines)) if file_diff is not None else ()
             )
 
+            module_imports: tuple[str, ...] = ()
             if ctx.parsed_file is not None:
-                modified_imports.extend(ctx.parsed_file.imports)
+                module_imports = ctx.parsed_file.imports
+                modified_imports.extend(module_imports)
                 if ctx.mode == "ast":
                     ast_live_paths.add(norm_path)
                     ast_live_entries.append((norm_path, ctx, file_blob_sha))
 
             for removed_sym in _extract_removed_symbol_names(ctx):
                 modified_symbol_keys.add((norm_path, removed_sym))
-                if not is_noise_symbol(removed_sym, noise_symbols=self._noise_symbols):
-                    raw_modified_symbols.append(removed_sym)
+                if is_noise_symbol(removed_sym, noise_symbols=self._noise_symbols):
+                    continue
+                if removed_sym in self._ambiguous_symbols:
+                    raw_ambiguous_caller_symbols.append(removed_sym)
+                    ambiguous_caller_files[removed_sym].add(norm_path)
+                    if specific_stem:
+                        ambiguous_caller_stems[removed_sym].add(specific_stem)
+                else:
+                    raw_specific_caller_symbols.append(removed_sym)
 
             if ctx.mode == "ast" and ctx.touched_chunks:
                 for idx, chunk in enumerate(ctx.touched_chunks):
                     modified_symbol_keys.add((norm_path, chunk.symbol_name))
                     touched_chunk_ids.add((norm_path, chunk.qualified_name, chunk.start_line))
                     modified_imports.extend(chunk.imports)
+                    enclosing_cls = _extract_chunk_enclosing_class(chunk)
+                    if enclosing_cls:
+                        modified_enclosing_classes.add(enclosing_cls.lower())
+                    if chunk.symbol_kind == "class" and not is_noise_symbol(
+                        chunk.symbol_name, noise_symbols=self._noise_symbols
+                    ):
+                        modified_enclosing_classes.add(chunk.symbol_name.lower())
+
                     if not is_noise_symbol(chunk.symbol_name, noise_symbols=self._noise_symbols):
-                        raw_modified_symbols.append(chunk.symbol_name)
+                        if enclosing_cls:
+                            raw_specific_caller_symbols.append(
+                                f"{enclosing_cls}.{chunk.symbol_name}"
+                            )
+                        if chunk.symbol_name in self._ambiguous_symbols:
+                            raw_ambiguous_caller_symbols.append(chunk.symbol_name)
+                            ambiguous_caller_files[chunk.symbol_name].add(norm_path)
+                            if specific_stem:
+                                ambiguous_caller_stems[chunk.symbol_name].add(specific_stem)
+                            if enclosing_cls:
+                                ambiguous_caller_classes[chunk.symbol_name].add(enclosing_cls)
+                        else:
+                            raw_specific_caller_symbols.append(chunk.symbol_name)
+
+                    chunk_imp_sets = [
+                        toks
+                        for raw in _dedupe_ordered((*chunk.imports, *module_imports))
+                        if (toks := _tokenize_single_import(raw))
+                    ]
                     for callee in chunk.called_symbols:
-                        if not is_noise_symbol(callee, noise_symbols=self._noise_symbols):
-                            raw_called_symbols.append(callee)
+                        receiver = ""
+                        callee_target = callee
+                        if "." in callee:
+                            receiver, callee_target = callee.rsplit(".", 1)
+                            if receiver in self._noise_symbols:
+                                continue
+                        if is_noise_symbol(callee_target, noise_symbols=self._noise_symbols):
+                            continue
+                        if callee_target in self._ambiguous_symbols:
+                            raw_ambiguous_callee_symbols.append(callee_target)
+                            ambiguous_callee_files[callee_target].add(norm_path)
+                            if receiver:
+                                ambiguous_callee_receivers[callee_target].add(receiver)
+                            if chunk_imp_sets:
+                                ambiguous_callee_import_sets[callee_target].extend(chunk_imp_sets)
+                        else:
+                            raw_specific_callee_symbols.append(callee_target)
+
                     focus = tuple(
                         ln for ln in changed_right if chunk.start_line <= ln <= chunk.end_line
                     )
@@ -687,10 +827,16 @@ class HybridContextRetriever:
                         )
                     )
 
-        target_caller_symbols = _dedupe_ordered(raw_modified_symbols)[:_MAX_LOOKUP_SYMBOLS]
-        target_callee_symbols = _dedupe_ordered(raw_called_symbols)[:_MAX_LOOKUP_SYMBOLS]
-        target_caller_set = set(target_caller_symbols)
-        target_callee_set = set(target_callee_symbols)
+        specific_caller_symbols = _dedupe_ordered(raw_specific_caller_symbols)[:_MAX_LOOKUP_SYMBOLS]
+        ambiguous_caller_symbols = _dedupe_ordered(raw_ambiguous_caller_symbols)[
+            :_MAX_LOOKUP_SYMBOLS
+        ]
+        specific_callee_symbols = _dedupe_ordered(raw_specific_callee_symbols)[:_MAX_LOOKUP_SYMBOLS]
+        ambiguous_callee_symbols = _dedupe_ordered(raw_ambiguous_callee_symbols)[
+            :_MAX_LOOKUP_SYMBOLS
+        ]
+        target_caller_set = set(specific_caller_symbols) | set(ambiguous_caller_symbols)
+        target_callee_set = set(specific_callee_symbols) | set(ambiguous_callee_symbols)
         footprint = _ModifiedFootprint(
             modified_symbol_keys=frozenset(modified_symbol_keys),
             modified_file_paths=frozenset(modified_file_paths),
@@ -703,6 +849,17 @@ class HybridContextRetriever:
                 for raw in _dedupe_ordered(modified_imports)
                 if (toks := _tokenize_single_import(raw))
             ),
+            modified_enclosing_classes=frozenset(modified_enclosing_classes),
+            ambiguous_caller_files={k: frozenset(v) for k, v in ambiguous_caller_files.items()},
+            ambiguous_caller_stems={k: frozenset(v) for k, v in ambiguous_caller_stems.items()},
+            ambiguous_caller_classes={k: frozenset(v) for k, v in ambiguous_caller_classes.items()},
+            ambiguous_callee_files={k: frozenset(v) for k, v in ambiguous_callee_files.items()},
+            ambiguous_callee_receivers={
+                k: frozenset(v) for k, v in ambiguous_callee_receivers.items()
+            },
+            ambiguous_callee_import_sets={
+                k: tuple(v) for k, v in ambiguous_callee_import_sets.items()
+            },
         )
         non_deleted_contexts = [
             ctx
@@ -719,28 +876,43 @@ class HybridContextRetriever:
             max(self._callee_limit * 8, _MIN_SCROLL_WINDOW), _MAX_SCROLL_WINDOW
         )
 
-        async def _empty_points() -> tuple[QdrantStoredPoint, ...]:
+        async def _fetch_split_tier(
+            specific: list[str],
+            ambiguous: list[str],
+            lookup: Callable[[list[str]], Awaitable[tuple[QdrantStoredPoint, ...]]],
+        ) -> tuple[QdrantStoredPoint, ...]:
+            if specific and ambiguous:
+                spec_pts, amb_pts = await asyncio.gather(lookup(specific), lookup(ambiguous))
+                return (*spec_pts, *amb_pts)
+            if specific:
+                return await lookup(specific)
+            if ambiguous:
+                return await lookup(ambiguous)
             return ()
 
         callers_task = asyncio.create_task(
-            self._store.find_by_called_symbols(
-                target_caller_symbols,
-                repo_full_name=slug,
-                repo_id=repo_id,
-                limit=caller_fetch_limit,
+            _fetch_split_tier(
+                specific_caller_symbols,
+                ambiguous_caller_symbols,
+                lambda syms: self._store.find_by_called_symbols(
+                    syms,
+                    repo_full_name=slug,
+                    repo_id=repo_id,
+                    limit=caller_fetch_limit,
+                ),
             )
-            if target_caller_symbols
-            else _empty_points()
         )
         callees_task = asyncio.create_task(
-            self._store.find_by_symbol_names(
-                target_callee_symbols,
-                repo_full_name=slug,
-                repo_id=repo_id,
-                limit=callee_fetch_limit,
+            _fetch_split_tier(
+                specific_callee_symbols,
+                ambiguous_callee_symbols,
+                lambda syms: self._store.find_by_symbol_names(
+                    syms,
+                    repo_full_name=slug,
+                    repo_id=repo_id,
+                    limit=callee_fetch_limit,
+                ),
             )
-            if target_callee_symbols
-            else _empty_points()
         )
         docs_task = asyncio.create_task(
             self._search_architecture_docs(
@@ -821,8 +993,78 @@ class HybridContextRetriever:
             qdrant_ms=qdrant_ms,
         )
 
-    @staticmethod
+    def _passes_ambiguous_affinity_gate(
+        self,
+        *,
+        is_caller: bool,
+        cand_file_path: str,
+        cand_called_symbols: Sequence[str],
+        cand_imports: Sequence[str],
+        matched_symbols: Sequence[str],
+        footprint: _ModifiedFootprint,
+    ) -> bool:
+        """Gate solely-ambiguous bare matches by file, qualified receiver, or import overlap."""
+        if not matched_symbols:
+            return False
+        if not all(sym in self._ambiguous_symbols for sym in matched_symbols):
+            return True
+
+        if is_caller:
+            cand_called_set = set(cand_called_symbols)
+            caller_import_tokens = _tokenize_imports(cand_imports)
+            for sym in matched_symbols:
+                if cand_file_path in footprint.ambiguous_caller_files.get(sym, ()):
+                    return True
+                classes = footprint.ambiguous_caller_classes.get(sym, ())
+                for cls_name in classes:
+                    receiver_forms = {
+                        f"{cls_name}.{sym}",
+                        f"{_to_snake_case(cls_name)}.{sym}",
+                        f"{_to_camel_case(cls_name)}.{sym}",
+                    }
+                    if cand_called_set & receiver_forms:
+                        return True
+                stems = footprint.ambiguous_caller_stems.get(sym, ())
+                affinity_tokens = set(stems) | {cls_name.lower() for cls_name in classes}
+                if affinity_tokens and (caller_import_tokens & affinity_tokens):
+                    return True
+            return False
+
+        callee_stem = _extract_file_stem(cand_file_path)
+        has_specific_stem = bool(callee_stem and callee_stem not in _GENERIC_FILE_STEMS)
+        parent_dir = _extract_parent_dir(cand_file_path)
+        parent_tok = parent_dir.rsplit("/", 1)[-1].strip().lower() if parent_dir else ""
+        has_specific_parent = parent_tok not in _GENERIC_PARENT_DIRS
+        for sym in matched_symbols:
+            if cand_file_path in footprint.ambiguous_callee_files.get(sym, ()):
+                return True
+            if has_specific_stem:
+                for receiver in footprint.ambiguous_callee_receivers.get(sym, ()):
+                    if (
+                        receiver
+                        and receiver[0].isupper()
+                        and (
+                            receiver.lower() == callee_stem
+                            or _to_snake_case(receiver) == callee_stem
+                        )
+                    ):
+                        return True
+            import_sets = footprint.ambiguous_callee_import_sets.get(sym, ())
+            if has_specific_stem and any(callee_stem in imp_toks for imp_toks in import_sets):
+                return True
+            if (
+                callee_stem
+                and not has_specific_stem
+                and has_specific_parent
+                and any(
+                    callee_stem in imp_toks and parent_tok in imp_toks for imp_toks in import_sets
+                )
+            ):
+                return True
+        return False
+
     def _extract_local_pr_candidates(
+        self,
         *,
         ast_live_entries: Sequence[tuple[str, PRFileContext, str | None]],
         touched_chunk_ids: set[tuple[str, str, int]],
@@ -846,7 +1088,14 @@ class HybridContextRetriever:
                     matched_calls = tuple(
                         sym for sym in chunk.called_symbols if sym in target_caller_set
                     )
-                    if matched_calls:
+                    if matched_calls and self._passes_ambiguous_affinity_gate(
+                        is_caller=True,
+                        cand_file_path=norm_path,
+                        cand_called_symbols=chunk.called_symbols,
+                        cand_imports=chunk.imports,
+                        matched_symbols=matched_calls,
+                        footprint=footprint,
+                    ):
                         score = _score_code_affinity(
                             cand_file_path=norm_path,
                             cand_imports=chunk.imports,
@@ -876,7 +1125,14 @@ class HybridContextRetriever:
                                 matched_symbols=matched_calls,
                             )
                         )
-                if chunk.symbol_name in target_callee_set:
+                if chunk.symbol_name in target_callee_set and self._passes_ambiguous_affinity_gate(
+                    is_caller=False,
+                    cand_file_path=norm_path,
+                    cand_called_symbols=chunk.called_symbols,
+                    cand_imports=chunk.imports,
+                    matched_symbols=(chunk.symbol_name,),
+                    footprint=footprint,
+                ):
                     score = _score_code_affinity(
                         cand_file_path=norm_path,
                         cand_imports=chunk.imports,
@@ -963,6 +1219,16 @@ class HybridContextRetriever:
                 if sym_name not in target_symbols:
                     continue
                 matched = (sym_name,)
+
+            if not self._passes_ambiguous_affinity_gate(
+                is_caller=is_caller,
+                cand_file_path=norm_path,
+                cand_called_symbols=called,
+                cand_imports=imports,
+                matched_symbols=matched,
+                footprint=footprint,
+            ):
+                continue
 
             affinity = _score_code_affinity(
                 cand_file_path=norm_path,

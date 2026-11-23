@@ -280,11 +280,7 @@ def test_invalid_glob_syntax_in_ignore_paths_rejected_and_salvages_siblings(
 
 @pytest.mark.asyncio
 async def test_yaml_alias_bomb_rejected_and_same_origin_redirect_handled() -> None:
-    billion_laughs = (
-        "a: &a ['x', 'x', 'x', 'x']\n"
-        "b: &b [*a, *a, *a, *a]\n"
-        "ignore_paths: *b\n"
-    )
+    billion_laughs = "a: &a ['x', 'x', 'x', 'x']\nb: &b [*a, *a, *a, *a]\nignore_paths: *b\n"
     cfg = parse_repo_config_yaml(billion_laughs, source=".codesight.yaml")
     assert cfg == RepoConfig()
 

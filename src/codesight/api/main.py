@@ -67,9 +67,7 @@ class TraceIdMiddleware:
             if message["type"] == "http.response.start":
                 response_status = int(message["status"])
                 raw_headers = [
-                    (k, v)
-                    for k, v in message.get("headers", ())
-                    if k.lower() != b"x-trace-id"
+                    (k, v) for k, v in message.get("headers", ()) if k.lower() != b"x-trace-id"
                 ]
                 raw_headers.append((b"x-trace-id", trace_id.encode("ascii")))
                 message["headers"] = raw_headers

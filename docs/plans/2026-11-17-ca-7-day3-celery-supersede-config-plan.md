@@ -230,9 +230,7 @@ async def test_live_redis_lua_cas_claim_rollback_and_superseded_detection() -> N
 
         # 2. CAS Rollback Hazard: SHA_3 arrives BEFORE SHA_2's failed-publish rollback runs
         await lock.claim_active_sha(repo_id, pr_num, "sha-3")
-        await lock.rollback_active_sha(
-            repo_id, pr_num, attempted_sha="sha-2", prev_sha="sha-1"
-        )
+        await lock.rollback_active_sha(repo_id, pr_num, attempted_sha="sha-2", prev_sha="sha-1")
         await lock.record_active_task(repo_id, pr_num, head_sha="sha-2", task_id="stale-task-2")
         # SHA_3 MUST remain active and task_key MUST NOT be overwritten by stale SHA_2
         assert await async_client.get(pr_active_sha_key(repo_id, pr_num)) == "sha-3"
@@ -416,7 +414,9 @@ async def test_loader_trusts_default_branch_falls_back_yml_and_propagates_429_5x
         ):
             return httpx.Response(404, json={"message": "Not Found"})
         if path.endswith("/org/ratelimited/contents/.codesight.yaml"):
-            return httpx.Response(403, headers={"Retry-After": "14"}, json={"message": "rate limit"})
+            return httpx.Response(
+                403, headers={"Retry-After": "14"}, json={"message": "rate limit"}
+            )
         if path.endswith("/org/forbidden/contents/.codesight.yaml"):
             return httpx.Response(403, json={"message": "Resource not accessible by integration"})
         return httpx.Response(502, json={"message": "Bad Gateway"})

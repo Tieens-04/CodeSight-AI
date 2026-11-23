@@ -246,9 +246,7 @@ class GitHubAuthProvider:
         app_id = self._settings.github_app_id
         private_key = self._settings.github_private_key
         if app_id is None or private_key is None:
-            raise GitHubAuthConfigError(
-                "GITHUB_APP_ID and GITHUB_PRIVATE_KEY must be configured."
-            )
+            raise GitHubAuthConfigError("GITHUB_APP_ID and GITHUB_PRIVATE_KEY must be configured.")
         if self._normalized_pem is None:
             self._normalized_pem = normalize_private_key(private_key.get_secret_value())
         return create_app_jwt(app_id, self._normalized_pem)
@@ -362,9 +360,7 @@ class GitHubAuthProvider:
 
         lock = self._installation_locks.setdefault(installation_id, asyncio.Lock())
         async with lock:
-            cached_again = await self._read_cached_token(
-                installation_id, redis_client=redis_client
-            )
+            cached_again = await self._read_cached_token(installation_id, redis_client=redis_client)
             if cached_again is not None:
                 return SecretStr(cached_again)
 

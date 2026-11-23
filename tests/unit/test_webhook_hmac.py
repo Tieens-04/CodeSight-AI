@@ -289,6 +289,7 @@ async def test_webhook_idempotency_filtering_cli_upsert_and_broker_rollback(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
+
             async def _send(event: str, delivery: str, body_obj: dict[str, Any]) -> httpx.Response:
                 raw = json.dumps(body_obj).encode("utf-8")
                 return await client.post(
@@ -656,6 +657,7 @@ async def test_webhook_rejects_bool_ints_invalid_slugs_oversize_strings_and_hand
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
+
             async def _post(
                 event: str,
                 delivery: str,
@@ -711,9 +713,9 @@ async def test_webhook_rejects_bool_ints_invalid_slugs_oversize_strings_and_hand
                     f"d-bad-payload-{idx}",
                     json.dumps(bad_obj).encode("utf-8"),
                 )
-                assert (
-                    resp.status_code == 400
-                ), f"Expected 400 for case {idx}, got {resp.status_code}"
+                assert resp.status_code == 400, (
+                    f"Expected 400 for case {idx}, got {resp.status_code}"
+                )
 
             # Independent push deletion cases & ignored events -> 200 ignored, 0 dispatches
             r_zero_sha = await _post(
@@ -738,12 +740,10 @@ async def test_webhook_rejects_bool_ints_invalid_slugs_oversize_strings_and_hand
             )
             assert r_zero_sha.status_code == 200 and r_zero_sha.json()["status"] == "ignored"
             assert (
-                r_deleted_only.status_code == 200
-                and r_deleted_only.json()["status"] == "ignored"
+                r_deleted_only.status_code == 200 and r_deleted_only.json()["status"] == "ignored"
             )
             assert (
-                r_push_no_repo.status_code == 200
-                and r_push_no_repo.json()["status"] == "ignored"
+                r_push_no_repo.status_code == 200 and r_push_no_repo.json()["status"] == "ignored"
             )
             assert r_unknown_evt.status_code == 200 and r_unknown_evt.json()["status"] == "ignored"
             assert spy.pr_calls == []
@@ -820,9 +820,9 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
             for idx, (action, sha) in enumerate(
                 (("opened", "benchwarm0000"), ("synchronize", "benchwarm0001"))
             ):
-                warm_raw = json.dumps(
-                    _pr_payload(action=action, pr_number=1, head_sha=sha)
-                ).encode("utf-8")
+                warm_raw = json.dumps(_pr_payload(action=action, pr_number=1, head_sha=sha)).encode(
+                    "utf-8"
+                )
                 warm_resp = await client.post(
                     "/api/v1/webhooks/github",
                     content=warm_raw,
@@ -872,8 +872,7 @@ async def test_webhook_gateway_warm_mean_latency_under_100ms(
                 ).scalar_one_or_none()
             if repo_id is not None:
                 keys = [
-                    str(k)
-                    async for k in redis_client.scan_iter(match=f"pr_active*:{repo_id}:*")
+                    str(k) async for k in redis_client.scan_iter(match=f"pr_active*:{repo_id}:*")
                 ]
                 if keys:
                     await redis_client.delete(*keys)
@@ -943,6 +942,7 @@ async def test_webhook_commits_before_dispatch_and_handles_repo_rename_collision
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
+
             async def _send(delivery: str, body_obj: dict[str, Any]) -> httpx.Response:
                 raw = json.dumps(body_obj).encode("utf-8")
                 return await client.post(
@@ -1219,6 +1219,7 @@ async def test_webhook_stale_received_reclaim_null_repo_id_and_concurrent_upsert
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
+
             async def _send(delivery: str, body_obj: dict[str, Any]) -> httpx.Response:
                 raw = json.dumps(body_obj).encode("utf-8")
                 return await client.post(

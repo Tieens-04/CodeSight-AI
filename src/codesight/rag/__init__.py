@@ -9,12 +9,15 @@ from codesight.rag.doc_chunker import (
     is_architecture_doc_path,
 )
 from codesight.rag.embedder import (
+    DEFAULT_EMBED_MAX_RETRIES,
+    DEFAULT_EMBED_RETRY_CAP_SECONDS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_BASE_SECONDS,
     DEFAULT_RETRY_CAP_SECONDS,
     EmbeddingTaskType,
     ExistingPointIdChecker,
     GeminiEmbedder,
+    parse_gemini_retry_delay,
 )
 from codesight.rag.indexer import (
     DEFAULT_BLOB_CONCURRENCY,
@@ -45,6 +48,7 @@ from codesight.rag.models import (
     ALLOWED_LANGUAGES,
     ALLOWED_PAYLOAD_KEYS,
     BODY_LEAK_RE,
+    CODE_CHUNK_PLACEHOLDER_VECTOR,
     DEFAULT_EMBED_BATCH_SIZE,
     DEFAULT_RPM_CONCURRENCY,
     EMBEDDING_DIMENSIONS,
@@ -79,6 +83,8 @@ from codesight.rag.qdrant_store import (
     QdrantZeroCodeStore,
 )
 from codesight.rag.retriever import (
+    AMBIGUOUS_METHOD_SYMBOLS,
+    BUILTIN_NOISE_SYMBOLS,
     COMMON_NOISE_SYMBOLS,
     DEFAULT_CALLEE_LIMIT,
     DEFAULT_CALLER_LIMIT,
@@ -108,9 +114,12 @@ __all__ = [
     "ALLOWED_CHUNK_TYPES",
     "ALLOWED_LANGUAGES",
     "ALLOWED_PAYLOAD_KEYS",
+    "AMBIGUOUS_METHOD_SYMBOLS",
     "ARCHITECTURE_DOC_BASENAMES",
     "ARCHITECTURE_DOC_GLOBS",
     "BODY_LEAK_RE",
+    "BUILTIN_NOISE_SYMBOLS",
+    "CODE_CHUNK_PLACEHOLDER_VECTOR",
     "COMMON_NOISE_SYMBOLS",
     "DEFAULT_AUX_TOKEN_BUDGET",
     "DEFAULT_BLOB_CONCURRENCY",
@@ -119,6 +128,8 @@ __all__ = [
     "DEFAULT_DOC_LIMIT",
     "DEFAULT_DOC_SCORE_THRESHOLD",
     "DEFAULT_EMBED_BATCH_SIZE",
+    "DEFAULT_EMBED_MAX_RETRIES",
+    "DEFAULT_EMBED_RETRY_CAP_SECONDS",
     "DEFAULT_INDEX_WAVE_SIZE",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_QDRANT_TIMEOUT_SECONDS",
@@ -188,6 +199,7 @@ __all__ = [
     "is_architecture_doc_path",
     "is_noise_symbol",
     "normalize_l2_vector",
+    "parse_gemini_retry_delay",
     "read_repository_state",
     "upsert_repository_state",
     "validate_positive_int",

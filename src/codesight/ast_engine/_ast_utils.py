@@ -265,3 +265,19 @@ def pack_spans_into_ranges(
     if chunk_start <= final_end:
         packed.append((chunk_start, final_end))
     return packed
+
+
+def count_syntax_error_nodes(root_node: Node) -> int:
+    """Count `ERROR` and `MISSING` syntax-error nodes in a tree-sitter AST."""
+    if not root_node.has_error:
+        return 0
+    count = 0
+    stack: list[Node] = [root_node]
+    while stack:
+        current = stack.pop()
+        if current.is_error or current.is_missing:
+            count += 1
+        for child in reversed(current.children):
+            if child.has_error:
+                stack.append(child)
+    return count

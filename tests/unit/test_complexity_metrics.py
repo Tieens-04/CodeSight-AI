@@ -562,3 +562,89 @@ def test_compute_complexity_delta_max_after_cc_respects_changed_right_lines() ->
     assert [(d.qualified_name, d.delta_cc) for d in summary.deltas] == [("tiny", 0)]
     assert summary.max_after_cc == 1
     assert summary.high_complexity_functions == ()
+
+
+def test_detect_missing_test_companion_ignores_seed_json_yaml_and_supports_multi_layouts() -> None:
+    diff_parser = SmartDiffParser()
+    seed_lines = [f'  "key_{i}": {i},' for i in range(110)]
+    yaml_lines = [f"field_{i}: value_{i}" for i in range(110)]
+    non_code_diff = diff_parser.parse_diff(
+        _make_unified_diff("src/data/seed.json", seed_lines)
+        + _make_unified_diff("src/config/schema.yaml", yaml_lines)
+    )
+    non_code_report = detect_missing_test_companion(non_code_diff)
+    assert non_code_report.added_source_logic_lines == 0
+    assert non_code_report.source_files == ()
+    assert non_code_report.is_untested is False
+
+    app_lines = [f"order_step_{i} = {i}" for i in range(55)]
+    app_diff = diff_parser.parse_diff(_make_unified_diff("app/services/order.py", app_lines))
+    app_report = detect_missing_test_companion(app_diff)
+    assert app_report.added_source_logic_lines == 55
+    assert app_report.source_files == ("app/services/order.py",)
+    assert app_report.is_untested is True
+
+    multi_layout_diff = diff_parser.parse_diff(
+        _make_unified_diff("backend/api/orders.py", [f"val_{i} = {i}" for i in range(20)])
+        + _make_unified_diff("frontend/src/App.tsx", [f"const x{i} = {i};" for i in range(20)])
+        + _make_unified_diff("packages/core/src/calc.ts", [f"const y{i} = {i};" for i in range(20)])
+    )
+    multi_report = detect_missing_test_companion(multi_layout_diff)
+    assert multi_report.added_source_logic_lines == 60
+    assert multi_report.source_files == (
+        "backend/api/orders.py",
+        "frontend/src/App.tsx",
+        "packages/core/src/calc.ts",
+    )
+    assert multi_report.is_untested is True
+
+
+def test_s2_07_docs_and_fixtures_in_tests_dir_do_not_suppress_p_untested() -> None:
+    """S2-07: Non-code files under test_globs (tests/README.md) must not suppress P_untested."""
+    diff_parser = SmartDiffParser()
+    fifty_one_py_lines = [f"step_{i} = {i}" for i in range(51)]
+
+    # Markdown (`README.md`) and `.d.ts` or fixture entries reach `detect_missing_test_companion`.
+    raw_untested_with_test_docs = (
+        _make_unified_diff("src/codesight/service.py", fifty_one_py_lines)
+        + _make_unified_diff("tests/README.md", ["# Test Suite Guide", "Run pytest -q."])
+        + _make_unified_diff("tests/fixtures/sample.json", ['{"ok": true}'])
+        + _make_unified_diff("src/__tests__/App.test.tsx.snap", ['exports[`App 1`] = `"ok"`;'])
+        + _make_unified_diff("tests/types.test.d.ts", ["export type TestHelper = string;"])
+    )
+    pr_untested = diff_parser.parse_diff(raw_untested_with_test_docs)
+    # Ensure `tests/README.md` reached `pr_untested.files` (reproducing the exact S2-07 bug)
+    assert any(f.file_path == "tests/README.md" for f in pr_untested.files)
+
+    rep_untested = detect_missing_test_companion(pr_untested)
+    assert rep_untested.added_source_logic_lines == 51
+    assert rep_untested.added_test_logic_lines == 0
+    assert rep_untested.test_files == ()
+    assert rep_untested.is_untested is True
+
+    # Real Python test file alongside `tests/README.md` -> counts only the `.py` test logic lines
+    raw_with_py_test = raw_untested_with_test_docs + _make_unified_diff(
+        "tests/unit/test_service.py",
+        ["def test_service_steps() -> None:", "    val = 1", "    assert val == 1"],
+    )
+    rep_py_tested = detect_missing_test_companion(diff_parser.parse_diff(raw_with_py_test))
+    assert rep_py_tested.added_source_logic_lines == 51
+    assert rep_py_tested.added_test_logic_lines == 3
+    assert rep_py_tested.test_files == ("tests/unit/test_service.py",)
+    assert rep_py_tested.is_untested is False
+
+    # Real colocated TSX test file alongside `src/__tests__/README.md` -> counts only `.tsx`
+    fifty_one_ts_lines = [f"export const v{i} = {i};" for i in range(51)]
+    raw_with_tsx_test = (
+        _make_unified_diff("src/ui/App.tsx", fifty_one_ts_lines)
+        + _make_unified_diff("src/__tests__/README.md", ["# UI Test Notes"])
+        + _make_unified_diff(
+            "src/__tests__/App.test.tsx",
+            ["it('renders', () => {", "  const ok = true;", "  expect(ok).toBe(true);"],
+        )
+    )
+    rep_tsx_tested = detect_missing_test_companion(diff_parser.parse_diff(raw_with_tsx_test))
+    assert rep_tsx_tested.added_source_logic_lines == 51
+    assert rep_tsx_tested.added_test_logic_lines == 3
+    assert rep_tsx_tested.test_files == ("src/__tests__/App.test.tsx",)
+    assert rep_tsx_tested.is_untested is False

@@ -1335,7 +1335,8 @@ class TestReviewFixRegressions:
         assert embedder._compute_backoff_delay(2) == 4.0
         assert embedder._compute_backoff_delay(3) == 5.0
         assert embedder._compute_backoff_delay(4) == 5.0
-        assert embedder._compute_backoff_delay(0, retry_after=9.0) == 9.0
+        assert embedder._compute_backoff_delay(0, retry_after=9.0) == 5.0
+        assert embedder._compute_backoff_delay(0, retry_after=0.2) == 1.0
 
     def test_new01_allows_valid_tsx_destructuring_and_inline_object_type_signatures(
         self,
@@ -1701,3 +1702,193 @@ def test_zerocode_auditor_hardening_ident_canaries_signature_and_cli(
     with pytest.raises(SystemExit) as exc_info:
         zerocode_auditor.main()
     assert exc_info.value.code == 2
+
+
+def test_embedding_text_drops_imports_while_payload_retains_imports() -> None:
+    chunk = _make_chunk(1)
+    emb_text = chunk.build_embedding_text()
+    assert "file: src/codesight/auth.py" in emb_text
+    assert "symbol: AuthService.verify_token_1 (method)" in emb_text
+    assert "signature: def verify_token_1(self, token: str) -> bool" in emb_text
+    assert "calls: compare_digest, new" in emb_text
+    assert "imports:" not in emb_text
+
+    payload = chunk.to_qdrant_payload(repo_full_name="org/repo", blob_sha="sha-h3")
+    assert payload["imports"] == ["hmac", "hashlib"]
+
+
+@pytest.mark.asyncio
+async def test_parse_gemini_retry_delay_backoff_cap_and_defaults() -> None:
+    from codesight.rag.embedder import (
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_CAP_SECONDS,
+        parse_gemini_retry_delay,
+    )
+
+    assert DEFAULT_MAX_RETRIES == 5
+    assert DEFAULT_RETRY_CAP_SECONDS == 65.0
+
+    exc_with_retry_info = errors.ClientError(
+        429,
+        {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "42.5s",
+                    }
+                ],
+            }
+        },
+        SimpleNamespace(headers={}),
+    )
+    assert parse_gemini_retry_delay(exc_with_retry_info, {}) == pytest.approx(42.5)
+    assert parse_gemini_retry_delay(
+        errors.ClientError(429, {"error": {"message": "limit"}}, SimpleNamespace(headers={})),
+        {"Retry-After": "12"},
+    ) == pytest.approx(12.0)
+
+    client, _ = _make_fake_genai_client()
+    embedder = GeminiEmbedder(client=client)
+    assert embedder._retry_cap_seconds == 65.0
+    assert embedder._max_retries == 5
+    assert embedder._compute_backoff_delay(0, retry_after=300.0) == 65.0
+    assert embedder._compute_backoff_delay(0, retry_after=0.2) == 1.0
+
+    sleeps: list[float] = []
+    attempts = 0
+
+    async def _retry_info_once(
+        *,
+        model: str,
+        contents: list[str],
+        config: types.EmbedContentConfig | None = None,
+    ) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise exc_with_retry_info
+        return SimpleNamespace(
+            embeddings=[SimpleNamespace(values=_make_unit_vector(i)) for i in range(len(contents))]
+        )
+
+    async def _record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    retry_client, _ = _make_fake_genai_client(handler=_retry_info_once)
+    retry_embedder = GeminiEmbedder(client=retry_client, sleep_fn=_record_sleep)
+    item = TransientEmbeddingItem.from_code_chunk(
+        _make_chunk(0),
+        repo_full_name="org/repo",
+        blob_sha="sha-retry-info",
+    )
+    res = await retry_embedder.embed_items([item])
+    assert res.embedded_count == 1
+    assert sleeps == [42.5]
+
+
+@pytest.mark.asyncio
+async def test_async_tpm_limiter_paces_cumulative_tokens_and_settings_defaults() -> None:
+    from codesight.rag.embedder import _AsyncTPMLimiter
+
+    defaults = Settings(_env_file=None)
+    assert defaults.index_embed_code_chunks is False
+    assert defaults.gemini_embed_tpm_budget == 25_000
+    assert defaults.gemini_embed_concurrency == 2
+
+    now = 100.0
+    sleeps: list[float] = []
+
+    def _clock() -> float:
+        return now
+
+    async def _fake_sleep(delay: float) -> None:
+        nonlocal now
+        sleeps.append(delay)
+        now += delay
+
+    limiter = _AsyncTPMLimiter(tpm_budget=1_000, sleep_fn=_fake_sleep, clock_fn=_clock)
+    # 2,400 chars -> 600 estimated tokens <= 1,000 budget (no sleep)
+    await limiter.acquire(["a" * 2_400])
+    assert sleeps == []
+    # Next 2,400 chars -> 600 tokens; cumulative 1,200 > 1,000 within 60s -> sleeps 60.0s
+    await limiter.acquire(["b" * 2_400])
+    assert len(sleeps) == 1
+    assert sleeps[0] == pytest.approx(60.0)
+
+    # Also verify GeminiEmbedder wires tpm_budget pacing end-to-end
+    client, models_stub = _make_fake_genai_client()
+    emb_sleeps: list[float] = []
+    emb_now = 200.0
+
+    async def _emb_sleep(delay: float) -> None:
+        nonlocal emb_now
+        emb_sleeps.append(delay)
+        emb_now += delay
+
+    embedder = GeminiEmbedder(
+        client=client,
+        batch_size=1,
+        tpm_budget=500,
+        sleep_fn=_emb_sleep,
+        clock_fn=lambda: emb_now,
+    )
+    items = [
+        TransientEmbeddingItem(
+            point_id=str(uuid.uuid4()),
+            chunk_type="architecture_doc",
+            payload={
+                "repo_full_name": "org/repo",
+                "file_path": f"docs/doc_{i}.md",
+                "blob_sha": "sha-tpm",
+                "chunk_type": "architecture_doc",
+                "language": "markdown",
+                "symbol_name": f"Section {i}",
+                "symbol_kind": "section",
+                "start_line": 1,
+                "end_line": 10,
+                "signature": f"Section {i}",
+                "called_symbols": [],
+                "imports": [],
+                "cyclomatic_complexity": 0,
+            },
+            _embedding_text="x" * 1_600,  # 400 tokens each -> 2nd item exceeds 500 TPM
+        )
+        for i in range(2)
+    ]
+    res = await embedder.embed_items(items)
+    assert res.embedded_count == 2
+    assert len(models_stub.calls) == 2
+    assert len(emb_sleeps) == 1
+    assert emb_sleeps[0] == pytest.approx(60.0)
+
+    # Non-advancing sleep_fn stub must still terminate via virtual clock offset
+    static_sleeps: list[float] = []
+
+    async def _static_sleep(delay: float) -> None:
+        static_sleeps.append(delay)
+
+    static_limiter = _AsyncTPMLimiter(
+        tpm_budget=1_000,
+        sleep_fn=_static_sleep,
+        clock_fn=lambda: 500.0,
+    )
+    await static_limiter.acquire(["a" * 2_400])
+    await static_limiter.acquire(["b" * 2_400])
+    assert static_sleeps == [pytest.approx(60.0)]
+
+    # Settings without test client enables TPM limiter and concurrency=2; with test client disables
+    prod_like = GeminiEmbedder(
+        settings=Settings(_env_file=None, gemini_api_key=SecretStr("test-key")),
+    )
+    assert prod_like._max_concurrency == 2
+    assert prod_like._tpm_limiter is not None
+    assert prod_like._tpm_limiter._tpm_budget == 25_000
+
+    with_test_client = GeminiEmbedder(
+        settings=Settings(_env_file=None, gemini_api_key=SecretStr("test-key")),
+        client=client,
+    )
+    assert with_test_client._tpm_limiter is None

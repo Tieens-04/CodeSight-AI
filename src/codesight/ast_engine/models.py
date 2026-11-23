@@ -98,8 +98,6 @@ class CodeSymbolChunk:
         lines.append(f"signature: {self.signature}")
         if self.docstring:
             lines.append(f"docstring: {self.docstring}")
-        if self.imports:
-            lines.append(f"imports: {', '.join(self.imports)}")
         if self.called_symbols:
             lines.append(f"calls: {', '.join(self.called_symbols)}")
         return "\n".join(lines)

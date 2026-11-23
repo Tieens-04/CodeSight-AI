@@ -1,0 +1,54 @@
+{
+  "repos": [
+    {
+      "repo_full_name": "Tieens-04/CodeSight-AI",
+      "language": "python",
+      "probes": [
+        {
+          "file_path": "src/codesight/rag/qdrant_store.py",
+          "symbol_name": "upsert_points",
+          "expected_callers": [
+            "src/codesight/rag/indexer.py::_index_repository_unlocked",
+            "src/codesight/rag/indexer.py::sync_push"
+          ],
+          "expected_callees": [
+            "src/codesight/rag/models.py::validate_zero_code_point"
+          ],
+          "expected_docs": [
+            "AGENTS.md::CodeSight-AI — Project Rules, Architecture Invariants & Jira Workflow > 4. Non-Negotiable Engineering & Security Invariants"
+          ]
+        },
+        {
+          "file_path": "src/codesight/diff/smart_diff_parser.py",
+          "symbol_name": "parse_diff",
+          "expected_callers": [
+            "src/codesight/cli/commands/review.py::fetch_pull_request_dry_run",
+            "src/codesight/vcs/github_pr_client.py::fetch_pull_request_diff"
+          ],
+          "expected_callees": [
+            "src/codesight/diff/file_filter.py::evaluate",
+            "src/codesight/diff/file_filter.py::build_skipped_record",
+            "src/codesight/diff/hunk_mapper.py::map_hunks"
+          ],
+          "expected_docs": [
+            "AGENTS.md::CodeSight-AI — Project Rules, Architecture Invariants & Jira Workflow > 4. Non-Negotiable Engineering & Security Invariants"
+          ]
+        },
+        {
+          "file_path": "src/codesight/vcs/blob_fetcher.py",
+          "symbol_name": "fetch_slices",
+          "expected_callers": [
+            "src/codesight/rag/retriever.py::retrieve_and_pack"
+          ],
+          "expected_callees": [
+            "src/codesight/diff/file_filter.py::normalize_diff_path",
+            "src/codesight/vcs/github_auth.py::validate_repo_full_name"
+          ],
+          "expected_docs": [
+            "AGENTS.md::CodeSight-AI — Project Rules, Architecture Invariants & Jira Workflow > 4. Non-Negotiable Engineering & Security Invariants"
+          ]
+        }
+      ]
+    }
+  ]
+}

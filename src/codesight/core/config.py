@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     # Week 1 E2E milestone smoke review behavior (set False when LangGraph AI pipeline takes over)
     week1_smoke_inline_comment: bool = True
 
+    # Hybrid Code RAG indexing & Gemini embedding quota discipline
+    index_embed_code_chunks: bool = False
+    gemini_embed_tpm_budget: int = Field(default=25_000, ge=1_000)
+    gemini_embed_concurrency: int = Field(default=2, ge=1, le=10)
+    index_task_soft_time_limit_seconds: int = Field(default=300, ge=30)
+    index_task_hard_time_limit_seconds: int = Field(default=360, ge=60)
+
     # Optional Phase 2+ secrets (kept None until configured)
     github_app_id: str | None = None
     github_private_key: SecretStr | None = None
@@ -62,6 +69,11 @@ class Settings(BaseSettings):
     langfuse_secret_key: SecretStr | None = None
     langfuse_host: str = "https://cloud.langfuse.com"
 
+    # Optional Milestone 2 live evaluation overrides
+    codesight_live_py_repo: str | None = None
+    codesight_live_ts_repo: str | None = None
+    codesight_qdrant_container: str | None = None
+
     @model_validator(mode="after")
     def _validate_production_secrets(self) -> Self:
         if (
@@ -69,6 +81,10 @@ class Settings(BaseSettings):
             and self.postgres_password.get_secret_value() == "codesight_dev_password"
         ):
             raise ValueError("POSTGRES_PASSWORD must not use the dev default in production.")
+        if self.index_task_hard_time_limit_seconds <= self.index_task_soft_time_limit_seconds:
+            raise ValueError(
+                "INDEX_TASK_HARD_TIME_LIMIT_SECONDS must exceed INDEX_TASK_SOFT_TIME_LIMIT_SECONDS."
+            )
         return self
 
     @property
@@ -90,6 +106,13 @@ class Settings(BaseSettings):
     def has_github_credentials(self) -> bool:
         """Return True when either GitHub App or PAT credentials are configured."""
         return self.has_github_app_credentials or self.has_github_token
+
+    @property
+    def has_gemini_api_key(self) -> bool:
+        """Return True when a non-empty GEMINI_API_KEY is configured."""
+        return bool(
+            self.gemini_api_key is not None and self.gemini_api_key.get_secret_value().strip()
+        )
 
     def _build_postgres_dsn(self, scheme: str) -> str:
         user = quote_plus(self.postgres_user)

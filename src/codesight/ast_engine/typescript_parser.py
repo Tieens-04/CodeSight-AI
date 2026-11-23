@@ -21,7 +21,7 @@ from codesight.ast_engine._ast_utils import (
 )
 from codesight.ast_engine._typescript_ast import (
     TypeScriptDefinitionEvent,
-    extract_ts_callee_target,
+    extract_ts_callee_targets,
     get_typescript_grammar,
     is_ts_scope_boundary,
     iter_typescript_definitions,
@@ -344,6 +344,7 @@ def _extract_ts_called_symbols(
     nodes: Sequence[Node],
     source_bytes: bytes,
     *,
+    enclosing_class: str | None = None,
     wrapper_nodes: tuple[Node, ...] = (),
     line_range: tuple[int, int] | None = None,
 ) -> tuple[str, ...]:
@@ -352,11 +353,13 @@ def _extract_ts_called_symbols(
     for wrapper in wrapper_nodes:
         w_line = wrapper.start_point[0] + 1
         if line_range is None or (line_range[0] <= w_line <= line_range[1]):
-            extracted = extract_ts_callee_target(
-                wrapper.child_by_field_name("function"), source_bytes
+            matches.extend(
+                extract_ts_callee_targets(
+                    wrapper.child_by_field_name("function"),
+                    source_bytes,
+                    enclosing_class=enclosing_class,
+                )
             )
-            if extracted is not None:
-                matches.append(extracted)
 
     stack: list[Node] = list(reversed(nodes))
     while stack:
@@ -366,17 +369,21 @@ def _extract_ts_called_symbols(
 
         if in_range:
             if current.type == "call_expression":
-                extracted = extract_ts_callee_target(
-                    current.child_by_field_name("function"), source_bytes
+                matches.extend(
+                    extract_ts_callee_targets(
+                        current.child_by_field_name("function"),
+                        source_bytes,
+                        enclosing_class=enclosing_class,
+                    )
                 )
-                if extracted is not None:
-                    matches.append(extracted)
             elif current.type == "new_expression":
-                extracted = extract_ts_callee_target(
-                    current.child_by_field_name("constructor"), source_bytes
+                matches.extend(
+                    extract_ts_callee_targets(
+                        current.child_by_field_name("constructor"),
+                        source_bytes,
+                        enclosing_class=enclosing_class,
+                    )
                 )
-                if extracted is not None:
-                    matches.append(extracted)
             elif current.type in {"jsx_opening_element", "jsx_self_closing_element"}:
                 extracted = _extract_jsx_component_name(current, source_bytes)
                 if extracted is not None:
@@ -522,9 +529,27 @@ class TypeScriptASTParser:
             )
 
         module_imports = _collect_ts_imports(root, source_bytes)
+        scope_classes: dict[tuple[str, ...], str | None] = {(): None}
         chunks: list[CodeSymbolChunk] = []
 
         for event in iter_typescript_definitions(root, source_bytes):
+            parent_class = scope_classes.get(event.scope_stack[:-1])
+            if event.symbol_kind == "class":
+                scope_classes[event.scope_stack] = event.symbol_name
+                enclosing_class_for_calls: str | None = None
+            elif event.symbol_kind == "method":
+                enclosing_class_for_calls = parent_class
+                scope_classes[event.scope_stack] = parent_class
+            elif event.symbol_kind == "function":
+                is_arrow = (
+                    event.callable_node is not None and event.callable_node.type == "arrow_function"
+                )
+                enclosing_class_for_calls = parent_class if is_arrow else None
+                scope_classes[event.scope_stack] = enclosing_class_for_calls
+            else:
+                enclosing_class_for_calls = None
+                scope_classes[event.scope_stack] = None
+
             qualified_name = ".".join(event.scope_stack)
             start_line, _ = node_line_span(event.start_node, source_bytes)
             _, end_line = node_line_span(event.outer_node, source_bytes)
@@ -575,6 +600,7 @@ class TypeScriptASTParser:
                         called_symbols=_extract_ts_called_symbols(
                             call_scope_nodes,
                             source_bytes,
+                            enclosing_class=enclosing_class_for_calls,
                             wrapper_nodes=event.wrapper_nodes,
                             line_range=win,
                         ),

@@ -104,6 +104,13 @@ def check_python_gates(repo_root: Path) -> tuple[list[str], list[str]]:
     if rc != 0:
         errors.append(f"`uv run ruff check .` failed:\n{out}")
 
+    rc, out = run_cmd([uv_bin, "run", "ruff", "format", "--check", "."], repo_root)
+    summaries.append(
+        f"ruff-format: {'PASS' if rc == 0 else 'FAIL'} ({out.splitlines()[-1] if out else 'ok'})"
+    )
+    if rc != 0:
+        errors.append(f"`uv run ruff format --check .` failed:\n{out}")
+
     target_dir = "src" if (repo_root / "src").exists() else "."
     rc, out = run_cmd([uv_bin, "run", "mypy", target_dir], repo_root)
     summaries.append(f"mypy: {'PASS' if rc == 0 else 'FAIL'} ({out.splitlines()[-1] if out else 'ok'})")

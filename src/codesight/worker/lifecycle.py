@@ -12,6 +12,7 @@ import redis.asyncio as redis_async
 import redis.exceptions
 import sqlalchemy.exc as sa_exc
 import structlog
+from celery.exceptions import SoftTimeLimitExceeded
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from codesight.config_reader.repo_config import RepoConfig, RepoConfigLoader
@@ -84,6 +85,8 @@ def classify_retryable_exception(exc: BaseException) -> tuple[bool, float | None
     """Return (is_retryable, optional_retry_after_seconds) for worker exception triage."""
     if isinstance(exc, (PRSupersededError, GitHubAuthConfigError)):
         return False, None
+    if isinstance(exc, SoftTimeLimitExceeded):
+        return True, 5.0
     if isinstance(exc, RetryableTaskError):
         return True, exc.retry_after_seconds
     if isinstance(exc, GitHubAuthError):

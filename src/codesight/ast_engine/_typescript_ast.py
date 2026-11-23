@@ -99,21 +99,51 @@ def _unwrap_expression_wrappers(node: Node, *, allow_await: bool = False) -> Nod
     return current
 
 
+def extract_ts_callee_targets(
+    target: Node | None,
+    source_bytes: bytes,
+    *,
+    enclosing_class: str | None = None,
+) -> list[tuple[int, str]]:
+    """Extract `(start_byte, callee_name)` pairs (bare + receiver-qualified) from TS/TSX calls."""
+    if target is None:
+        return []
+    current = _unwrap_expression_wrappers(target, allow_await=True)
+    if current.type == "identifier":
+        name = node_text(current, source_bytes)
+        return [(current.start_byte, name)] if name else []
+    if current.type == "member_expression":
+        prop = current.child_by_field_name("property")
+        if prop is None:
+            return []
+        prop_name = node_text(prop, source_bytes)
+        if not prop_name:
+            return []
+        matches: list[tuple[int, str]] = [(prop.start_byte, prop_name)]
+        obj = current.child_by_field_name("object")
+        if obj is not None:
+            unwrapped_obj = _unwrap_expression_wrappers(obj, allow_await=True)
+            if unwrapped_obj.type in {"this", "super"}:
+                if enclosing_class:
+                    matches.append((prop.start_byte, f"{enclosing_class}.{prop_name}"))
+            elif unwrapped_obj.type == "identifier":
+                receiver = node_text(unwrapped_obj, source_bytes)
+                if receiver in {"this", "super"}:
+                    if enclosing_class:
+                        matches.append((prop.start_byte, f"{enclosing_class}.{prop_name}"))
+                elif receiver:
+                    matches.append((prop.start_byte, f"{receiver}.{prop_name}"))
+        return matches
+    return []
+
+
 def extract_ts_callee_target(
     target: Node | None,
     source_bytes: bytes,
 ) -> tuple[int, str] | None:
-    """Extract `(start_byte, callee_name)` from a TypeScript/TSX call or constructor target."""
-    if target is None:
-        return None
-    current = _unwrap_expression_wrappers(target, allow_await=True)
-    if current.type == "identifier":
-        return current.start_byte, node_text(current, source_bytes)
-    if current.type == "member_expression":
-        prop = current.child_by_field_name("property")
-        if prop is not None:
-            return prop.start_byte, node_text(prop, source_bytes)
-    return None
+    """Extract primary `(start_byte, callee_name)` from a TypeScript/TSX call target."""
+    matches = extract_ts_callee_targets(target, source_bytes)
+    return matches[0] if matches else None
 
 
 def unwrap_callable_initializer(
