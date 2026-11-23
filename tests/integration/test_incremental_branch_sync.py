@@ -714,3 +714,255 @@ async def test_s2_01_live_redis_lua_lock_loss_blocks_stale_qdrant_delete_and_cur
     finally:
         await redis_client.aclose()
         await engine.dispose()
+
+
+def _load_run_m2_eval_module() -> Any:
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location(
+        "run_m2_eval_live_test", repo_root / "evals" / "run_m2_eval.py"
+    )
+    assert spec is not None and spec.loader is not None
+    cli_mod = importlib.util.module_from_spec(spec)
+    sys.modules["run_m2_eval_live_test"] = cli_mod
+    spec.loader.exec_module(cli_mod)
+    return cli_mod
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_s2_02_and_s2_03_eval_cli_isolates_postgres_cursor_and_preserves_main_collection_live(
+    isolated_postgres_dsn: str,
+    isolated_qdrant_collection: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uuid
+    from urllib.parse import urlsplit
+
+    import asyncpg
+
+    from codesight.rag.indexer import (
+        AsyncRepoIndexLock,
+        IncrementalBranchSyncer,
+        InitialRepoIndexer,
+    )
+    from codesight.rag.live_eval import M2LiveEvaluationReport
+    from codesight.vcs.github_auth import GitHubAuthProvider
+
+    cli_mod = _load_run_m2_eval_module()
+
+    main_db_name = urlsplit(isolated_postgres_dsn).path.lstrip("/")
+    py_slug = "codesight-eval/cursor-isolation"
+    ts_slug = "codesight-eval/ts-isolation"
+    sha_v0 = "0" * 39 + "1"
+    sha_v1 = "b" * 40
+    src_v0 = b"def v0_fn() -> int:\n    return 0\n"
+    src_v1 = b"def v1_fn() -> int:\n    return 1\n"
+    blob_v0 = _sha1_blob(src_v0)
+    blob_v1 = _sha1_blob(src_v1)
+
+    main_engine = create_async_engine(isolated_postgres_dsn, echo=False)
+    async with main_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    main_session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
+        main_engine, expire_on_commit=False, autoflush=False
+    )
+
+    main_settings = Settings(
+        _env_file=None,
+        postgres_db=main_db_name,
+        qdrant_collection_name=isolated_qdrant_collection,
+        github_token=SecretStr("ghp_eval_isolation"),
+        gemini_api_key=SecretStr("gem_eval_isolation"),
+    )
+    redis_client = redis_async.from_url(main_settings.redis_url, decode_responses=True)
+    eval_col = f"codesight_m2_eval_it_{uuid.uuid4().hex[:8]}"
+
+    def _gh_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == f"/repos/{py_slug}":
+            return httpx.Response(
+                200, json={"id": 9901, "full_name": py_slug, "default_branch": "main"}
+            )
+        if path.startswith(f"/repos/{py_slug}/commits/"):
+            return httpx.Response(200, json={"sha": sha_v1})
+        if path.startswith(f"/repos/{py_slug}/contents/.codesight."):
+            return httpx.Response(404)
+        if path.startswith(f"/repos/{py_slug}/git/trees/"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": sha_v1,
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "src/main.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": blob_v1,
+                            "size": len(src_v1),
+                        }
+                    ],
+                },
+            )
+        if path == f"/repos/{py_slug}/compare/{sha_v0}...{sha_v1}":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ahead",
+                    "total_commits": 1,
+                    "files": [{"filename": "src/main.py", "status": "modified", "sha": blob_v1}],
+                },
+            )
+        if path.endswith(f"/git/blobs/{blob_v1}"):
+            return httpx.Response(
+                200, json={"sha": blob_v1, "encoding": "base64", "content": _b64(src_v1)}
+            )
+        if path.endswith(f"/git/blobs/{blob_v0}"):
+            return httpx.Response(
+                200, json={"sha": blob_v0, "encoding": "base64", "content": _b64(src_v0)}
+            )
+        return httpx.Response(404)
+
+    try:
+        async with QdrantZeroCodeStore(
+            settings=main_settings,
+            collection_name=isolated_qdrant_collection,
+        ) as main_store:
+            # 1. Seed main Qdrant collection & main PostgreSQL cursor at sha_v0
+            await main_store.ensure_collection()
+            async with main_session_factory() as session:
+                repo_row = Repository(
+                    github_repo_id=9901,
+                    full_name=py_slug,
+                    default_branch="main",
+                    last_indexed_sha=sha_v0,
+                )
+                session.add(repo_row)
+                await session.commit()
+                main_repo_id = str(repo_row.id)
+
+            # 2. S2-03 live: Passing pre-existing collection to _run_async raises ValueError
+            #    and leaves isolated_qdrant_collection intact!
+            args_collide = cli_mod._build_parser().parse_args(
+                [
+                    "--py-repo",
+                    py_slug,
+                    "--ts-repo",
+                    ts_slug,
+                    "--collection",
+                    isolated_qdrant_collection,
+                ]
+            )
+            with pytest.raises(ValueError, match="already exists"):
+                await cli_mod._run_async(
+                    args_collide,
+                    main_settings,
+                    py_repo=py_slug,
+                    ts_repo=ts_slug,
+                )
+            assert await main_store.client.collection_exists(isolated_qdrant_collection) is True
+
+            # 3. S2-02 live: _run_async indexes sha_v1 into isolated temp Postgres + eval_col
+            observed_eval_dbs: list[str] = []
+
+            async def _eval_indexing_sha_v1(**kw: Any) -> M2LiveEvaluationReport:
+                eval_sf = kw["session_factory"]
+                eval_store = kw["store"]
+                eval_cfg: Settings = kw["settings"]
+                observed_eval_dbs.append(eval_cfg.postgres_db)
+                async with httpx.AsyncClient(transport=httpx.MockTransport(_gh_handler)) as http:
+                    await run_cli_index(
+                        py_slug,
+                        settings=eval_cfg,
+                        http_client=http,
+                        redis_client=redis_client,
+                        session_factory=eval_sf,
+                        store=eval_store,
+                        embed_code_chunks=False,
+                    )
+                return M2LiveEvaluationReport(
+                    py_repo=py_slug,
+                    ts_repo=ts_slug,
+                    collection_name=eval_col,
+                    recall_at_5=1.0,
+                    p50_retrieval_ms=50.0,
+                    tokens_saved_pct=55.0,
+                    zerocode_violations=0,
+                )
+
+            monkeypatch.setattr(cli_mod, "run_milestone2_live_evaluation", _eval_indexing_sha_v1)
+            monkeypatch.setattr(cli_mod, "validate_m2_kpi_thresholds", lambda _r: [])
+
+            args_ok = cli_mod._build_parser().parse_args(
+                ["--py-repo", py_slug, "--ts-repo", ts_slug, "--collection", eval_col]
+            )
+            rc = await cli_mod._run_async(
+                args_ok,
+                main_settings,
+                py_repo=py_slug,
+                ts_repo=ts_slug,
+            )
+            assert rc == 0
+            assert len(observed_eval_dbs) == 1
+            assert observed_eval_dbs[0] != main_db_name
+            assert observed_eval_dbs[0].startswith("codesight_m2_eval_")
+
+            # Temporary eval Qdrant collection and temporary Postgres DB were both cleaned up!
+            assert await main_store.client.collection_exists(eval_col) is False
+            admin_conn = await asyncpg.connect(dsn=main_settings.postgres_dsn)
+            try:
+                exists_after = await admin_conn.fetchval(
+                    "SELECT 1 FROM pg_database WHERE datname = $1", observed_eval_dbs[0]
+                )
+                assert exists_after is None
+            finally:
+                await admin_conn.close()
+
+            # Main PostgreSQL cursor MUST still be sha_v0, so worker sync_push(sha_v1) runs!
+            async with main_session_factory() as session:
+                refreshed = (
+                    await session.execute(
+                        sa.select(Repository).where(Repository.full_name == py_slug)
+                    )
+                ).scalar_one()
+                assert refreshed.last_indexed_sha == sha_v0
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_gh_handler)) as http:
+                auth = GitHubAuthProvider(main_settings, http_client=http)
+                lock = AsyncRepoIndexLock(redis_client)
+                init_idx = InitialRepoIndexer(
+                    auth_provider=auth,
+                    embedder=None,
+                    store=main_store,
+                    http_client=http,
+                    session_factory=main_session_factory,
+                    repo_lock=lock,
+                )
+                syncer = IncrementalBranchSyncer(
+                    initial_indexer=init_idx,
+                    repo_client=init_idx.repo_client,
+                    embedder=None,
+                    store=main_store,
+                    session_factory=main_session_factory,
+                    lock=lock,
+                )
+                worker_rep = await syncer.sync_push(
+                    repo_full_name=py_slug,
+                    after_sha=sha_v1,
+                    repo_id=main_repo_id,
+                    github_repo_id=9901,
+                )
+                assert worker_rep.mode == "incremental_compare"
+                hits = await main_store.find_by_symbol_names(["v1_fn"], repo_full_name=py_slug)
+                assert len(hits) == 1
+    finally:
+        if await QdrantZeroCodeStore(settings=main_settings).client.collection_exists(eval_col):
+            tmp_q = QdrantZeroCodeStore(settings=main_settings)
+            await tmp_q.client.delete_collection(eval_col)
+            await tmp_q.aclose()
+        await redis_client.aclose()
+        await main_engine.dispose()

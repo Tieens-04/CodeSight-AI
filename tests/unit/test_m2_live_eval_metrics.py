@@ -1134,48 +1134,60 @@ def test_eval_cli_returns_0_on_pass_and_1_on_kpi_violation(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Thin CLI `evals/run_m2_eval.py` emits JSON report and maps KPI failures to exit 1."""
+    from contextlib import asynccontextmanager
+
     cli_mod = _load_eval_cli_module()
     monkeypatch.setattr(
         cli_mod,
         "Settings",
         lambda **_kw: Settings(
+            _env_file=None,
             gemini_api_key=SecretStr("gem_ok"),
             github_token=SecretStr("ghp_ok"),
         ),
     )
 
-    class _FakeConn:
-        async def run_sync(self, fn: Any) -> None:
-            del fn
-
-        async def __aenter__(self) -> _FakeConn:
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            return None
-
-    class _FakeEngine:
-        def begin(self) -> _FakeConn:
-            return _FakeConn()
-
-        async def dispose(self) -> None:
-            return None
+    created_collections: set[str] = set()
+    deleted_collections: list[str] = []
 
     class _FakeCleanupClient:
-        async def collection_exists(self, _name: str) -> bool:
-            return True
+        async def collection_exists(self, name: str) -> bool:
+            return name in created_collections
 
-        async def delete_collection(self, _name: str) -> None:
+        async def create_collection(self, collection_name: str, **_kw: Any) -> None:
+            created_collections.add(collection_name)
+
+        async def get_collection(self, _name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(size=EMBEDDING_DIMENSIONS, distance="cosine")
+                    )
+                ),
+                payload_schema={},
+            )
+
+        async def create_payload_index(self, **_kw: Any) -> None:
             return None
+
+        async def delete_collection(self, name: str) -> None:
+            deleted_collections.append(name)
+            created_collections.discard(name)
 
         async def close(self) -> None:
             return None
 
-    monkeypatch.setattr(cli_mod, "create_db_engine", lambda _s: _FakeEngine())
-    monkeypatch.setattr(cli_mod, "create_session_factory", lambda _e: object())
+    @asynccontextmanager
+    async def _fake_isolated_db(settings: Settings) -> Any:
+        yield settings.model_copy(update={"postgres_db": "codesight_m2_eval_fake"}), object()
+
+    monkeypatch.setattr(cli_mod, "isolated_eval_session_factory", _fake_isolated_db, raising=False)
     monkeypatch.setattr(cli_mod, "AsyncQdrantClient", lambda **_kw: _FakeCleanupClient())
 
-    async def _passing_eval(**_kw: Any) -> M2LiveEvaluationReport:
+    async def _passing_eval(**kw: Any) -> M2LiveEvaluationReport:
+        store = kw.get("store")
+        if store is not None:
+            await store.ensure_collection()
         return _make_sample_report()
 
     monkeypatch.setattr(cli_mod, "run_milestone2_live_evaluation", _passing_eval)
@@ -1183,19 +1195,166 @@ def test_eval_cli_returns_0_on_pass_and_1_on_kpi_violation(
         ["--py-repo", "Tieens-04/CodeSight-AI", "--ts-repo", "acme/web", "--collection", "eval_c"]
     )
     assert rc_ok == 0
+    assert deleted_collections == ["eval_c"]
     captured_ok = capsys.readouterr()
     parsed = json.loads(captured_ok.out)
     assert parsed["ts_repo"] == "acme/react-dashboard"
 
-    async def _failing_eval(**_kw: Any) -> M2LiveEvaluationReport:
+    async def _failing_eval(**kw: Any) -> M2LiveEvaluationReport:
+        store = kw.get("store")
+        if store is not None:
+            await store.ensure_collection()
         return _make_sample_report(recall_at_5=0.5)
 
     monkeypatch.setattr(cli_mod, "run_milestone2_live_evaluation", _failing_eval)
     rc_fail = cli_mod.main(
-        ["--py-repo", "Tieens-04/CodeSight-AI", "--ts-repo", "acme/web", "--keep-collection"]
+        [
+            "--py-repo",
+            "Tieens-04/CodeSight-AI",
+            "--ts-repo",
+            "acme/web",
+            "--collection",
+            "eval_keep_c",
+            "--keep-collection",
+        ]
     )
     assert rc_fail == 1
+    assert deleted_collections == ["eval_c"]
     assert "recall_at_5" in capsys.readouterr().err
+
+
+def test_s2_03_eval_cli_rejects_existing_collection_and_deletes_only_created_collection(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """S2-03: Reject existing --collection up front and delete only collections created by run."""
+    from contextlib import asynccontextmanager
+
+    cli_mod = _load_eval_cli_module()
+    monkeypatch.setattr(
+        cli_mod,
+        "Settings",
+        lambda **_kw: Settings(
+            _env_file=None,
+            gemini_api_key=SecretStr("gem_ok"),
+            github_token=SecretStr("ghp_ok"),
+        ),
+    )
+
+    live_collections: set[str] = {"codesight_ast_index", "pre_existing_col"}
+    deleted_calls: list[str] = []
+    db_entered = 0
+
+    class _TrackingQdrantClient:
+        async def collection_exists(self, name: str) -> bool:
+            return name in live_collections
+
+        async def create_collection(self, collection_name: str, **_kw: Any) -> None:
+            live_collections.add(collection_name)
+
+        async def get_collection(self, _name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(size=EMBEDDING_DIMENSIONS, distance="cosine")
+                    )
+                ),
+                payload_schema={},
+            )
+
+        async def create_payload_index(self, **_kw: Any) -> None:
+            return None
+
+        async def delete_collection(self, name: str) -> None:
+            deleted_calls.append(name)
+            live_collections.discard(name)
+
+        async def close(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def _tracking_isolated_db(settings: Settings) -> Any:
+        nonlocal db_entered
+        db_entered += 1
+        yield settings.model_copy(update={"postgres_db": "codesight_m2_eval_tmp"}), object()
+
+    monkeypatch.setattr(
+        cli_mod, "isolated_eval_session_factory", _tracking_isolated_db, raising=False
+    )
+    monkeypatch.setattr(cli_mod, "AsyncQdrantClient", lambda **_kw: _TrackingQdrantClient())
+
+    # 1. Colliding with an existing collection fails immediately and NEVER deletes it
+    rc_existing = cli_mod.main(
+        [
+            "--py-repo",
+            "Tieens-04/CodeSight-AI",
+            "--ts-repo",
+            "acme/web",
+            "--collection",
+            "pre_existing_col",
+        ]
+    )
+    assert rc_existing == 1
+    assert "already exists" in capsys.readouterr().err
+    assert db_entered == 0
+    assert deleted_calls == []
+    assert "pre_existing_col" in live_collections
+
+    # 2. Failure BEFORE indexing creates the collection does NOT call delete_collection
+    async def _fail_before_index(**_kw: Any) -> M2LiveEvaluationReport:
+        raise ValueError("TS repo discovery failed before indexing")
+
+    monkeypatch.setattr(cli_mod, "run_milestone2_live_evaluation", _fail_before_index)
+    rc_pre_err = cli_mod.main(
+        [
+            "--py-repo",
+            "Tieens-04/CodeSight-AI",
+            "--ts-repo",
+            "acme/web",
+            "--collection",
+            "never_created_col",
+        ]
+    )
+    assert rc_pre_err == 1
+    capsys.readouterr()
+    assert deleted_calls == []
+
+    # 3. Failure AFTER run created the collection cleans up ONLY that newly created collection
+    async def _fail_after_create(**kw: Any) -> M2LiveEvaluationReport:
+        store = kw["store"]
+        await store.ensure_collection()
+        assert store.created_collection is True
+        raise ValueError("TS repo failed after py_repo created collection")
+
+    monkeypatch.setattr(cli_mod, "run_milestone2_live_evaluation", _fail_after_create)
+    rc_mid_err = cli_mod.main(
+        [
+            "--py-repo",
+            "Tieens-04/CodeSight-AI",
+            "--ts-repo",
+            "acme/web",
+            "--collection",
+            "created_then_failed_col",
+        ]
+    )
+    assert rc_mid_err == 1
+    capsys.readouterr()
+    assert deleted_calls == ["created_then_failed_col"]
+    assert "pre_existing_col" in live_collections
+
+    # 4. Unsafe --collection identifier rejected before touching Qdrant
+    rc_unsafe = cli_mod.main(
+        [
+            "--py-repo",
+            "Tieens-04/CodeSight-AI",
+            "--ts-repo",
+            "acme/web",
+            "--collection",
+            "../unsafe",
+        ]
+    )
+    assert rc_unsafe == 1
+    assert deleted_calls == ["created_then_failed_col"]
 
 
 def test_validate_m2_kpi_thresholds_flags_zero_cases_and_aux_budget_on_repo_summary() -> None:

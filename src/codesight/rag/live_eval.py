@@ -7,15 +7,19 @@ import importlib.util
 import json
 import math
 import os
+import re
 import statistics
+import uuid
 from collections import Counter
-from collections.abc import Awaitable, Callable, Hashable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Sequence
 from collections.abc import Set as AbstractSet
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Final
 
+import asyncpg
 import httpx
 import redis.asyncio as redis_async
 import redis.exceptions
@@ -27,6 +31,8 @@ from codesight import __version__
 from codesight.ast_engine.models import CodeSymbolChunk, PRFileContext, SymbolKind
 from codesight.ast_engine.registry import ASTParserRegistry
 from codesight.core.config import Settings
+from codesight.db.models import Base
+from codesight.db.session import create_db_engine, create_session_factory
 from codesight.diff.file_filter import normalize_diff_path
 from codesight.diff.models import ParsedFileDiff, ParsedPullRequestDiff
 from codesight.diff.smart_diff_parser import SmartDiffParser
@@ -74,6 +80,65 @@ _FALLBACK_CANARY_LEN: Final[int] = 12
 _MAX_CANARY_LEN: Final[int] = 120
 _MAX_BODY_CANARIES_PER_REPO: Final[int] = 6
 _STATIC_FALLBACK_CANARY: Final[str] = "CODESIGHT_NFR3_SYNTHETIC_BODY_CANARY"
+_SAFE_COLLECTION_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_SAFE_DB_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^codesight_m2_eval_[0-9a-f]{8}$")
+
+
+def validate_eval_collection_name(raw_name: str) -> str:
+    """Validate an isolated Qdrant evaluation collection identifier."""
+    cleaned = raw_name.strip()
+    if not cleaned or ".." in cleaned or not _SAFE_COLLECTION_NAME_RE.fullmatch(cleaned):
+        raise ValueError(
+            f"Invalid Qdrant evaluation collection name {raw_name!r}; expected safe identifier."
+        )
+    return cleaned
+
+
+@asynccontextmanager
+async def isolated_eval_session_factory(
+    settings: Settings,
+) -> AsyncIterator[tuple[Settings, async_sessionmaker[AsyncSession]]]:
+    """Create a temporary PostgreSQL database so evaluation never mutates worker cursors."""
+    db_name = f"codesight_m2_eval_{uuid.uuid4().hex[:8]}"
+    if not _SAFE_DB_NAME_RE.fullmatch(db_name):
+        raise ValueError(f"Generated unsafe temporary evaluation database name: {db_name!r}")
+
+    created_db = False
+    admin_conn = await asyncpg.connect(dsn=settings.postgres_dsn)
+    try:
+        await admin_conn.execute(f'CREATE DATABASE "{db_name}"')
+        created_db = True
+    finally:
+        await admin_conn.close()
+
+    eval_db_settings = settings.model_copy(update={"postgres_db": db_name})
+    engine = create_db_engine(eval_db_settings)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        yield eval_db_settings, create_session_factory(engine)
+    finally:
+        await engine.dispose()
+        if created_db:
+            try:
+                cleanup_conn = await asyncpg.connect(dsn=settings.postgres_dsn)
+                try:
+                    await cleanup_conn.execute(
+                        "SELECT pg_terminate_backend(pid) "
+                        "FROM pg_stat_activity "
+                        "WHERE datname = $1 AND pid <> pg_backend_pid()",
+                        db_name,
+                    )
+                    await cleanup_conn.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
+                finally:
+                    await cleanup_conn.close()
+            except Exception as exc:
+                logger.warning(
+                    "m2_live_eval_isolated_db_cleanup_failed",
+                    db_name=db_name,
+                    error_type=type(exc).__name__,
+                )
+
 
 type IndexFn = Callable[..., Awaitable[InitialIndexReport]]
 type PointsLoaderFn = Callable[

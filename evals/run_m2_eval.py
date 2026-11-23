@@ -11,18 +11,18 @@ import uuid
 from collections.abc import Sequence
 
 from qdrant_client import AsyncQdrantClient
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from codesight.core.config import Settings
 from codesight.core.logging import configure_logging
-from codesight.db.models import Base
-from codesight.db.session import create_db_engine, create_session_factory
 from codesight.rag.live_eval import (
     DEFAULT_LIVE_PY_REPO,
     DEFAULT_PROBES_PER_REPO,
+    isolated_eval_session_factory,
     run_milestone2_live_evaluation,
+    validate_eval_collection_name,
     validate_m2_kpi_thresholds,
 )
+from codesight.rag.qdrant_store import QdrantZeroCodeStore
 from codesight.rag.retriever import DEFAULT_DOC_SCORE_THRESHOLD
 
 
@@ -83,7 +83,7 @@ async def _run_async(
     py_repo: str,
     ts_repo: str,
 ) -> int:
-    engine = create_db_engine(settings)
+    collection_name = validate_eval_collection_name(args.collection)
     qdrant_cleanup = AsyncQdrantClient(
         host=settings.qdrant_host,
         port=settings.qdrant_http_port,
@@ -91,39 +91,49 @@ async def _run_async(
         prefer_grpc=True,
         timeout=15,
     )
+    eval_store: QdrantZeroCodeStore | None = None
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        session_factory: async_sessionmaker = create_session_factory(engine)
-        report = await run_milestone2_live_evaluation(
-            settings=settings,
-            py_repo=py_repo,
-            ts_repo=ts_repo,
-            collection_name=args.collection,
-            session_factory=session_factory,
-            max_probes_per_repo=args.max_probes_per_repo,
-            doc_score_threshold=args.doc_threshold,
-        )
-        print(json.dumps(report.to_dict(), indent=2), file=sys.stdout)
-        violations = validate_m2_kpi_thresholds(report)
-        if violations:
-            print("[FAIL] Milestone 2 live KPI validation failed:", file=sys.stderr)
-            for item in violations:
-                print(f"  - {item}", file=sys.stderr)
-            return 1
-        return 0
+        if await qdrant_cleanup.collection_exists(collection_name):
+            raise ValueError(
+                f"Qdrant collection '{collection_name}' already exists; pass a fresh "
+                "--collection name to avoid overwriting or deleting existing data."
+            )
+
+        async with isolated_eval_session_factory(settings) as (eval_db_settings, session_factory):
+            eval_store = QdrantZeroCodeStore(
+                settings=eval_db_settings,
+                client=qdrant_cleanup,
+                collection_name=collection_name,
+            )
+            report = await run_milestone2_live_evaluation(
+                settings=eval_db_settings,
+                py_repo=py_repo,
+                ts_repo=ts_repo,
+                collection_name=collection_name,
+                session_factory=session_factory,
+                store=eval_store,
+                max_probes_per_repo=args.max_probes_per_repo,
+                doc_score_threshold=args.doc_threshold,
+            )
+            print(json.dumps(report.to_dict(), indent=2), file=sys.stdout)
+            violations = validate_m2_kpi_thresholds(report)
+            if violations:
+                print("[FAIL] Milestone 2 live KPI validation failed:", file=sys.stderr)
+                for item in violations:
+                    print(f"  - {item}", file=sys.stderr)
+                return 1
+            return 0
     finally:
-        if not args.keep_collection:
+        if eval_store is not None and eval_store.created_collection and not args.keep_collection:
             try:
-                if await qdrant_cleanup.collection_exists(args.collection):
-                    await qdrant_cleanup.delete_collection(args.collection)
+                if await qdrant_cleanup.collection_exists(collection_name):
+                    await qdrant_cleanup.delete_collection(collection_name)
             except Exception as exc:
                 print(
-                    f"[WARN] Failed cleaning up Qdrant collection '{args.collection}': {exc}",
+                    f"[WARN] Failed cleaning up Qdrant collection '{collection_name}': {exc}",
                     file=sys.stderr,
                 )
         await qdrant_cleanup.close()
-        await engine.dispose()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
