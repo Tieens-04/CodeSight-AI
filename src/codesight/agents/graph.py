@@ -1,0 +1,916 @@
+"""LangGraph Batch-Grouped Parallel (~3 LLM calls/PR) & Map-Reduce Send() PR review skeleton."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
+from typing import Any, Final, cast
+
+import structlog
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from codesight.agents.llm_factory import LLMFactory, StructuredInvocationResult
+from codesight.agents.schemas import (
+    AuditorRole,
+    BatchReviewResult,
+    CodeSuggestion,
+    CriticVerdict,
+    DiffBatch,
+    FindingCandidate,
+    FindingSeverity,
+    LLMAuditorDraftOutput,
+    LLMCallMetrics,
+    LLMCodeSuggestionDraft,
+    LLMCriticDraftOutput,
+    LLMCriticVerdictDraft,
+    LLMFindingDraft,
+    LLMRole,
+    PRReviewState,
+    UnreviewableDiffSegment,
+)
+from codesight.core.config import Settings
+from codesight.core.logging import get_trace_id, sanitize_trace_id
+from codesight.core.observability import create_langfuse_trace_session
+from codesight.diff.file_filter import estimate_tokens
+from codesight.diff.models import DiffHunk, ParsedFileDiff, ParsedPullRequestDiff
+
+DEFAULT_BATCH_DIFF_TOKEN_LIMIT: Final[int] = 12_000
+DEFAULT_MAX_REQUEST_TOKENS: Final[int] = 24_000
+DEFAULT_OUTPUT_RESERVE_TOKENS: Final[int] = 4_096
+
+_ROLE_PREFIX: Final[dict[AuditorRole, str]] = {
+    "security_auditor": "sec",
+    "logic_performance_auditor": "log",
+}
+_ROLE_ORDER: Final[dict[AuditorRole, int]] = {
+    "security_auditor": 0,
+    "logic_performance_auditor": 1,
+}
+_SEVERITY_RANK: Final[dict[FindingSeverity, int]] = {
+    "CRITICAL": 0,
+    "WARNING": 1,
+    "INFO": 2,
+}
+
+_SECURITY_SYSTEM_PROMPT: Final[str] = (
+    "You are CodeSight-AI Security Auditor. Inspect the line-annotated PR diff for security "
+    "vulnerabilities (injection, auth bypass, secret exposure, unsafe deserialization, SSRF). "
+    "Emit ONLY grounded FindingCandidate objects referencing exact RIGHT-side line numbers."
+)
+_LOGIC_SYSTEM_PROMPT: Final[str] = (
+    "You are CodeSight-AI Logic & Performance Auditor. Inspect the line-annotated PR diff for "
+    "logic defects, race conditions, resource leaks, and N+1 or algorithmic regressions. "
+    "Emit ONLY grounded FindingCandidate objects referencing exact RIGHT-side line numbers."
+)
+_CRITIC_SYSTEM_PROMPT: Final[str] = (
+    "You are CodeSight-AI Critic & Verification Agent. Review candidate findings against the diff "
+    "batch, reject false positives, approve or refine grounded issues, and emit CriticVerdict "
+    "entries linked by exact candidate_id."
+)
+
+_AUDITOR_SCHEMA_TOKENS: Final[int] = estimate_tokens(
+    json.dumps(LLMAuditorDraftOutput.model_json_schema(), separators=(",", ":"))
+)
+_CRITIC_SCHEMA_TOKENS: Final[int] = estimate_tokens(
+    json.dumps(LLMCriticDraftOutput.model_json_schema(), separators=(",", ":"))
+)
+
+logger = structlog.get_logger("codesight.agents.graph")
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewGraphConfig:
+    """Token-envelope configuration governing single-batch vs Map-Reduce Send() splitting."""
+
+    batch_diff_token_limit: int = DEFAULT_BATCH_DIFF_TOKEN_LIMIT
+    max_request_tokens: int = DEFAULT_MAX_REQUEST_TOKENS
+    output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS
+
+    def __post_init__(self) -> None:
+        if self.batch_diff_token_limit < 1:
+            raise ValueError("batch_diff_token_limit must be >= 1.")
+        if self.max_request_tokens < 1:
+            raise ValueError("max_request_tokens must be >= 1.")
+        if self.output_reserve_tokens < 0:
+            raise ValueError("output_reserve_tokens must be >= 0.")
+        if self.output_reserve_tokens >= self.max_request_tokens:
+            raise ValueError("output_reserve_tokens must be < max_request_tokens.")
+
+    def available_auditor_diff_tokens(self) -> int:
+        """Compute max diff tokens per batch after reserving instructions, schema, and output."""
+        prompt_overhead = (
+            max(
+                estimate_tokens(_SECURITY_SYSTEM_PROMPT),
+                estimate_tokens(_LOGIC_SYSTEM_PROMPT),
+            )
+            + _AUDITOR_SCHEMA_TOKENS
+            + 64  # user wrapper framing margin
+        )
+        available = self.max_request_tokens - self.output_reserve_tokens - prompt_overhead
+        if available < 1:
+            raise ValueError(
+                "max_request_tokens is too small to fit auditor instructions, schema, and output."
+            )
+        return min(self.batch_diff_token_limit, available)
+
+    def available_critic_payload_tokens(self) -> int:
+        """Compute max Critic user-message tokens after reserving instructions, schema, output."""
+        prompt_overhead = estimate_tokens(_CRITIC_SYSTEM_PROMPT) + _CRITIC_SCHEMA_TOKENS + 64
+        available = self.max_request_tokens - self.output_reserve_tokens - prompt_overhead
+        if available < 1:
+            raise ValueError(
+                "max_request_tokens is too small to fit critic instructions, schema, and output."
+            )
+        return available
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical File -> Hunk -> Line Diff Splitter
+# ---------------------------------------------------------------------------
+
+
+def _file_header(parsed_file: ParsedFileDiff) -> str:
+    return f"=== FILE: {parsed_file.file_path} ({parsed_file.change_type}) ==="
+
+
+class _BatchAccumulator:
+    """Mutable accumulator packing ordered (file_path, file_header, chunk_text) pieces in O(1)."""
+
+    def __init__(self, max_batch_tokens: int) -> None:
+        self._max_batch_tokens = max_batch_tokens
+        self._groups: list[tuple[str, str, list[str]]] = []
+        self._total_bytes: int = 0
+        self._batches: list[DiffBatch] = []
+
+    def _render_groups(self, groups: Sequence[tuple[str, str, Sequence[str]]]) -> str:
+        blocks = [f"{hdr}\n" + "\n".join(chunks) for _, hdr, chunks in groups]
+        return "\n\n".join(blocks)
+
+    def has_content(self) -> bool:
+        return bool(self._groups)
+
+    def try_add_chunk(self, file_path: str, file_header: str, chunk_text: str) -> bool:
+        chunk_bytes = len(chunk_text.encode("utf-8"))
+        same_file = bool(self._groups and self._groups[-1][0] == file_path)
+        if not self._groups:
+            hdr_bytes = len(file_header.encode("utf-8"))
+            new_total_bytes = hdr_bytes + 1 + chunk_bytes
+        elif same_file:
+            new_total_bytes = self._total_bytes + 1 + chunk_bytes
+        else:
+            hdr_bytes = len(file_header.encode("utf-8"))
+            new_total_bytes = self._total_bytes + 2 + hdr_bytes + 1 + chunk_bytes
+
+        new_tokens = (new_total_bytes + 3) // 4 if new_total_bytes > 0 else 0
+        if new_tokens <= self._max_batch_tokens:
+            if same_file:
+                self._groups[-1][2].append(chunk_text)
+            else:
+                self._groups.append((file_path, file_header, [chunk_text]))
+            self._total_bytes = new_total_bytes
+            return True
+        return False
+
+    def flush(self) -> None:
+        if not self._groups:
+            return
+        rendered = self._render_groups(self._groups)
+        file_paths = tuple(dict.fromkeys(fp for fp, _, _ in self._groups))
+        idx = len(self._batches)
+        self._batches.append(
+            DiffBatch(
+                batch_index=idx,
+                batch_id=f"batch-{idx:03d}",
+                file_paths=file_paths,
+                annotated_diff=rendered,
+                estimated_tokens=estimate_tokens(rendered),
+            )
+        )
+        self._groups = []
+        self._total_bytes = 0
+
+    def finalize(self) -> tuple[DiffBatch, ...]:
+        self.flush()
+        return tuple(self._batches)
+
+
+def _split_oversized_hunk_by_lines(
+    *,
+    parsed_file: ParsedFileDiff,
+    hunk: DiffHunk,
+    accumulator: _BatchAccumulator,
+    max_batch_tokens: int,
+    unreviewable: list[UnreviewableDiffSegment],
+) -> None:
+    hdr = _file_header(parsed_file)
+    hunk_header = hunk.annotated_text.split("\n", 1)[0]
+    prefix_bytes = len(f"{hdr}\n{hunk_header}".encode())
+
+    pending_lines: list[str] = []
+    pending_bytes = 0
+
+    def _flush_pending_lines() -> None:
+        nonlocal pending_lines, pending_bytes
+        if not pending_lines:
+            return
+        chunk = hunk_header + "\n" + "\n".join(pending_lines)
+        if not accumulator.try_add_chunk(parsed_file.file_path, hdr, chunk):
+            accumulator.flush()
+            added = accumulator.try_add_chunk(parsed_file.file_path, hdr, chunk)
+            if not added:  # pragma: no cover - guarded by standalone check below
+                raise RuntimeError("Line-split chunk unexpectedly exceeded batch token budget.")
+        pending_lines = []
+        pending_bytes = 0
+
+    for diff_line in hunk.lines:
+        line_bytes = len(diff_line.llm_text.encode("utf-8"))
+        standalone_bytes = prefix_bytes + 1 + line_bytes
+        standalone_tokens = (standalone_bytes + 3) // 4
+        if standalone_tokens > max_batch_tokens:
+            _flush_pending_lines()
+            unreviewable.append(
+                UnreviewableDiffSegment(
+                    file_path=parsed_file.file_path,
+                    hunk_id=hunk.hunk_id,
+                    right_line=diff_line.right_line,
+                    left_line=diff_line.left_line,
+                    estimated_tokens=standalone_tokens,
+                    reason="single_line_exceeds_batch_token_budget",
+                )
+            )
+            continue
+
+        trial_bytes = (
+            prefix_bytes + 1 + line_bytes if not pending_lines else pending_bytes + 1 + line_bytes
+        )
+        if ((trial_bytes + 3) // 4) <= max_batch_tokens:
+            pending_lines.append(diff_line.llm_text)
+            pending_bytes = trial_bytes
+        else:
+            _flush_pending_lines()
+            pending_lines = [diff_line.llm_text]
+            pending_bytes = standalone_bytes
+
+    _flush_pending_lines()
+
+
+def split_parsed_diff_into_batches(
+    parsed_diff: ParsedPullRequestDiff,
+    *,
+    max_batch_tokens: int = DEFAULT_BATCH_DIFF_TOKEN_LIMIT,
+) -> tuple[tuple[DiffBatch, ...], tuple[UnreviewableDiffSegment, ...]]:
+    """Partition a filtered ParsedPullRequestDiff hierarchically (file -> hunk -> line)."""
+    if max_batch_tokens < 1:
+        raise ValueError("max_batch_tokens must be >= 1.")
+
+    reviewable_files = [
+        f
+        for f in parsed_diff.files
+        if f.change_type != "deleted" and f.hunks and f.annotated_diff.strip()
+    ]
+    if not reviewable_files:
+        return (), ()
+
+    full_diff = "\n\n".join(f.annotated_diff for f in reviewable_files)
+    total_tokens = estimate_tokens(full_diff)
+    if total_tokens <= max_batch_tokens:
+        single_batch = DiffBatch(
+            batch_index=0,
+            batch_id="batch-000",
+            file_paths=tuple(f.file_path for f in reviewable_files),
+            annotated_diff=full_diff,
+            estimated_tokens=total_tokens,
+        )
+        return (single_batch,), ()
+
+    accumulator = _BatchAccumulator(max_batch_tokens=max_batch_tokens)
+    unreviewable: list[UnreviewableDiffSegment] = []
+
+    for parsed_file in reviewable_files:
+        hdr = _file_header(parsed_file)
+        file_hunks_body = "\n".join(h.annotated_text for h in parsed_file.hunks)
+
+        # 1. File-level packing: keep whole files together whenever possible.
+        if accumulator.try_add_chunk(parsed_file.file_path, hdr, file_hunks_body):
+            continue
+        if estimate_tokens(parsed_file.annotated_diff) <= max_batch_tokens:
+            accumulator.flush()
+            accumulator.try_add_chunk(parsed_file.file_path, hdr, file_hunks_body)
+            continue
+
+        # 2. Hunk-level packing: split oversized file at hunk boundaries.
+        for hunk in parsed_file.hunks:
+            if accumulator.try_add_chunk(parsed_file.file_path, hdr, hunk.annotated_text):
+                continue
+            if estimate_tokens(f"{hdr}\n{hunk.annotated_text}") <= max_batch_tokens:
+                accumulator.flush()
+                accumulator.try_add_chunk(parsed_file.file_path, hdr, hunk.annotated_text)
+                continue
+
+            # 3. Line-level packing: split oversized hunk at line boundaries preserving L-numbers.
+            accumulator.flush()
+            _split_oversized_hunk_by_lines(
+                parsed_file=parsed_file,
+                hunk=hunk,
+                accumulator=accumulator,
+                max_batch_tokens=max_batch_tokens,
+                unreviewable=unreviewable,
+            )
+
+    return accumulator.finalize(), tuple(unreviewable)
+
+
+# ---------------------------------------------------------------------------
+# Prompt Builders, Candidate Normalization & Critic Budget Guard
+# ---------------------------------------------------------------------------
+
+
+def _validate_suggestion_draft(
+    raw_suggestion: CodeSuggestion | LLMCodeSuggestionDraft | None,
+) -> CodeSuggestion | None:
+    if raw_suggestion is None:
+        return None
+    if isinstance(raw_suggestion, CodeSuggestion):
+        return raw_suggestion
+    try:
+        return CodeSuggestion.model_validate(
+            {
+                "start_line": raw_suggestion.start_line,
+                "end_line": raw_suggestion.end_line,
+                "replacement_code": raw_suggestion.replacement_code,
+                "explanation": raw_suggestion.explanation,
+            }
+        )
+    except ValidationError:
+        return None
+
+
+def _normalize_auditor_findings(
+    findings: Sequence[FindingCandidate | LLMFindingDraft],
+    *,
+    role: AuditorRole,
+    batch_index: int,
+) -> tuple[list[FindingCandidate], int]:
+    prefix = _ROLE_PREFIX[role]
+    normalized: list[FindingCandidate] = []
+    dropped_count = 0
+    for item in findings:
+        stable_id = f"b{batch_index:03d}-{prefix}-{len(normalized):03d}"
+        if isinstance(item, FindingCandidate):
+            normalized.append(
+                item.model_copy(
+                    update={
+                        "candidate_id": stable_id,
+                        "role": role,
+                        "batch_index": batch_index,
+                    }
+                )
+            )
+            continue
+        valid_suggestion = _validate_suggestion_draft(item.suggestion)
+        try:
+            candidate = FindingCandidate.model_validate(
+                {
+                    "candidate_id": stable_id,
+                    "role": role,
+                    "batch_index": batch_index,
+                    "file_path": item.file_path,
+                    "start_line": item.start_line,
+                    "end_line": item.end_line,
+                    "severity": item.severity.strip().upper(),
+                    "category": item.category,
+                    "title": item.title,
+                    "evidence": item.evidence,
+                    "confidence": item.confidence,
+                    "suggestion": valid_suggestion,
+                }
+            )
+        except ValidationError:
+            dropped_count += 1
+            continue
+        normalized.append(candidate)
+    return normalized, dropped_count
+
+
+def _normalize_critic_verdicts(
+    verdicts: Sequence[CriticVerdict | LLMCriticVerdictDraft],
+    *,
+    batch_index: int,
+    valid_candidate_ids: AbstractSet[str],
+) -> tuple[list[CriticVerdict], int]:
+    normalized: list[CriticVerdict] = []
+    seen_ids: set[str] = set()
+    dropped_count = 0
+
+    for item in verdicts:
+        if isinstance(item, CriticVerdict):
+            cid = item.candidate_id
+            if cid not in valid_candidate_ids or cid in seen_ids:
+                dropped_count += 1
+                continue
+            seen_ids.add(cid)
+            normalized.append(item.model_copy(update={"batch_index": batch_index}))
+            continue
+
+        valid_suggestion = _validate_suggestion_draft(item.suggestion)
+        adjusted_severity: str | None = None
+        if item.adjusted_severity is not None:
+            cleaned_sev = item.adjusted_severity.strip().upper()
+            if cleaned_sev in _SEVERITY_RANK:
+                adjusted_severity = cleaned_sev
+        try:
+            verdict = CriticVerdict.model_validate(
+                {
+                    "candidate_id": item.candidate_id,
+                    "batch_index": batch_index,
+                    "decision": item.decision.strip().upper(),
+                    "rationale": item.rationale,
+                    "adjusted_severity": adjusted_severity,
+                    "suggestion": valid_suggestion,
+                }
+            )
+        except ValidationError:
+            dropped_count += 1
+            continue
+
+        if verdict.candidate_id not in valid_candidate_ids or verdict.candidate_id in seen_ids:
+            dropped_count += 1
+            continue
+        seen_ids.add(verdict.candidate_id)
+        normalized.append(verdict)
+
+    return normalized, dropped_count
+
+
+def _build_auditor_messages(role: AuditorRole, batch: DiffBatch) -> list[BaseMessage]:
+    sys_prompt = _SECURITY_SYSTEM_PROMPT if role == "security_auditor" else _LOGIC_SYSTEM_PROMPT
+    user_prompt = f"Batch: {batch.batch_id} (index={batch.batch_index})\n\n{batch.annotated_diff}"
+    return [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
+
+
+def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    if max_bytes <= 3:
+        return "..."[:max_bytes]
+    clipped = encoded[: max_bytes - 3].decode("utf-8", errors="ignore")
+    return f"{clipped}..."
+
+
+def _build_critic_messages_within_budget(
+    *,
+    batch: DiffBatch,
+    candidates: Sequence[FindingCandidate],
+    available_user_tokens: int,
+) -> tuple[list[BaseMessage], tuple[str, ...]]:
+    """Pack Critic user message strictly inside `available_user_tokens` and return dropped IDs."""
+    ordered = sorted(
+        candidates,
+        key=lambda f: (
+            _SEVERITY_RANK[f.severity],
+            -f.confidence,
+            _ROLE_ORDER[f.role],
+            f.file_path,
+            f.start_line,
+            f.end_line,
+            f.candidate_id,
+        ),
+    )
+
+    header = f"Batch: {batch.batch_id} (index={batch.batch_index})\nCandidate Findings:\n"
+    diff_section_header = "\n\nDiff Excerpt:\n"
+
+    # Reserve at least 60% of Critic user budget for candidates and up to 40% for diff excerpt.
+    candidates_token_cap = max(1, int(available_user_tokens * 0.6)) if ordered else 0
+    selected_serialized: list[str] = []
+    truncated_ids: list[str] = []
+
+    for cand in ordered:
+        compact = {
+            "candidate_id": cand.candidate_id,
+            "role": cand.role,
+            "file_path": cand.file_path,
+            "start_line": cand.start_line,
+            "end_line": cand.end_line,
+            "severity": cand.severity,
+            "category": cand.category,
+            "title": _truncate_text_to_bytes(cand.title, 160),
+            "evidence": _truncate_text_to_bytes(cand.evidence, 320),
+            "confidence": cand.confidence,
+        }
+        entry_line = json.dumps(compact, separators=(",", ":"))
+        trial_text = header + "\n".join([*selected_serialized, entry_line])
+        if estimate_tokens(trial_text) <= candidates_token_cap:
+            selected_serialized.append(entry_line)
+        else:
+            truncated_ids.append(cand.candidate_id)
+
+    candidates_block = (
+        header + "\n".join(selected_serialized) if selected_serialized else f"{header}(none)"
+    )
+
+    used_tokens = estimate_tokens(candidates_block)
+    remaining_tokens = available_user_tokens - used_tokens - estimate_tokens(diff_section_header)
+    if remaining_tokens > 16:
+        diff_excerpt = _truncate_text_to_bytes(batch.annotated_diff, remaining_tokens * 4)
+        user_content = f"{candidates_block}{diff_section_header}{diff_excerpt}"
+    else:
+        user_content = candidates_block
+
+    # Hard final envelope guarantee: never exceed `available_user_tokens`.
+    if estimate_tokens(user_content) > available_user_tokens:
+        user_content = _truncate_text_to_bytes(user_content, available_user_tokens * 4)
+
+    return [
+        SystemMessage(content=_CRITIC_SYSTEM_PROMPT),
+        HumanMessage(content=user_content),
+    ], tuple(truncated_ids)
+
+
+def _sort_findings(findings: Sequence[FindingCandidate]) -> list[FindingCandidate]:
+    return sorted(
+        findings,
+        key=lambda f: (
+            f.batch_index,
+            _ROLE_ORDER[f.role],
+            f.file_path,
+            f.start_line,
+            f.end_line,
+            f.candidate_id,
+        ),
+    )
+
+
+def _sort_verdicts(verdicts: Sequence[CriticVerdict]) -> list[CriticVerdict]:
+    return sorted(verdicts, key=lambda v: (v.batch_index, v.candidate_id))
+
+
+def _node_config(
+    config: RunnableConfig | None,
+    *,
+    role: str,
+    batch: DiffBatch,
+) -> RunnableConfig:
+    base: dict[str, Any] = dict(config) if config is not None else {}
+    existing_meta = dict(cast(Mapping[str, Any], base.get("metadata") or {}))
+    existing_meta.update(
+        {
+            "role": role,
+            "batch_index": batch.batch_index,
+            "batch_id": batch.batch_id,
+        }
+    )
+    base["metadata"] = existing_meta
+    base["run_name"] = f"{role}_{batch.batch_id}"
+    return cast(RunnableConfig, base)
+
+
+# ---------------------------------------------------------------------------
+# LangGraph Construction & Async Entry Point
+# ---------------------------------------------------------------------------
+
+
+def _metrics_from_invocation(
+    role: LLMRole,
+    batch_index: int,
+    inv: StructuredInvocationResult[Any],
+) -> LLMCallMetrics:
+    return LLMCallMetrics(
+        role=role,
+        batch_index=batch_index,
+        model_name=inv.model_name,
+        input_tokens=inv.input_tokens,
+        output_tokens=inv.output_tokens,
+        total_tokens=inv.total_tokens,
+        estimated_cost_usd=inv.estimated_cost_usd,
+        latency_ms=inv.latency_ms,
+        attempts=inv.attempts,
+    )
+
+
+class _BatchWorkerInput(BaseModel):
+    """Input payload dispatched to each Map-Reduce `Send('process_diff_batch', ...)` branch."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    batch: DiffBatch
+
+
+def build_pr_review_graph(
+    llm_factory: LLMFactory,
+    *,
+    graph_config: ReviewGraphConfig | None = None,
+) -> Any:
+    """Compile the in-memory LangGraph StateGraph supporting single-batch and Send() Map-Reduce."""
+    cfg = graph_config if graph_config is not None else ReviewGraphConfig()
+    critic_user_budget = cfg.available_critic_payload_tokens()
+
+    async def _run_auditor(
+        role: AuditorRole,
+        batch: DiffBatch,
+        config: RunnableConfig | None,
+    ) -> tuple[list[FindingCandidate], LLMCallMetrics, int]:
+        messages = _build_auditor_messages(role, batch)
+        inv = await llm_factory.invoke_structured(
+            role=role,
+            schema=LLMAuditorDraftOutput,
+            messages=messages,
+            config=_node_config(config, role=role, batch=batch),
+        )
+        normalized, dropped_count = _normalize_auditor_findings(
+            inv.parsed.findings,
+            role=role,
+            batch_index=batch.batch_index,
+        )
+        metrics = _metrics_from_invocation(role, batch.batch_index, inv)
+        return normalized, metrics, dropped_count
+
+    async def _run_critic(
+        batch: DiffBatch,
+        candidates: Sequence[FindingCandidate],
+        config: RunnableConfig | None,
+    ) -> tuple[list[CriticVerdict], LLMCallMetrics, tuple[str, ...], int]:
+        messages, truncated_ids = _build_critic_messages_within_budget(
+            batch=batch,
+            candidates=candidates,
+            available_user_tokens=critic_user_budget,
+        )
+        inv = await llm_factory.invoke_structured(
+            role="critic",
+            schema=LLMCriticDraftOutput,
+            messages=messages,
+            config=_node_config(config, role="critic", batch=batch),
+        )
+        valid_candidate_ids = {c.candidate_id for c in candidates} - set(truncated_ids)
+        verdicts, dropped_verdicts = _normalize_critic_verdicts(
+            inv.parsed.verdicts,
+            batch_index=batch.batch_index,
+            valid_candidate_ids=valid_candidate_ids,
+        )
+        metrics = _metrics_from_invocation("critic", batch.batch_index, inv)
+        return verdicts, metrics, truncated_ids, dropped_verdicts
+
+    async def plan_batches(state: PRReviewState) -> dict[str, Any]:
+        if not state.batches:
+            return {"batching_mode": "empty"}
+        if len(state.batches) == 1:
+            return {"batching_mode": "single_batch"}
+        return {"batching_mode": "map_reduce"}
+
+    def route_after_plan(state: PRReviewState) -> str | list[str] | list[Send]:
+        if state.batching_mode == "empty" or not state.batches:
+            return "finalize_review"
+        if state.batching_mode == "single_batch":
+            # Parallel superstep fan-out -> fan-in to critic_synthesis (3 LLM calls total).
+            return ["security_auditor", "logic_performance_auditor"]
+        return [
+            Send("process_diff_batch", _BatchWorkerInput(batch=batch)) for batch in state.batches
+        ]
+
+    async def security_auditor(
+        state: PRReviewState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        batch = state.batches[0]
+        findings, metrics, dropped = await _run_auditor("security_auditor", batch, config)
+        return {
+            "security_findings": findings,
+            "dropped_invalid_findings_count": dropped,
+            "llm_metrics": [metrics],
+        }
+
+    async def logic_performance_auditor(
+        state: PRReviewState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        batch = state.batches[0]
+        findings, metrics, dropped = await _run_auditor("logic_performance_auditor", batch, config)
+        return {
+            "logic_findings": findings,
+            "dropped_invalid_findings_count": dropped,
+            "llm_metrics": [metrics],
+        }
+
+    async def critic_synthesis(
+        state: PRReviewState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        batch = state.batches[0]
+        combined = _sort_findings([*state.security_findings, *state.logic_findings])
+        verdicts, metrics, truncated_ids, dropped_verdicts = await _run_critic(
+            batch, combined, config
+        )
+        ordered_verdicts = _sort_verdicts(verdicts)
+        batch_result = BatchReviewResult(
+            batch_index=batch.batch_index,
+            batch_id=batch.batch_id,
+            findings=tuple(combined),
+            verdicts=tuple(ordered_verdicts),
+            truncated_candidates_count=len(truncated_ids),
+            truncated_candidate_ids=truncated_ids,
+            dropped_invalid_findings_count=state.dropped_invalid_findings_count,
+            dropped_invalid_verdicts_count=dropped_verdicts,
+        )
+        return {
+            "batch_results": [batch_result],
+            "merged_findings": combined,
+            "merged_verdicts": ordered_verdicts,
+            "llm_metrics": [metrics],
+        }
+
+    async def process_diff_batch(
+        state: _BatchWorkerInput,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        batch = state.batch
+        sec_task = asyncio.create_task(_run_auditor("security_auditor", batch, config))
+        log_task = asyncio.create_task(_run_auditor("logic_performance_auditor", batch, config))
+        try:
+            (
+                (sec_findings, sec_metrics, sec_dropped),
+                (log_findings, log_metrics, log_dropped),
+            ) = await asyncio.gather(sec_task, log_task)
+        except BaseException:
+            for task in (sec_task, log_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sec_task, log_task, return_exceptions=True)
+            raise
+        combined = _sort_findings([*sec_findings, *log_findings])
+        verdicts, critic_metrics, truncated_ids, dropped_verdicts = await _run_critic(
+            batch, combined, config
+        )
+        ordered_verdicts = _sort_verdicts(verdicts)
+        total_dropped_findings = sec_dropped + log_dropped
+        batch_result = BatchReviewResult(
+            batch_index=batch.batch_index,
+            batch_id=batch.batch_id,
+            findings=tuple(combined),
+            verdicts=tuple(ordered_verdicts),
+            truncated_candidates_count=len(truncated_ids),
+            truncated_candidate_ids=truncated_ids,
+            dropped_invalid_findings_count=total_dropped_findings,
+            dropped_invalid_verdicts_count=dropped_verdicts,
+        )
+        return {
+            "security_findings": sec_findings,
+            "logic_findings": log_findings,
+            "dropped_invalid_findings_count": total_dropped_findings,
+            "batch_results": [batch_result],
+            "llm_metrics": [sec_metrics, log_metrics, critic_metrics],
+        }
+
+    async def reduce_batches(state: PRReviewState) -> dict[str, Any]:
+        ordered_batches = sorted(state.batch_results, key=lambda b: b.batch_index)
+        merged_findings = _sort_findings(
+            [finding for br in ordered_batches for finding in br.findings]
+        )
+        merged_verdicts = _sort_verdicts(
+            [verdict for br in ordered_batches for verdict in br.verdicts]
+        )
+        return {
+            "merged_findings": merged_findings,
+            "merged_verdicts": merged_verdicts,
+        }
+
+    async def finalize_review(state: PRReviewState) -> dict[str, Any]:
+        if state.batching_mode == "empty":
+            if state.unreviewable_segments:
+                return {"status": "unreviewable_only"}
+            return {"status": "empty_diff"}
+        return {"status": "completed"}
+
+    graph: StateGraph[PRReviewState] = StateGraph(PRReviewState)
+    graph.add_node("plan_batches", plan_batches)
+    graph.add_node("security_auditor", security_auditor)
+    graph.add_node("logic_performance_auditor", logic_performance_auditor)
+    graph.add_node("critic_synthesis", critic_synthesis)
+    graph.add_node("process_diff_batch", process_diff_batch, input_schema=_BatchWorkerInput)
+    graph.add_node("reduce_batches", reduce_batches)
+    graph.add_node("finalize_review", finalize_review)
+
+    graph.add_edge(START, "plan_batches")
+    graph.add_conditional_edges(
+        "plan_batches",
+        route_after_plan,
+        ["security_auditor", "logic_performance_auditor", "process_diff_batch", "finalize_review"],
+    )
+    graph.add_edge("security_auditor", "critic_synthesis")
+    graph.add_edge("logic_performance_auditor", "critic_synthesis")
+    graph.add_edge("critic_synthesis", "finalize_review")
+    graph.add_edge("process_diff_batch", "reduce_batches")
+    graph.add_edge("reduce_batches", "finalize_review")
+    graph.add_edge("finalize_review", END)
+
+    # In-memory execution only — no persistent checkpointer (NFR-3 Zero-Code Persistence).
+    return graph.compile()
+
+
+async def run_pr_review_graph(
+    *,
+    parsed_diff: ParsedPullRequestDiff,
+    llm_factory: LLMFactory,
+    graph_config: ReviewGraphConfig | None = None,
+    pr_id: str = "pr-unknown",
+    head_sha: str = "",
+    trace_id: str | None = None,
+    settings: Settings | None = None,
+    span_exporter: Any = None,
+    telemetry_flush_timeout_seconds: float = 2.0,
+) -> PRReviewState:
+    """Execute the full in-memory LangGraph PR review pipeline on a ParsedPullRequestDiff."""
+    cfg = graph_config if graph_config is not None else ReviewGraphConfig()
+    effective_settings = settings if settings is not None else llm_factory.settings
+    raw_trace = trace_id if trace_id is not None else get_trace_id()
+    if raw_trace is not None and raw_trace.strip() in {"", "-"}:
+        raw_trace = None
+    effective_trace_id = sanitize_trace_id(raw_trace)
+
+    effective_batch_limit = cfg.available_auditor_diff_tokens()
+    batches, unreviewable = split_parsed_diff_into_batches(
+        parsed_diff,
+        max_batch_tokens=effective_batch_limit,
+    )
+    total_diff_tokens = estimate_tokens(parsed_diff.annotated_diff)
+
+    initial_state = PRReviewState(
+        pr_id=pr_id,
+        head_sha=head_sha[:64],
+        trace_id=effective_trace_id,
+        total_diff_tokens=total_diff_tokens,
+        batching_mode=(
+            "empty" if not batches else ("single_batch" if len(batches) == 1 else "map_reduce")
+        ),
+        batches=list(batches),
+        unreviewable_segments=list(unreviewable),
+    )
+
+    compiled = build_pr_review_graph(llm_factory, graph_config=cfg)
+    telemetry_session = create_langfuse_trace_session(
+        settings=effective_settings,
+        trace_id=effective_trace_id,
+        span_exporter=span_exporter,
+    )
+
+    run_config: RunnableConfig = {
+        "run_name": "codesight_pr_review",
+        "metadata": {
+            "pr_id": pr_id,
+            "head_sha": head_sha[:64],
+            "trace_id": effective_trace_id,
+            "batching_mode": initial_state.batching_mode,
+            "provider": llm_factory.provider,
+        },
+        "callbacks": list(telemetry_session.callbacks),
+    }
+
+    was_cancelled = False
+    final_telemetry = telemetry_session.telemetry_status
+    try:
+        raw_final = await compiled.ainvoke(initial_state, config=run_config)
+        final_state = (
+            raw_final
+            if isinstance(raw_final, PRReviewState)
+            else PRReviewState.model_validate(raw_final)
+        )
+    except asyncio.CancelledError:
+        was_cancelled = True
+        raise
+    finally:
+        if not was_cancelled:
+            final_telemetry = await telemetry_session.aflush_and_close(
+                timeout_seconds=telemetry_flush_timeout_seconds
+            )
+
+    final_state = final_state.model_copy(update={"telemetry": final_telemetry})
+    truncated_total = sum(br.truncated_candidates_count for br in final_state.batch_results)
+    dropped_findings_total = sum(
+        br.dropped_invalid_findings_count for br in final_state.batch_results
+    )
+    dropped_verdicts_total = sum(
+        br.dropped_invalid_verdicts_count for br in final_state.batch_results
+    )
+    logger.info(
+        "pr_review_graph_completed",
+        trace_id=effective_trace_id,
+        pr_id=pr_id,
+        batching_mode=final_state.batching_mode,
+        batch_count=len(final_state.batches),
+        unreviewable_count=len(final_state.unreviewable_segments),
+        finding_count=len(final_state.merged_findings),
+        verdict_count=len(final_state.merged_verdicts),
+        truncated_candidates_count=truncated_total,
+        dropped_invalid_findings_count=dropped_findings_total,
+        dropped_invalid_verdicts_count=dropped_verdicts_total,
+        llm_call_count=len(final_state.llm_metrics),
+        telemetry_status=final_telemetry.status,
+    )
+    return final_state
