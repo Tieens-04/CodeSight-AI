@@ -1,119 +1,138 @@
-# Shared Rules — CodeSight-AI Workflow (v3.0: Antigravity & Cross-Model Edition)
+# Shared Rules — CodeSight-AI Workflow (v4.0: `pstack` + Grok Bot + Antigravity Edition)
 
-Quy tắc kỷ luật bắt buộc áp dụng cho toàn bộ quy trình `.ai-workflow` của **CodeSight-AI**. Thiết kế chuyên biệt cho **Google Antigravity** (phối hợp đa Model **Gemini 4 / Orchestrator** & **Claude 5.5**, Subagents độc lập, MCP `jira-cwb`, Python `3.12+` / `uv` và các cổng kiểm tra cơ học).
-
----
-
-## 1. Thứ Tự Ưu Tiên Source of Truth
-
-Khi có xung đột thông tin, luôn ưu tiên từ trên xuống dưới:
-1. **Jira Issue Description + Acceptance Criteria + Product Comments** (lấy từ Project **`CA`** qua `jira-cwb`, lưu tại `.ai-workflow/tasks/<TICKET_ID>/jira.md`).
-2. **Architecture & Security Invariants trong `AGENTS.md`**:
-   - **Zero-Code Persistence (`NFR-3`)**: Không bao giờ lưu mã nguồn thô xuống ổ cứng hoặc payload Qdrant; mọi workspace tạm bắt buộc dọn sạch trong `finally`.
-   - **Latency & Quota Discipline**: Webhook `/api/v1/webhooks/github` xác thực `HMAC-SHA256` (`hmac.compare_digest`), chống trùng `X-GitHub-Delivery`, trả `202 Accepted` trong `< 100ms`; tổng E2E `< 25s`; `pull_request.opened` (`0s`) vs `pull_request.synchronize` (Cancel-on-Supersede + `5s` debounce); batch embedding `64` chunks + `asyncio.Semaphore(3)`.
-   - **Zero `HTTP 422` & Syntax-Safe Suggestions**: Chỉ gắn comment inline vào `valid_commentable_lines` phía `RIGHT` trong cùng 1 hunk (ngoài hunk đẩy xuống PR Summary); kiểm tra mọi khối ```` ```suggestion ```` trong RAM bằng `tree-sitter` (`not tree.root_node.has_error`).
-   - **Host Port Coexistence**: Postgres `5433`, Redis `6381`, Qdrant `6333`/`6334`, FastAPI/Radar `8082`. **Tuyệt đối không** dừng hay đụng tới bất kỳ container `flintflow-*` hoặc `documind-*` nào (luôn dùng `-p codesight` khi chạy Docker Compose).
-3. **Approved Implementation Plan** (`.ai-workflow/tasks/<TICKET_ID>/plan.md` hoặc spec liên quan trong `docs/specs/`).
-4. **Agent Assumptions**: Mức ưu tiên thấp nhất; bắt buộc ghi rõ trong báo cáo.
+Quy tắc kỷ luật bắt buộc áp dụng cho toàn bộ quy trình `.ai-workflow` của **CodeSight-AI**, hợp nhất kiến trúc **4-Role Specialist của Lauren Tan (`pstack`)**, cơ chế **Token Economy của Grok Bot (`Wake-ups × Re-reads`)**, khả năng **Cross-Model + Subagents của Google Antigravity**, và cổng kiểm định cơ học Python `3.12+` / `uv`.
 
 ---
 
-## 2. Kỷ Luật `1 Lượt = 1 Bước` (Single-Step Execution Gate)
+## 1. Thứ Tự Source of Truth & Luật "Fetch, Never Remember"
 
-Mỗi lượt trả lời của Agent **chỉ được thực thi đúng 1 bước** mà người dùng vừa gọi, ghi đúng artifact vào `.ai-workflow/tasks/<TICKET_ID>/`, in hộp câu lệnh chuyển tiếp rồi **kết thúc lượt ngay lập tức (`END TURN`)**:
+Khi đối chiếu thông tin, luôn ưu tiên từ trên xuống dưới và **truy xuất trực tiếp nguồn sống (fetch live)** thay vì dựa vào trí nhớ cũ:
 
-| Bước | Hành động được phép | Artifact bắt buộc trong `.ai-workflow/tasks/<TICKET_ID>/` | Ranh giới dừng (Hard Stop) |
+1. **Live Jira Issue + Acceptance Criteria + Comments** (lấy từ Project **`CA`** qua `atlassian-mcp-server` / `jira-cwb`, đồng bộ tại `.ai-workflow/tasks/<TICKET_ID>/jira.md`).
+2. **Architecture & Security Invariants trong `AGENTS.md`** & Schema/Models thực tế (`src/codesight/db/models.py`, `src/codesight/rag/models.py`):
+   - **Zero-Code Persistence (`NFR-3`)**: Không bao giờ lưu mã nguồn thô xuống đĩa, DB, Qdrant payload hay OTel/Langfuse spans; mọi workspace tạm dọn sạch trong `finally` qua `src/codesight/core/ephemeral.py`.
+   - **Latency & Quota Discipline**: Webhook `/api/v1/webhooks/github` xác thực `HMAC-SHA256` (`hmac.compare_digest`), chống trùng `X-GitHub-Delivery`, trả `202 Accepted` trong `< 100ms`; tổng E2E `< 25s`; `pull_request.opened` (`0s`) vs `pull_request.synchronize` (Cancel-on-Supersede + `5s` debounce); batch embedding `64` chunks + shared `asyncio.Semaphore(3)`.
+   - **Zero `HTTP 422` & Syntax-Safe Suggestions**: Chỉ gắn comment inline vào `valid_commentable_lines` phía `RIGHT` cùng `hunk_id` (ngoài hunk hạ cấp xuống PR Summary); splice kiểm tra mọi khối ```` ```suggestion ```` trong RAM bằng `tree-sitter` (`not tree.root_node.has_error`).
+   - **Host Port Coexistence**: Postgres `5433`, Redis `6381`, Qdrant `6333`/`6334`, FastAPI/Radar `8082`. **Tuyệt đối không** dừng hay đụng tới bất kỳ container `flintflow-*` hoặc `documind-*` nào (luôn dùng `docker compose -p codesight ...`).
+3. **Approved Plan & Handoff State** (`.ai-workflow/tasks/<TICKET_ID>/plan.md` & `state.md`, kèm spec liên quan trong `docs/specs/`).
+4. **Shared Persistent Memory** (`.ai-workflow/MEMORY.md`): Các quyết định kiến trúc (`Decisions`), file mẫu chuẩn (`Sources`), và bài học tổng quát (`Lessons`).
+5. **Agent Assumptions**: Mức thấp nhất; phải ghi rõ trong báo cáo.
+
+---
+
+## 2. Kiến Trúc 4 Vai Trò & Kỷ Luật `1 Lượt = 1 Bước` (Single-Step Gate)
+
+Mỗi lượt chỉ đóng **đúng 1 vai trò cho 1 bước**, ghi đúng artifact + cập nhật `state.md` + chạy `python .ai-workflow/scripts/verify.py board`, in Hộp Chuyển Tiếp rồi **DỪNG LƯỢT NGAY (`END TURN`)**:
+
+| Bước | Vai trò (`pstack` Role) | Đầu ra bắt buộc trong `tasks/<TICKET_ID>/` | Ranh giới dừng (Undo-Priced Gate) |
 | :--- | :--- | :--- | :--- |
-| **Bước 1: Plan** | Kéo Jira `CA-*`, chuyển Jira sang `21` (`In Progress`), tạo nhánh `feat/ca-...` từ `main`, khảo sát code, lập kế hoạch | `jira.md`, `plan.md` | Không sửa `src/`, `tests/`, `alembic/`; dừng chờ Gate 1 |
-| **Bước 2: Implement** | Viết tests (`TDD`) + code theo `plan.md`, chạy bộ kiểm tra `uv run` | `implementation-report.md` | Không `git commit` / `git push`, không tự tạo `review-01.md`; dừng chờ Gate 2 |
-| **Bước 3: Review** | Khởi chạy 3 Subagents độc lập đọc `git diff HEAD` + file untracked `??` | `review-01.md` | Tuyệt đối không sửa bất kỳ file code/test/docs nào; dừng chờ Gate 3 |
-| **Bước 4: Fix** | Vá tận gốc các findings đã xác nhận + bổ sung regression tests | `fix-report.md` | Không mở rộng scope, không `git commit`, không tự tạo `final-review.md` |
-| **Bước 5: Final Review** | Chuyển Jira sang `31` (`Verify / Test`), đối chiếu findings, chạy thật `uv run` & `preclose_audit.py` | `final-review.md` | Không sửa code, không `git commit`; dừng chờ Gate 4 |
-| **Bước 6: Pre-Commit** | Quét working tree, secret & port coexistence, dùng skill `pr` soạn PR + khung Verification Evidence | `precommit.md` | Không tự `git commit` / `git push`; giữ Jira ở `31` và in lệnh Git cho Human |
-| **Bước 7: Close Jira** *(Tùy chọn sau commit)* | Lấy `<short-sha>` thật từ `HEAD`, chạy `preclose_audit.py`, đăng comment 5 mục & chuyển Jira sang `41` (`Done`) | Cập nhật mục chốt đóng trong `precommit.md` | Chỉ chạy khi Human gõ `/ai-workflow close CA-XX` sau khi đã `git commit` |
+| **Bước 1: Plan** | `Chief of Staff` + `Researcher` (subagent) | `jira.md`, `plan.md`, `state.md` | Jira `21` (`In Progress`), tạo nhánh `feat/ca-...` từ `main`; không sửa `src/`, `tests/`, `alembic/` |
+| **Bước 2: Implement** | `Engineer` *(hoặc tách Pipeline/Surface Specialists)* | `implementation-report.md`, `state.md` | Code + TDD + `verify.py check` xanh; không `git commit`, không tự review |
+| **Bước 3: Review** | `Reviewer / Checker` (3 `research` subagents) | `review-01.md` (`FAILED/SAW/FIX`), `state.md` | Chỉ đọc & kiểm chứng độc lập; không sửa bất kỳ file code/test/docs nào |
+| **Bước 4: Fix** | `Engineer` | `fix-report.md`, `state.md` | Vá đúng root-cause + regression tests + `verify.py check`; không mở rộng scope |
+| **Bước 5: Final Review** | `Final Checker` + `OPS` Prevention Auditor | `final-review.md`, `state.md` | Jira `31` (`Verify / Test`) + chạy thật `verify.py check --full-format --preclose` + Prevention Audit |
+| **Bước 6: Pre-Commit** | `Deliver & Memory Keeper` | `precommit.md`, `state.md` (+ `MEMORY.md`) | Soạn PR + khung Evidence Jira + chắt lọc `MEMORY.md`; **dừng tại `The Undo Gate` trước `git commit`** |
+| **Bước 7: Close Jira** | `Jira Release Closer` | Cập nhật `precommit.md` & `state.md` (`Done`) | Sau khi Human `git commit`: lấy `<short-sha>` thật + `preclose_audit.py` + đăng Evidence 5 mục + Jira `41` (`Done`) |
 
 ---
 
-## 3. Hộp Gợi Ý Chuyển Tiếp Kèm Khuyến Nghị Model (Mandatory Hand-off Box)
+## 3. Gói Bàn Giao Gọn `state.md` & Chống Đọc Lại Lịch Sử Chat (`Re-read Tax`)
 
-Ở cuối **mọi** câu trả lời khi kết thúc bước (từ Bước 1 đến Bước 6), Agent bắt buộc in hộp chuyển tiếp theo đúng mẫu sau để người dùng chọn ngay **Model phù hợp trên thanh Model Selection của Antigravity**:
+Để tránh việc mỗi bước sau phải đọc lại hàng trăm nghìn token lịch sử chat cũ hoặc hàng chục KB văn xuôi:
 
-```markdown
+1. **Mọi bước từ 1 đến 7 phải tạo/cập nhật `.ai-workflow/tasks/<TICKET_ID>/state.md` (tối đa 20 dòng)** theo đúng 5 trạng thái chuẩn của `THE BOARD` (`Todo` | `Working` | `Blocked` | `Ready for Review` | `Done`):
+   ```markdown
+   # Handoff State: <TICKET_ID>
+
+   - **Status**: <Todo | Working | Blocked | Ready for Review | Done>
+   - **Step**: <01-plan | 02-implement | 03-review | 04-fix | 05-final-review | 06-precommit | 07-close-jira>
+   - **Branch**: `feat/ca-<number>-<short-slug>`
+   - **Objective**: <1 câu mục tiêu cốt lõi của ticket>
+   - **Canonical Examples**: `<src/codesight/...>`, `<tests/...>`
+   - **Changed Files**: `<danh sách gọn các file M/A/D/?? hiện tại hoặc "none">`
+   - **Key Decisions**: <1–2 dòng quyết định kỹ thuật quan trọng nhất>
+   - **Strikes**: <0 | 1 | 2>
+   - **Open Findings**: <Danh sách mã lỗi chưa đóng, vd: R1-01, R1-02 hoặc "none">
+   - **Next Gate**: <Hành động tiếp theo cần thực hiện>
+   ```
+   *(Tương thích ngược: Nếu ticket khởi tạo từ bản v3.0 chưa có `state.md`, bước hiện tại tự tạo mới `state.md` khi kết thúc bước).*
+2. **Đồng bộ Bảng Công Việc (`.ai-workflow/BOARD.md`)**: Cuối mỗi bước, chạy `python .ai-workflow/scripts/verify.py board` (mất `<0.1s`, tốn `0` token suy luận; `.ai-workflow/BOARD.md` và `tasks/*` đã được `.gitignore` bảo vệ).
+3. **Chiến lược Cắt Lịch Sử Chat (Context Hygiene)**:
+   - Khuyến khích mở **New Chat sạch** (hoặc gõ `/compact`) ở **mọi ranh giới đổi vai trò**: Bước 1 → Bước 2 (`Researcher` → `Engineer`), Bước 2 → Bước 3 (`Engineer` → `Checker`), Bước 3 → Bước 4 (`Checker` → `Engineer`), Bước 4 → Bước 5 (`Engineer` → `Final Checker`). Nhờ `state.md` + `plan.md` / `review-01.md` gọn sắc, cửa sổ mới nắm đủ 100% trạng thái mà giảm 50%–75% lượng token đọc lại mỗi vòng gọi tool.
+
 ---
-### ⏩ Bước tiếp theo: [Tên bước tiếp theo]
-- **🤖 Model khuyến nghị trên Antigravity**: **[Model ưu tiên 1]** *(hoặc [Model thay thế])* — *[Lý do 1 câu ngắn gọn]*
-- **💡 Mẹo ngữ cảnh**: [Giữ nguyên cửa sổ chat hiện tại / Khuyên mở New Chat sạch để review khách quan]
 
-Copy câu lệnh dưới đây và gửi vào ô chat:
-> `[Câu prompt tự thân đầy đủ chứa mã <TICKET_ID> và đường dẫn .ai-workflow/prompts/...]`
-```
+## 4. Công Cụ Kiểm Chứng 1 Lệnh (`verify.py` — Script Before Reasoning)
+
+Thay vì gọi rời rạc 6–7 lệnh terminal làm phình context bởi log thô, ưu tiên tuyệt đối chạy CLI kiểm chứng xác định tại `.ai-workflow/scripts/verify.py` (Python `3.12+` stdlib, `0` thư viện ngoài; cấm tuyệt đối `pip install` toàn cục):
+
+1. **Thu thập phạm vi diff + file mới `??` + quét vệ sinh mã nguồn & Docker ports (Bước 3, 5, 6)**:
+   ```powershell
+   python .ai-workflow/scripts/verify.py diff --ticket <TICKET_ID>
+   ```
+   *(Tự động kiểm tra tên nhánh chuẩn `^feat/ca-\d+-[a-z0-9][a-z0-9-]*$`, xác nhận `tasks/*` & `BOARD.md` được gitignore, kiểm tra Docker port coexistence `FlintFlow`/`DocuMind`, liệt kê cả tracked diff lẫn file mới untracked `??`, chạy `git diff HEAD --check`, phát hiện `.env*` thật, `*.pem`/`*.key`, `*.log`, `breakpoint()`, `print(` trần trong `src/codesight/`, `@pytest.mark.skip` không điều kiện và secret patterns).*
+   - **Lưu ý quan trọng khi Review**: Vì Bước 2 và Bước 4 chưa commit nên `HEAD` vẫn trùng gốc nhánh — luôn kết hợp `verify.py diff` + `git diff HEAD` + đọc trực tiếp các file mới `??` (tuyệt đối không dùng diff ba chấm `git diff main...HEAD` vì sẽ ra rỗng).
+2. **Chạy trọn bộ Quality Gates với bảng tóm tắt gọn (Bước 2, 4, 5)**:
+   ```powershell
+   # Khi không chạm DB Postgres / Redis / Qdrant / Worker:
+   python .ai-workflow/scripts/verify.py check --ticket <TICKET_ID>
+
+   # Khi chạm Postgres (5433) / Redis (6381) / Qdrant (6333-6334) / Worker / Alembic:
+   python .ai-workflow/scripts/verify.py check --ticket <TICKET_ID> --integration tests/integration/<suite>.py
+
+   # Tại Bước 5 (Final Review — quét Ruff format toàn repo + cổng preclose_audit.py):
+   python .ai-workflow/scripts/verify.py check --ticket <TICKET_ID> --full-format --preclose [--integration all]
+   ```
+   - `verify.py check` tự động chạy thêm `audit_qdrant_zerocode.py --self-test` khi chạm `ast_engine/` hoặc `rag/`, và `validate_diff_and_payload.py --self-test` khi chạm `diff/`, `agents/` hoặc `github_publisher.py`.
+   - Với Golden PR Benchmark (`CA-23`..`CA-28`): chạy thêm `python .agents/skills/codesight-kpi-benchmark/scripts/check_kpi_gates.py --report evals/results/latest_benchmark.json` *(thêm `--require-live` khi chốt Milestone 4)*.
+   - Nếu ticket chạm UI `/radar` / Playwright E2E: luôn chạy ở **chế độ hiển thị trình duyệt (`--headed` / `headless: false`)** qua `--e2e <spec>`.
+3. **Không bao giờ báo `PASS` cho cổng chưa chạy thực tế.** Nếu Docker stack `codesight` chưa bật khi cần integration tests, khởi động cô lập bằng `docker compose -p codesight up -d` (hoặc báo rõ `BLOCKED` nếu thiếu daemon).
 
 ---
 
-## 4. Quy Tắc Đọc Thay Đổi Chưa Commit Khi Review (Working-Tree Diff Rule)
+## 5. Cầu Chì `2-Strike Blocked` & Cổng Phê Duyệt Theo Chi Phí Hoàn Tác (`The Undo Gate`)
 
-Vì Bước 2 và Bước 4 **không tạo `git commit`**, tại Bước 3 (`03-review.md`) và Bước 5 (`05-final-review.md`), `HEAD` vẫn trùng với commit gốc của nhánh `main` (hoặc commit đầu nhánh). Reviewer và cả 3 Subagents bắt buộc thu thập thay đổi theo 3 bước:
-1. Chạy `git status --short` để liệt kê toàn bộ các tệp đã sửa (`M`, `A`, `D`) **và các tệp mới chưa theo dõi (`??`)** *(lưu ý `.ai-workflow/tasks/` đã được `.gitignore` che tự động)*.
-2. Chạy `git diff HEAD` để đọc toàn bộ thay đổi của các tệp đã tracked *(không bao giờ dùng diff ba chấm `git diff main...HEAD` khi chưa commit vì sẽ ra rỗng)*.
-3. Đọc trực tiếp toàn bộ nội dung mọi tệp mới untracked (`??`) thuộc `src/`, `tests/`, `alembic/`, `evals/`, `docs/` để không bỏ sót bất kỳ dòng code mới nào.
+1. **2-Strike Circuit Breaker (Chống lặp vô tận)**:
+   - Trong cùng một bước (Bước 2 hoặc Bước 4): nếu cùng một cách sửa hoặc bài test thất bại **2 lần liên tiếp** theo cùng một kiểu mà chưa tìm ra nguyên nhân gốc, dừng thử mù lần 3.
+   - Giữa các vòng Review ↔ Fix: mỗi lần `final-review.md` trả về `CHANGES REQUESTED` trên cùng một lỗi cũ, tăng `Strikes` trong `state.md` thêm `1`. Khi **`Strikes >= 2`**, chuyển `Status: Blocked` trong `state.md`, chạy `python .ai-workflow/scripts/verify.py board` và báo ngay cho Human kèm 2 phương án xử lý rõ ràng.
+2. **Gate Priced by Undo Cost**:
+   - **Tự hoàn tất 100% bước khả nghịch**: khảo sát code, chuyển Jira `21`/`31`, viết test/code local, chạy `verify.py`, tạo báo cáo, soạn PR description & khung Verification Evidence.
+   - **Dừng hỏi trước bước khó/không thể hoàn tác**: `git commit`, `git push`, đóng Jira `41` (`Done`) khi chưa có `<short-sha>` thật, tạo Alembic migration hoặc `uv add` package ngoài `plan.md` đã duyệt, hoặc khi AC trên Jira mâu thuẫn với `AGENTS.md`.
 
 ---
 
-## 5. Chuẩn Quản Lý Jira `CA-*` & Nhánh Git Tự Động
+## 6. Chuẩn Quản Lý Jira `CA-*` & Nhánh Git Tự Động
 
 1. **Ranh giới Không gian Jira & Cú pháp MCP (`atlassian-mcp-server` / `jira-cwb`)**:
    - Chỉ thao tác trên Jira Project **`CA`** (`Board ID 74`, site `nguyentien191004.atlassian.net`). **Nghiêm cấm tuyệt đối** đọc/ghi hoặc chuyển trạng thái các ticket thuộc `DA` (`DocuMind-AI`) hay `CWB` (`Co-Workspace Booking`).
-   - Kiểm tra danh sách `<mcp_servers>` đang hoạt động trong phiên hiện tại (luôn đọc file schema `.json` trong `<appDataDir>/mcp/<serverName>/` trước khi gọi `call_mcp_tool`):
-     - **Mặc định trên Antigravity (`atlassian-mcp-server`)** với `cloudId: "nguyentien191004.atlassian.net"`:
-       - Đọc ticket: `getJiraIssue(cloudId, issueIdOrKey="CA-X", view="full")` + `listJiraIssueComments(cloudId, issueIdOrKey="CA-X")` (nếu có comment).
-       - Đổi trạng thái: `transitionJiraIssue(cloudId, issueIdOrKey="CA-X", transitionId="21" | "31" | "41")`.
-       - Đăng bình luận: `addOrEditJiraIssueComment(cloudId, issueIdOrKey="CA-X", commentBody="<markdown>")` *(bỏ trống `commentId` để tạo mới)*.
-     - **Dự phòng nếu phiên CLI mount `jira-cwb`**: `jira_get_issue(issue_key, include="comments,transitions")`, `jira_transition_issue(issue_key, transition_id)`, `jira_add_comment(issue_key, body)`.
-2. **Kiểm tra Working Tree Sạch ở Bước 1**:
-   - Chạy `git status --porcelain`. Nếu đang còn thay đổi chưa commit từ ticket khác ➔ **DỪNG LẠI & BÁO NGƯỜI DÙNG NGAY**, không tự ý `stash`, `reset` hay `checkout` đè.
-3. **Chuẩn Tên Nhánh Bắt Buộc (`feat/ca-<number>-<short-slug>`)**:
-   - Cả `AGENTS.md` lẫn cổng cơ học `.agents/skills/codesight-jira-workflow/scripts/preclose_audit.py` đều kiểm tra cứng regex **`^feat/ca-\d+-[a-z0-9][a-z0-9-]*$`**.
-   - Vì vậy **mọi ticket `CA-*`** đều dùng đúng định dạng `feat/ca-<số-viết-thường>-<slug-2-đến-4-từ>` (ví dụ: `feat/ca-8-github-blob-fetcher`), tạo từ nhánh gốc **`main`**:
+   - Luôn đọc file schema `.json` trong `<appDataDir>/mcp/<serverName>/` trước khi gọi `call_mcp_tool`:
+     - **Mặc định trên Antigravity (`atlassian-mcp-server`, `cloudId: "nguyentien191004.atlassian.net"`)**: `getJiraIssue(cloudId, issueIdOrKey="CA-X", view="full")`, `listJiraIssueComments(cloudId, issueIdOrKey="CA-X")`, `transitionJiraIssue(cloudId, issueIdOrKey="CA-X", transitionId="21" | "31" | "41")`, `addOrEditJiraIssueComment(cloudId, issueIdOrKey="CA-X", commentBody="<markdown>")` *(để trống `commentId` khi tạo mới)*.
+     - **Dự phòng khi mount `jira-cwb`**: `jira_get_issue`, `jira_transition_issue`, `jira_add_comment`.
+2. **Chuẩn Tạo Nhánh Bắt Buộc Từ `main` (Bước 1)**:
+   - Chạy `git status --porcelain`. Nếu có thay đổi chưa commit từ công việc khác ➔ **DỪNG LẠI BÁO HUMAN**, không tự ý stash/reset/checkout đè.
+   - Mọi ticket `CA-*` bắt buộc dùng đúng regex **`^feat/ca-\d+-[a-z0-9][a-z0-9-]*$`** (không dùng `master`, `codex/`, `feature/`, `bugfix/`, `chore/`):
      ```powershell
      git checkout main
      git pull --ff-only
      git checkout -b feat/ca-<number>-<short-slug>
      ```
-   - *(Nếu nhánh `feat/ca-<number>-...` của đúng ticket đó đã tồn tại sẵn và working tree sạch, checkout trực tiếp vào nhánh đó).*
-   - **Tuyệt đối không** dùng `master`, `codex/`, `feature/`, `chore/`, hay `bugfix/` cho nhánh ticket `CA-*`.
+   - *(Nếu nhánh `feat/ca-<number>-...` của đúng ticket đó đã tồn tại và working tree sạch, `git checkout <branch-name>`).*
 
 ---
 
-## 6. Bộ Cổng Kiểm Chứng Chuẩn Của CodeSight-AI (`uv` + Mechanical Gates)
+## 7. Mẫu Hộp Gợi Ý Chuyển Tiếp Bắt Buộc (Mandatory Hand-off Box)
 
-Dự án dùng Python `3.12+` quản lý độc quyền qua **`uv`** (`pyproject.toml` + `uv.lock`; **cấm tuyệt đối `pip install` toàn cục**):
+Cuối mỗi lượt từ Bước 1 đến Bước 6, in đúng mẫu hộp sau:
 
-1. **Lint & Format Check (Bắt buộc mọi task sửa Python)**:
-   - `uv run ruff check .`
-   - `uv run ruff format --check <các-file-py-đã-sửa>` *(hoặc format gọn các file thuộc phạm vi ticket bằng `uv run ruff format <files>`)*
-2. **Strict Typecheck (Bắt buộc)**:
-   - `uv run mypy src`
-3. **Unit Tests & Branch Coverage Gate `>= 80%` (Bắt buộc)**:
-   - `uv run pytest --cov=src --cov-fail-under=80`
-   - *(Lưu ý quan trọng: `pyproject.toml` bật `branch = true` trong `[tool.coverage.run]`, tức đo **Branch Coverage** trên `src/codesight` — cần viết test phủ đủ cả nhánh đúng và nhánh lỗi/fallback của câu lệnh rẽ nhánh).*
-4. **Live Docker Integration Tests (Bắt buộc khi chạm PostgreSQL `5433`, Redis `6381`, Qdrant `6333/6334`, Alembic migrations, hoặc Celery/Lua locks)**:
-   - Đảm bảo stack chạy cô lập bằng `docker compose -p codesight up -d` *(không bao giờ chạy `docker compose down` không có `-p codesight`)*.
-   - Chạy: `uv run pytest -m integration`
-5. **Cổng Kiểm Tra Cơ Học Theo Chuyên Đề (Chạy thực tế khi liên quan & ở Bước 5/6/7)**:
-   - **Mọi ticket `CA-*` (Bước 5, 6, 7)**: `python .agents/skills/codesight-jira-workflow/scripts/preclose_audit.py --ticket <TICKET_ID>`
-   - **AST / Embeddings / Qdrant (`CA-11`..`CA-16`)**: `python .agents/skills/zerocode-ast-rag/scripts/audit_qdrant_zerocode.py --self-test` *(kèm `--collection codesight_symbols` khi Qdrant đang chạy)*
-   - **Diff Mapping / Suggestion / GitHub Review API (`CA-17`..`CA-22`)**: `python .agents/skills/github-diff-suggestion-guard/scripts/validate_diff_and_payload.py --self-test`
-   - **Golden PR Benchmark & KPI Sign-off (`CA-23`..`CA-28`)**: `python .agents/skills/codesight-kpi-benchmark/scripts/check_kpi_gates.py --report evals/results/latest_benchmark.json` *(thêm `--require-live` khi chốt Milestone 4)*
-   - **Playwright / `/radar` UI**: Bắt buộc chạy ở chế độ hiển thị trình duyệt (**`--headed` / `headless: false`**) theo quy tắc người dùng.
-
-Không bao giờ báo `PASS` cho lệnh chưa chạy thật trong lượt đó.
-
+```markdown
 ---
 
-## 7. Điều Kiện Dừng Khẩn Cấp (Stop Conditions)
+### ⏩ Bước tiếp theo: [Tên bước & Vai trò kế tiếp]
 
-Dừng ngay lập tức và hỏi ý kiến người dùng khi gặp một trong các tình huống:
-1. Jira Acceptance Criteria mâu thuẫn nội tại hoặc vi phạm trực tiếp các bất biến trong `AGENTS.md` (`NFR-3`, SLA `< 25s` / `< 100ms`, giới hạn port Docker).
-2. Phát hiện cần tạo Alembic migration mới hoặc thêm package vào `pyproject.toml` (`uv add`) **ngoài** `plan.md` đã duyệt.
-3. Working tree đang bẩn bởi thay đổi của một ticket khác khi bắt đầu Bước 1.
-4. Bất kỳ cổng kiểm tra nào (`ruff`, `mypy`, `pytest --cov`, `preclose_audit.py`) đang `FAIL` thực sự — tuyệt đối không lách luật hay chuyển sang bước đóng ticket khi cổng kiểm tra còn đỏ.
+- **🤖 Model khuyến nghị trên Antigravity**: **[Model ưu tiên 1]** *(hoặc [Model thay thế])* — *[Lý do 1 câu]*
+- **💡 Vệ sinh ngữ cảnh (Chống Re-read Tax)**: [Khuyên mở **New Chat sạch** (hoặc chạy `/compact`) rồi dán câu lệnh dưới — trạng thái đã lưu trọn trong `state.md`]
+
+Copy câu lệnh dưới đây và gửi vào ô chat:
+
+> `[Câu prompt tự thân đầy đủ chứa mã <TICKET_ID> và đường dẫn .ai-workflow/prompts/...]`
+```
