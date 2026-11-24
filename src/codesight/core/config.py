@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     index_task_soft_time_limit_seconds: int = Field(default=300, ge=30)
     index_task_hard_time_limit_seconds: int = Field(default=360, ge=60)
 
+    # Multi-agent LangGraph LLM orchestration (kept separate from embedding limits)
+    llm_provider: Literal["gemini", "openai", "anthropic"] = "gemini"
+    auditor_model: str = "gemini-2.5-flash"
+    critic_model: str = "gemini-2.5-flash"
+    llm_max_concurrency: int = Field(default=3, ge=1, le=10)
+    langfuse_tracing_enabled: bool = True
+
     # Optional Phase 2+ secrets (kept None until configured)
     github_app_id: str | None = None
     github_private_key: SecretStr | None = None
@@ -84,6 +91,22 @@ class Settings(BaseSettings):
         if self.index_task_hard_time_limit_seconds <= self.index_task_soft_time_limit_seconds:
             raise ValueError(
                 "INDEX_TASK_HARD_TIME_LIMIT_SECONDS must exceed INDEX_TASK_SOFT_TIME_LIMIT_SECONDS."
+            )
+        cleaned_auditor = self.auditor_model.strip()
+        cleaned_critic = self.critic_model.strip()
+        if not cleaned_auditor:
+            raise ValueError("AUDITOR_MODEL must not be empty.")
+        if not cleaned_critic:
+            raise ValueError("CRITIC_MODEL must not be empty.")
+        self.auditor_model = cleaned_auditor
+        self.critic_model = cleaned_critic
+        if self.llm_provider == "gemini" and cleaned_critic not in {
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+        }:
+            raise ValueError(
+                "CRITIC_MODEL must be 'gemini-2.5-flash' or 'gemini-2.5-pro' "
+                "when LLM_PROVIDER is 'gemini'."
             )
         return self
 
@@ -112,6 +135,16 @@ class Settings(BaseSettings):
         """Return True when a non-empty GEMINI_API_KEY is configured."""
         return bool(
             self.gemini_api_key is not None and self.gemini_api_key.get_secret_value().strip()
+        )
+
+    @property
+    def has_langfuse_credentials(self) -> bool:
+        """Return True when both LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY are non-empty."""
+        return bool(
+            self.langfuse_public_key is not None
+            and self.langfuse_public_key.strip()
+            and self.langfuse_secret_key is not None
+            and self.langfuse_secret_key.get_secret_value().strip()
         )
 
     def _build_postgres_dsn(self, scheme: str) -> str:
