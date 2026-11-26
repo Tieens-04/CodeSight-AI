@@ -1221,7 +1221,7 @@ class TestLangGraphOrchestration:
                     severity="CRITICAL" if role == "security_auditor" else "WARNING",
                     category="security" if role == "security_auditor" else "performance",
                     title=f"Finding from {role}",
-                    evidence=f"Evidence from {role}",
+                    evidence=f"Evidence from {role} calling process",
                 )
                 return StructuredInvocationResult(
                     parsed=AuditorOutput(findings=[finding]),
@@ -1342,12 +1342,15 @@ class TestLangGraphOrchestration:
                 if "src/mod_0.py" in user_text:
                     await asyncio.sleep(0.05)
                     target_file = "src/mod_0.py"
+                    var_prefix = "m0"
                 elif "src/mod_1.py" in user_text:
                     await asyncio.sleep(0.025)
                     target_file = "src/mod_1.py"
+                    var_prefix = "m1"
                 else:
                     await asyncio.sleep(0.005)
                     target_file = "src/mod_2.py"
+                    var_prefix = "m2"
 
                 if role in {"security_auditor", "logic_performance_auditor"}:
                     # Emit verbose findings to exercise Critic input budget capping
@@ -1362,7 +1365,7 @@ class TestLangGraphOrchestration:
                             severity="CRITICAL" if idx == 0 else "INFO",
                             category="audit",
                             title=f"{role} issue {idx} on {target_file}",
-                            evidence="Detail " + ("E" * 260),
+                            evidence=f"Detail on {var_prefix}_{idx} " + ("E" * 260),
                         )
                         for idx in range(5)
                     ]
@@ -1468,7 +1471,7 @@ class TestLangGraphOrchestration:
                                 "severity": "critical",
                                 "category": "sec",
                                 "title": "Valid critical finding",
-                                "evidence": "Reachable at L5.",
+                                "evidence": "Reachable at L5 via line_3.",
                             },
                             {
                                 "file_path": "src/resilient.py",
@@ -1486,7 +1489,7 @@ class TestLangGraphOrchestration:
                                 "severity": "INFO",
                                 "category": "sec",
                                 "title": "Valid finding with broken suggestion",
-                                "evidence": "Issue at L10.",
+                                "evidence": "Issue at L10 via line_8.",
                                 "suggestion": {
                                     "start_line": 15,
                                     "end_line": 10,
@@ -1772,7 +1775,7 @@ class TestLangfuseObservabilityAndNFR3:
                                 severity="CRITICAL",
                                 category="secrets",
                                 title="Hardcoded secret",
-                                evidence=canary_evidence,
+                                evidence=f"token leaks {canary_evidence}",
                                 suggestion=LLMCodeSuggestionDraft(
                                     start_line=2,
                                     end_line=2,

@@ -17,9 +17,13 @@ from langgraph.types import Send
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from codesight.agents.llm_factory import LLMFactory, StructuredInvocationResult
+from codesight.agents.nodes.context_builder import PRReviewContext, build_batch_context
+from codesight.agents.nodes.security_auditor import run_security_auditor
+from codesight.agents.prompts.security_prompt import SECURITY_AUDITOR_SYSTEM_PROMPT
 from codesight.agents.schemas import (
     AuditorRole,
     BatchReviewResult,
+    BuiltBatchContext,
     CodeSuggestion,
     CriticVerdict,
     DiffBatch,
@@ -38,7 +42,7 @@ from codesight.agents.schemas import (
 from codesight.core.config import Settings
 from codesight.core.logging import get_trace_id, sanitize_trace_id
 from codesight.core.observability import create_langfuse_trace_session
-from codesight.diff.file_filter import estimate_tokens
+from codesight.diff.file_filter import estimate_tokens, normalize_diff_path
 from codesight.diff.models import DiffHunk, ParsedFileDiff, ParsedPullRequestDiff
 
 DEFAULT_BATCH_DIFF_TOKEN_LIMIT: Final[int] = 12_000
@@ -59,11 +63,6 @@ _SEVERITY_RANK: Final[dict[FindingSeverity, int]] = {
     "INFO": 2,
 }
 
-_SECURITY_SYSTEM_PROMPT: Final[str] = (
-    "You are CodeSight-AI Security Auditor. Inspect the line-annotated PR diff for security "
-    "vulnerabilities (injection, auth bypass, secret exposure, unsafe deserialization, SSRF). "
-    "Emit ONLY grounded FindingCandidate objects referencing exact RIGHT-side line numbers."
-)
 _LOGIC_SYSTEM_PROMPT: Final[str] = (
     "You are CodeSight-AI Logic & Performance Auditor. Inspect the line-annotated PR diff for "
     "logic defects, race conditions, resource leaks, and N+1 or algorithmic regressions. "
@@ -76,8 +75,9 @@ _CRITIC_SYSTEM_PROMPT: Final[str] = (
 )
 
 _AUDITOR_SCHEMA_TOKENS: Final[int] = estimate_tokens(
-    json.dumps(LLMAuditorDraftOutput.model_json_schema(), separators=(",", ":"))
+    json.dumps(LLMAuditorDraftOutput.model_json_schema())
 )
+_DIFF_WRAPPER_RESERVE_TOKENS: Final[int] = 32
 _CRITIC_SCHEMA_TOKENS: Final[int] = estimate_tokens(
     json.dumps(LLMCriticDraftOutput.model_json_schema(), separators=(",", ":"))
 )
@@ -105,20 +105,39 @@ class ReviewGraphConfig:
 
     def available_auditor_diff_tokens(self) -> int:
         """Compute max diff tokens per batch after reserving instructions, schema, and output."""
-        prompt_overhead = (
-            max(
-                estimate_tokens(_SECURITY_SYSTEM_PROMPT),
-                estimate_tokens(_LOGIC_SYSTEM_PROMPT),
-            )
-            + _AUDITOR_SCHEMA_TOKENS
-            + 64  # user wrapper framing margin
-        )
-        available = self.max_request_tokens - self.output_reserve_tokens - prompt_overhead
+        available = self.available_auditor_user_tokens() - _DIFF_WRAPPER_RESERVE_TOKENS
         if available < 1:
             raise ValueError(
                 "max_request_tokens is too small to fit auditor instructions, schema, and output."
             )
         return min(self.batch_diff_token_limit, available)
+
+    def available_auditor_user_tokens(
+        self,
+        *,
+        system_prompt: str | None = None,
+    ) -> int:
+        """Compute max auditor user-message tokens after system prompt, JSON schema, and output."""
+        system_tokens = (
+            max(
+                estimate_tokens(SECURITY_AUDITOR_SYSTEM_PROMPT),
+                estimate_tokens(_LOGIC_SYSTEM_PROMPT),
+            )
+            if system_prompt is None
+            else estimate_tokens(system_prompt)
+        )
+        available = (
+            self.max_request_tokens
+            - self.output_reserve_tokens
+            - system_tokens
+            - _AUDITOR_SCHEMA_TOKENS
+            - 16
+        )
+        if available < 1:
+            raise ValueError(
+                "max_request_tokens is too small to fit auditor instructions, schema, and output."
+            )
+        return available
 
     def available_critic_payload_tokens(self) -> int:
         """Compute max Critic user-message tokens after reserving instructions, schema, output."""
@@ -140,12 +159,29 @@ def _file_header(parsed_file: ParsedFileDiff) -> str:
     return f"=== FILE: {parsed_file.file_path} ({parsed_file.change_type}) ==="
 
 
+def _hunk_left_deleted_hunks(hunk: DiffHunk) -> dict[int, int]:
+    return {
+        dl.left_line: hunk.hunk_id
+        for dl in hunk.lines
+        if dl.kind == "delete" and dl.left_line is not None
+    }
+
+
+def _file_left_deleted_hunks(parsed_file: ParsedFileDiff) -> dict[int, int]:
+    merged: dict[int, int] = {}
+    for hunk in parsed_file.hunks:
+        merged.update(_hunk_left_deleted_hunks(hunk))
+    return merged
+
+
 class _BatchAccumulator:
     """Mutable accumulator packing ordered (file_path, file_header, chunk_text) pieces in O(1)."""
 
     def __init__(self, max_batch_tokens: int) -> None:
         self._max_batch_tokens = max_batch_tokens
         self._groups: list[tuple[str, str, list[str]]] = []
+        self._line_hunks_by_file: dict[str, dict[int, int]] = {}
+        self._left_deleted_hunks_by_file: dict[str, dict[int, int]] = {}
         self._total_bytes: int = 0
         self._batches: list[DiffBatch] = []
 
@@ -156,7 +192,15 @@ class _BatchAccumulator:
     def has_content(self) -> bool:
         return bool(self._groups)
 
-    def try_add_chunk(self, file_path: str, file_header: str, chunk_text: str) -> bool:
+    def try_add_chunk(
+        self,
+        file_path: str,
+        file_header: str,
+        chunk_text: str,
+        *,
+        line_hunks: Mapping[int, int] | None = None,
+        left_deleted_hunks: Mapping[int, int] | None = None,
+    ) -> bool:
         chunk_bytes = len(chunk_text.encode("utf-8"))
         same_file = bool(self._groups and self._groups[-1][0] == file_path)
         if not self._groups:
@@ -174,6 +218,14 @@ class _BatchAccumulator:
                 self._groups[-1][2].append(chunk_text)
             else:
                 self._groups.append((file_path, file_header, [chunk_text]))
+            norm_fp = normalize_diff_path(file_path).rstrip("/")
+            if norm_fp:
+                if line_hunks:
+                    self._line_hunks_by_file.setdefault(norm_fp, {}).update(line_hunks)
+                if left_deleted_hunks:
+                    self._left_deleted_hunks_by_file.setdefault(norm_fp, {}).update(
+                        left_deleted_hunks
+                    )
             self._total_bytes = new_total_bytes
             return True
         return False
@@ -191,9 +243,17 @@ class _BatchAccumulator:
                 file_paths=file_paths,
                 annotated_diff=rendered,
                 estimated_tokens=estimate_tokens(rendered),
+                right_line_hunks_by_file={
+                    fp: dict(lh) for fp, lh in self._line_hunks_by_file.items() if lh
+                },
+                left_deleted_hunks_by_file={
+                    fp: dict(lh) for fp, lh in self._left_deleted_hunks_by_file.items() if lh
+                },
             )
         )
         self._groups = []
+        self._line_hunks_by_file = {}
+        self._left_deleted_hunks_by_file = {}
         self._total_bytes = 0
 
     def finalize(self) -> tuple[DiffBatch, ...]:
@@ -214,19 +274,35 @@ def _split_oversized_hunk_by_lines(
     prefix_bytes = len(f"{hdr}\n{hunk_header}".encode())
 
     pending_lines: list[str] = []
+    pending_line_hunks: dict[int, int] = {}
+    pending_left_deleted_hunks: dict[int, int] = {}
     pending_bytes = 0
 
     def _flush_pending_lines() -> None:
-        nonlocal pending_lines, pending_bytes
+        nonlocal pending_lines, pending_line_hunks, pending_left_deleted_hunks, pending_bytes
         if not pending_lines:
             return
         chunk = hunk_header + "\n" + "\n".join(pending_lines)
-        if not accumulator.try_add_chunk(parsed_file.file_path, hdr, chunk):
+        if not accumulator.try_add_chunk(
+            parsed_file.file_path,
+            hdr,
+            chunk,
+            line_hunks=pending_line_hunks,
+            left_deleted_hunks=pending_left_deleted_hunks,
+        ):
             accumulator.flush()
-            added = accumulator.try_add_chunk(parsed_file.file_path, hdr, chunk)
+            added = accumulator.try_add_chunk(
+                parsed_file.file_path,
+                hdr,
+                chunk,
+                line_hunks=pending_line_hunks,
+                left_deleted_hunks=pending_left_deleted_hunks,
+            )
             if not added:  # pragma: no cover - guarded by standalone check below
                 raise RuntimeError("Line-split chunk unexpectedly exceeded batch token budget.")
         pending_lines = []
+        pending_line_hunks = {}
+        pending_left_deleted_hunks = {}
         pending_bytes = 0
 
     for diff_line in hunk.lines:
@@ -252,10 +328,22 @@ def _split_oversized_hunk_by_lines(
         )
         if ((trial_bytes + 3) // 4) <= max_batch_tokens:
             pending_lines.append(diff_line.llm_text)
+            if diff_line.right_line is not None:
+                pending_line_hunks[diff_line.right_line] = hunk.hunk_id
+            if diff_line.kind == "delete" and diff_line.left_line is not None:
+                pending_left_deleted_hunks[diff_line.left_line] = hunk.hunk_id
             pending_bytes = trial_bytes
         else:
             _flush_pending_lines()
             pending_lines = [diff_line.llm_text]
+            pending_line_hunks = (
+                {diff_line.right_line: hunk.hunk_id} if diff_line.right_line is not None else {}
+            )
+            pending_left_deleted_hunks = (
+                {diff_line.left_line: hunk.hunk_id}
+                if diff_line.kind == "delete" and diff_line.left_line is not None
+                else {}
+            )
             pending_bytes = standalone_bytes
 
     _flush_pending_lines()
@@ -281,12 +369,24 @@ def split_parsed_diff_into_batches(
     full_diff = "\n\n".join(f.annotated_diff for f in reviewable_files)
     total_tokens = estimate_tokens(full_diff)
     if total_tokens <= max_batch_tokens:
+        left_deleted_by_file: dict[str, dict[int, int]] = {}
+        for f in reviewable_files:
+            left_map = _file_left_deleted_hunks(f)
+            norm_fp = normalize_diff_path(f.file_path).rstrip("/")
+            if norm_fp and left_map:
+                left_deleted_by_file[norm_fp] = left_map
         single_batch = DiffBatch(
             batch_index=0,
             batch_id="batch-000",
             file_paths=tuple(f.file_path for f in reviewable_files),
             annotated_diff=full_diff,
             estimated_tokens=total_tokens,
+            right_line_hunks_by_file={
+                normalize_diff_path(f.file_path).rstrip("/"): dict(f.right_line_to_hunk)
+                for f in reviewable_files
+                if f.right_line_to_hunk
+            },
+            left_deleted_hunks_by_file=left_deleted_by_file,
         )
         return (single_batch,), ()
 
@@ -296,22 +396,51 @@ def split_parsed_diff_into_batches(
     for parsed_file in reviewable_files:
         hdr = _file_header(parsed_file)
         file_hunks_body = "\n".join(h.annotated_text for h in parsed_file.hunks)
+        file_left_deleted = _file_left_deleted_hunks(parsed_file)
 
         # 1. File-level packing: keep whole files together whenever possible.
-        if accumulator.try_add_chunk(parsed_file.file_path, hdr, file_hunks_body):
+        if accumulator.try_add_chunk(
+            parsed_file.file_path,
+            hdr,
+            file_hunks_body,
+            line_hunks=parsed_file.right_line_to_hunk,
+            left_deleted_hunks=file_left_deleted,
+        ):
             continue
         if estimate_tokens(parsed_file.annotated_diff) <= max_batch_tokens:
             accumulator.flush()
-            accumulator.try_add_chunk(parsed_file.file_path, hdr, file_hunks_body)
+            accumulator.try_add_chunk(
+                parsed_file.file_path,
+                hdr,
+                file_hunks_body,
+                line_hunks=parsed_file.right_line_to_hunk,
+                left_deleted_hunks=file_left_deleted,
+            )
             continue
 
         # 2. Hunk-level packing: split oversized file at hunk boundaries.
         for hunk in parsed_file.hunks:
-            if accumulator.try_add_chunk(parsed_file.file_path, hdr, hunk.annotated_text):
+            hunk_line_hunks = {
+                dl.right_line: hunk.hunk_id for dl in hunk.lines if dl.right_line is not None
+            }
+            hunk_left_deleted = _hunk_left_deleted_hunks(hunk)
+            if accumulator.try_add_chunk(
+                parsed_file.file_path,
+                hdr,
+                hunk.annotated_text,
+                line_hunks=hunk_line_hunks,
+                left_deleted_hunks=hunk_left_deleted,
+            ):
                 continue
             if estimate_tokens(f"{hdr}\n{hunk.annotated_text}") <= max_batch_tokens:
                 accumulator.flush()
-                accumulator.try_add_chunk(parsed_file.file_path, hdr, hunk.annotated_text)
+                accumulator.try_add_chunk(
+                    parsed_file.file_path,
+                    hdr,
+                    hunk.annotated_text,
+                    line_hunks=hunk_line_hunks,
+                    left_deleted_hunks=hunk_left_deleted,
+                )
                 continue
 
             # 3. Line-level packing: split oversized hunk at line boundaries preserving L-numbers.
@@ -449,10 +578,11 @@ def _normalize_critic_verdicts(
     return normalized, dropped_count
 
 
-def _build_auditor_messages(role: AuditorRole, batch: DiffBatch) -> list[BaseMessage]:
-    sys_prompt = _SECURITY_SYSTEM_PROMPT if role == "security_auditor" else _LOGIC_SYSTEM_PROMPT
-    user_prompt = f"Batch: {batch.batch_id} (index={batch.batch_index})\n\n{batch.annotated_diff}"
-    return [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
+def _build_logic_auditor_messages(batch_context: BuiltBatchContext) -> list[BaseMessage]:
+    return [
+        SystemMessage(content=_LOGIC_SYSTEM_PROMPT),
+        HumanMessage(content=batch_context.rendered_prompt),
+    ]
 
 
 def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
@@ -602,28 +732,50 @@ class _BatchWorkerInput(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     batch: DiffBatch
+    batch_context: BuiltBatchContext | None = None
 
 
 def build_pr_review_graph(
     llm_factory: LLMFactory,
     *,
     graph_config: ReviewGraphConfig | None = None,
+    review_context: PRReviewContext | None = None,
 ) -> Any:
     """Compile the in-memory LangGraph StateGraph supporting single-batch and Send() Map-Reduce."""
     cfg = graph_config if graph_config is not None else ReviewGraphConfig()
+    auditor_user_budget = cfg.available_auditor_user_tokens()
     critic_user_budget = cfg.available_critic_payload_tokens()
 
     async def _run_auditor(
         role: AuditorRole,
         batch: DiffBatch,
+        batch_context: BuiltBatchContext | None,
         config: RunnableConfig | None,
     ) -> tuple[list[FindingCandidate], LLMCallMetrics, int]:
-        messages = _build_auditor_messages(role, batch)
+        effective_ctx = (
+            batch_context
+            if batch_context is not None
+            else build_batch_context(
+                batch=batch,
+                max_user_tokens=auditor_user_budget,
+                review_context=review_context,
+                total_batches=1,
+            )
+        )
+        node_cfg = _node_config(config, role=role, batch=batch)
+        if role == "security_auditor":
+            return await run_security_auditor(
+                batch=batch,
+                batch_context=effective_ctx,
+                llm_factory=llm_factory,
+                config=node_cfg,
+            )
+        messages = _build_logic_auditor_messages(effective_ctx)
         inv = await llm_factory.invoke_structured(
             role=role,
             schema=LLMAuditorDraftOutput,
             messages=messages,
-            config=_node_config(config, role=role, batch=batch),
+            config=node_cfg,
         )
         normalized, dropped_count = _normalize_auditor_findings(
             inv.parsed.findings,
@@ -665,14 +817,37 @@ def build_pr_review_graph(
             return {"batching_mode": "single_batch"}
         return {"batching_mode": "map_reduce"}
 
-    def route_after_plan(state: PRReviewState) -> str | list[str] | list[Send]:
+    def route_after_plan(state: PRReviewState) -> str:
         if state.batching_mode == "empty" or not state.batches:
             return "finalize_review"
+        return "context_builder"
+
+    async def context_builder(state: PRReviewState) -> dict[str, Any]:
+        total_batches = max(1, len(state.batches))
+        built = {
+            batch.batch_id: build_batch_context(
+                batch=batch,
+                max_user_tokens=auditor_user_budget,
+                review_context=review_context,
+                total_batches=total_batches,
+            )
+            for batch in state.batches
+        }
+        return {"batch_contexts": built}
+
+    def route_after_context(state: PRReviewState) -> list[str] | list[Send]:
         if state.batching_mode == "single_batch":
             # Parallel superstep fan-out -> fan-in to critic_synthesis (3 LLM calls total).
             return ["security_auditor", "logic_performance_auditor"]
         return [
-            Send("process_diff_batch", _BatchWorkerInput(batch=batch)) for batch in state.batches
+            Send(
+                "process_diff_batch",
+                _BatchWorkerInput(
+                    batch=batch,
+                    batch_context=state.batch_contexts.get(batch.batch_id),
+                ),
+            )
+            for batch in state.batches
         ]
 
     async def security_auditor(
@@ -680,7 +855,12 @@ def build_pr_review_graph(
         config: RunnableConfig,
     ) -> dict[str, Any]:
         batch = state.batches[0]
-        findings, metrics, dropped = await _run_auditor("security_auditor", batch, config)
+        findings, metrics, dropped = await _run_auditor(
+            "security_auditor",
+            batch,
+            state.batch_contexts.get(batch.batch_id),
+            config,
+        )
         return {
             "security_findings": findings,
             "dropped_invalid_findings_count": dropped,
@@ -692,7 +872,12 @@ def build_pr_review_graph(
         config: RunnableConfig,
     ) -> dict[str, Any]:
         batch = state.batches[0]
-        findings, metrics, dropped = await _run_auditor("logic_performance_auditor", batch, config)
+        findings, metrics, dropped = await _run_auditor(
+            "logic_performance_auditor",
+            batch,
+            state.batch_contexts.get(batch.batch_id),
+            config,
+        )
         return {
             "logic_findings": findings,
             "dropped_invalid_findings_count": dropped,
@@ -731,8 +916,12 @@ def build_pr_review_graph(
         config: RunnableConfig,
     ) -> dict[str, Any]:
         batch = state.batch
-        sec_task = asyncio.create_task(_run_auditor("security_auditor", batch, config))
-        log_task = asyncio.create_task(_run_auditor("logic_performance_auditor", batch, config))
+        sec_task = asyncio.create_task(
+            _run_auditor("security_auditor", batch, state.batch_context, config)
+        )
+        log_task = asyncio.create_task(
+            _run_auditor("logic_performance_auditor", batch, state.batch_context, config)
+        )
         try:
             (
                 (sec_findings, sec_metrics, sec_dropped),
@@ -790,6 +979,7 @@ def build_pr_review_graph(
 
     graph: StateGraph[PRReviewState] = StateGraph(PRReviewState)
     graph.add_node("plan_batches", plan_batches)
+    graph.add_node("context_builder", context_builder)
     graph.add_node("security_auditor", security_auditor)
     graph.add_node("logic_performance_auditor", logic_performance_auditor)
     graph.add_node("critic_synthesis", critic_synthesis)
@@ -801,7 +991,12 @@ def build_pr_review_graph(
     graph.add_conditional_edges(
         "plan_batches",
         route_after_plan,
-        ["security_auditor", "logic_performance_auditor", "process_diff_batch", "finalize_review"],
+        ["context_builder", "finalize_review"],
+    )
+    graph.add_conditional_edges(
+        "context_builder",
+        route_after_context,
+        ["security_auditor", "logic_performance_auditor", "process_diff_batch"],
     )
     graph.add_edge("security_auditor", "critic_synthesis")
     graph.add_edge("logic_performance_auditor", "critic_synthesis")
@@ -819,6 +1014,7 @@ async def run_pr_review_graph(
     parsed_diff: ParsedPullRequestDiff,
     llm_factory: LLMFactory,
     graph_config: ReviewGraphConfig | None = None,
+    review_context: PRReviewContext | None = None,
     pr_id: str = "pr-unknown",
     head_sha: str = "",
     trace_id: str | None = None,
@@ -853,7 +1049,11 @@ async def run_pr_review_graph(
         unreviewable_segments=list(unreviewable),
     )
 
-    compiled = build_pr_review_graph(llm_factory, graph_config=cfg)
+    compiled = build_pr_review_graph(
+        llm_factory,
+        graph_config=cfg,
+        review_context=review_context,
+    )
     telemetry_session = create_langfuse_trace_session(
         settings=effective_settings,
         trace_id=effective_trace_id,

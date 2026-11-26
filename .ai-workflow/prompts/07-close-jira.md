@@ -1,14 +1,17 @@
-# 07 — Close Jira Ticket Prompt (`/ai-workflow close CA-XX`: Real SHA + Evidence + `41` Done)
+# 07 — Close Jira Ticket & Archive Board Prompt (v4.0: `/ai-workflow close CA-XX`)
 
 ## Role
-Bạn là **Jira Release Closer & Verification Auditor**.
+
+Bạn đóng vai **`Jira Release Closer & Verification Auditor`**.
 
 ## Mục Tiêu
-Sau khi Human đã tự chạy `git commit` cho nhánh `feat/ca-<x>-<slug>`, bước này thu thập mã commit `<short-sha>` thực tế từ Git, chạy kiểm chứng tươi `preclose_audit.py` (tuân thủ `verification-before-completion`), đăng bình luận **Verification Evidence 5 mục** lên Jira và chuyển trạng thái ticket `<TICKET_ID>` từ `31` (`Verify / Test`) sang **`41` (`Done`)** qua MCP `jira-cwb`.
+
+Sau khi Human đã tự chạy `git commit` cho nhánh `feat/ca-<x>-<slug>`, bước này thu thập mã commit `<short-sha>` thực tế từ Git, chạy kiểm chứng tươi `preclose_audit.py` (tuân thủ `verification-before-completion`), đăng bình luận **Verification Evidence 5 mục** lên Jira, chuyển trạng thái ticket `<TICKET_ID>` từ `31` (`Verify / Test`) sang **`41` (`Done`)** và đóng thẻ sang **`Done` trên `.ai-workflow/BOARD.md`**.
 
 ---
 
 ## 🛑 Điều Kiện Tiên Quyết & Hard Rules
+
 1. **Chỉ chạy cho Jira Project `CA`** (`CA-*`); nghiêm cấm đụng tới `DA` hoặc `CWB`.
 2. **Bắt buộc đã có commit thật của ticket trên nhánh `feat/ca-<x>-<slug>`**:
    - Chạy `git status --porcelain` và `git log -n 1 --oneline`.
@@ -16,14 +19,14 @@ Sau khi Human đã tự chạy `git commit` cho nhánh `feat/ca-<x>-<slug>`, bư
 3. **Cổng cơ học bắt buộc `PASS` tươi trong chính lượt này**:
    - Phải chạy lại `python .agents/skills/codesight-jira-workflow/scripts/preclose_audit.py --ticket <TICKET_ID>` và nhận mã thoát `0` (`[PASS]`). Nếu khác `0`, giữ nguyên trạng thái `31` (`Verify / Test`) và báo lỗi ngay.
 4. **Thứ tự bất biến trên Jira**:
-   - Phải gọi `jira_add_comment` thành công **trước**, sau đó mới được gọi `jira_transition_issue` với `transition_id: "41"`.
+   - Phải đăng bình luận Verification Evidence thành công **trước**, sau đó mới được chuyển trạng thái sang `41` (`Done`).
 
 ---
 
 ## Quy Trình Thực Thi Bắt Buộc
 
 1. **Đọc Ngữ Cảnh & Kiểm Tra Commit Thật**:
-   - Đọc `.agents/skills/codesight-jira-workflow/SKILL.md` và `.ai-workflow/tasks/<TICKET_ID>/precommit.md` (hoặc `final-review.md` + `jira.md` nếu chạy độc lập).
+   - Đọc `.agents/skills/codesight-jira-workflow/SKILL.md`, `.ai-workflow/tasks/<TICKET_ID>/state.md` *(nếu có)* và `.ai-workflow/tasks/<TICKET_ID>/precommit.md` (hoặc `final-review.md` + `jira.md` nếu chạy độc lập).
    - Chạy `git rev-parse --abbrev-ref HEAD`, `git rev-parse --short HEAD`, và `git status --porcelain` để lấy tên nhánh cùng `<short-sha>` thực tế và xác nhận working tree sạch.
 2. **Chạy Tươi Cổng Cơ Học (`verification-before-completion`)**:
    ```powershell
@@ -51,7 +54,9 @@ Sau khi Human đã tự chạy `git commit` cho nhánh `feat/ca-<x>-<slug>`, bư
        <dán nguyên văn các dòng [GATE] và [PASS] từ preclose_audit.py>
        ```
      ```
-4. **Chuyển Trạng Thái Sang `Done` (`41`) & Lưu Dấu Hồ Sơ**:
+4. **Chuyển Trạng Thái Sang `Done` (`41`) & Lưu Dấu Hồ Sơ (`state.md` + `BOARD.md`)**:
    - Chỉ sau khi bình luận Verification Evidence đã đăng thành công, chuyển trạng thái `<TICKET_ID>` sang **`Done` (`41`)** (`transitionJiraIssue` với `transitionId: "41"` hoặc `jira_transition_issue` với `transition_id: "41"`).
    - *(Tùy chọn tiện lợi)*: Nếu Human đã `git push` nhánh lên remote và yêu cầu mở luôn GitHub PR, có thể dùng MCP `codesight-github_github` (`create_pull_request`) với đúng nội dung PR trong `precommit.md`.
-   - Ghi bổ sung mục `## 8. Jira Closure Record` (mã commit `<short-sha>`, Comment ID, trạng thái `Done`) vào cuối `.ai-workflow/tasks/<TICKET_ID>/precommit.md` rồi thông báo ngắn gọn cho người dùng và **DỪNG LƯỢT (`END TURN`)**.
+   - Ghi bổ sung mục `## 8. Jira Closure Record` (mã commit `<short-sha>`, Comment ID, trạng thái `Done`) vào cuối `.ai-workflow/tasks/<TICKET_ID>/precommit.md`.
+   - Cập nhật `.ai-workflow/tasks/<TICKET_ID>/state.md`: `Status: Done`, `Step: 07-close-jira`, `Open Findings: none`, `Next Gate: None (Jira 41 Done)`.
+   - Chạy `python .ai-workflow/scripts/verify.py board` để lưu trữ ticket vào mục `Completed Tickets` trên `.ai-workflow/BOARD.md`, báo cáo gọn cho người dùng và **DỪNG LƯỢT (`END TURN`)**.

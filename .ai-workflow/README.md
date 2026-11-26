@@ -1,159 +1,167 @@
-# CodeSight-AI — AI Development Workflow (v3.0: Antigravity Native & Cross-Model Edition)
+# CodeSight-AI — AI Development Workflow (v4.0: `pstack` + Grok Bot + Antigravity Edition)
 
-Quy trình phát triển phần mềm chuẩn hóa theo Jira ticket `CA-*` dành riêng cho **CodeSight-AI** trên **Google Antigravity**, kết hợp:
-- **Slash Skill khởi động & điều phối nhanh (`/ai-workflow`)** tại [SKILL.md](../.agents/skills/ai-workflow/SKILL.md).
-- **Kỷ luật `1 Lượt = 1 Bước` (Hard Stop)** kèm **Hộp Gợi Ý Câu Lệnh + Model Chuyển Tiếp Tự Động**.
-- **Chiến lược Đảo Họ Model (Cross-Model Review)** giữa **Gemini 4** và **Claude 5.5** để vừa triệt tiêu điểm mù khi thẩm định bảo mật/`NFR-3`/concurrency, vừa chia đều 2 bể hạn mức (Quota Pools) trên Antigravity.
-- **Tích hợp chặt với cổng cơ học CodeSight-AI**: `uv run` (`ruff`, `mypy`, `pytest --cov >= 80%` branch coverage), [preclose_audit.py](../.agents/skills/codesight-jira-workflow/scripts/preclose_audit.py), và quy trình trạng thái Jira **`21` (`In Progress`) → `31` (`Verify / Test`) → `41` (`Done`)** qua MCP `atlassian-mcp-server` (hoặc `jira-cwb`).
+Hệ thống điều phối phát triển phần mềm theo Jira ticket `CA-*` dành riêng cho **CodeSight-AI** trên **Google Antigravity**, hợp nhất 4 trụ cột:
 
----
-
-## 1. Cách Khởi Động Nhanh Nhất Trên Antigravity
-
-Mở khung chat Antigravity, chọn Model cho Bước 1 (xem bảng mục 3) và gõ **1 câu ngắn gọn**:
-
-```text
-/ai-workflow CA-8
-```
-*(hoặc gõ tự nhiên: `Làm task CA-8 theo .ai-workflow`)*
-
-Từ đó về sau, **ở cuối mỗi bước Agent sẽ tự động in ra một Hộp Chuyển Tiếp** gồm:
-1. **Model khuyên chọn** trên thanh Model Selection cho bước kế tiếp.
-2. **Câu lệnh chính xác** để bạn chỉ việc copy-paste vào ô chat.
-
-Sau khi xong Bước 6 và bạn đã tự chạy lệnh `git commit` trên Terminal, bạn chỉ cần gõ thêm:
-
-```text
-/ai-workflow close CA-8
-```
-để Agent tự lấy `<short-sha>` thật, chạy xác nhận `preclose_audit.py`, đăng **Verification Evidence 5 mục** và chuyển `CA-8` sang **`Done` (`41`)**!
+1. **Kiến trúc 4 Vai trò Chuyên biệt của Lauren Tan (`pstack`)**: `Chief of Staff` (điều phối) → `Researcher` (khảo sát `/how` & `/why` bằng subagent) → `Engineer` (TDD + chống AI slop) → `Reviewer / Checker` (3 subagents độc lập + `Comment-Sicko` + `FAILED/SAW/FIX`) → `Memory Reuse` ([MEMORY.md](MEMORY.md)).
+2. **Cơ chế Tiết kiệm Token của Grok Bot (`Wake-ups × Re-reads`)**: Gói bàn giao siêu gọn `state.md` (`<= 20` dòng), bảng `BOARD.md` 5 trạng thái, CLI kiểm chứng 1 lệnh [verify.py](scripts/verify.py) (thay cho 6–7 lệnh rời rạc), cầu chì **`2-Strike Blocked`** và cắt lịch sử chat giữa các vai trò.
+3. **Cross-Model Review trên Antigravity**: Đảo họ Model **Gemini 4 ↔ Claude 5.5** giữa người viết code và người chấm bài để triệt tiêu điểm mù về `NFR-3`/concurrency và chia đều 2 bể hạn mức (Quota Pools).
+4. **Cổng Cơ Học & Vòng Đời Jira `CA-*` Chuẩn Xác**: Tích hợp `uv run` (`ruff`, `mypy --strict`, `pytest --cov >= 80%` branch coverage), [preclose_audit.py](../.agents/skills/codesight-jira-workflow/scripts/preclose_audit.py), và chuỗi trạng thái Jira **`21` (`In Progress`) → `31` (`Verify / Test`) → `The Undo Gate` (`git commit`) → `41` (`Done`)**.
 
 ---
 
-## 2. Sơ Đồ Vòng Đời 6 Bước + Chốt Đóng Jira (Human Gates)
+## 1. Các Lệnh Khởi Động Nhanh Trên Antigravity
+
+| Mục đích | Câu lệnh gõ vào ô chat Antigravity |
+| :--- | :--- |
+| **Khởi động ticket mới (Bước 1)** | `/ai-workflow CA-18` *(hoặc `Làm task CA-18`)* |
+| **Xem bảng tiến độ toàn dự án (`THE BOARD`)** | `/ai-workflow board` *(hoặc chạy terminal: `python .ai-workflow/scripts/verify.py board`)* |
+| **Kiểm tra / Tiếp tục 1 ticket đang làm dở** | `/ai-workflow CA-18` |
+| **Chốt đóng Jira `41` (`Done`) sau khi `git commit` (Bước 7)** | `/ai-workflow close CA-18` |
+
+Ở cuối mỗi bước, Agent tự động cập nhật `state.md` + `BOARD.md` và in ra **Hộp Chuyển Tiếp** gồm: **Model khuyên chọn**, **mẹo mở New Chat / `/compact`** và **câu lệnh copy-paste** cho bước kế tiếp.
+
+---
+
+## 2. Vòng Đời 7 Bước, 4 Vai Trò & Các Cổng Kiểm Soát (`Undo-Priced Gates`)
 
 ```text
 [BẠN gõ: "/ai-workflow CA-XX"]
        │
        ▼
-[Bước 1: Plan (01-plan.md)]
-  • Kéo Jira CA-XX + comments (`atlassian-mcp-server` / `jira-cwb`) ➔ lưu jira.md & chuyển `21` (In Progress)
+[Bước 1: Goal, Research & Plan — Chief of Staff + Researcher (01-plan.md)]
+  • Đọc MEMORY.md + kéo live Jira CA-XX ➔ jira.md & chuyển `21` (In Progress)
   • Kiểm tra working tree sạch ➔ tạo nhánh `feat/ca-xx-<slug>` từ `main`
-  • Khảo sát code + chọn Dynamic Skills thật ➔ xuất plan.md
+  • Ủy quyền subagent `Researcher` chạy `/how` + `/why` (git log) + chọn Canonical Examples
+  • Xuất plan.md (Startup Checklist) + state.md + đồng bộ BOARD.md
        │
-       ▼ ──► [GATE 1]: Bạn duyệt plan.md, đổi sang Model Implement & dán prompt gợi ý
-[Bước 2: Implement (02-implement.md)]
-  • TDD (Red -> Green -> Refactor) theo Skills Blueprint + giữ chặt NFR-3 & port coexistence
-  • Chạy thật: `uv run ruff check .` + `mypy src` + `pytest --cov=src --cov-fail-under=80` (+ `-m integration`)
-  • Xuất implementation-report.md (KHÔNG commit)
+       ▼ ──► [GATE 1]: Duyệt plan.md ➔ Khuyên mở New Chat sạch (hoặc `/compact`) & đổi sang Model Engineer
+[Bước 2: Build — Engineer (02-implement.md)]
+  • Đọc gọn state.md + plan.md + Canonical Repo Examples (không đọc lại lịch sử mò file Bước 1)
+  • TDD + Anti-Slop (`Comment-Sicko` ngay lúc viết) + đồng bộ docs/
+  • Chạy 1 lệnh: `python .ai-workflow/scripts/verify.py check --ticket CA-XX [--integration ...]`
+  • Xuất implementation-report.md + cập nhật state.md (`Ready for Review`)
        │
-       ▼ ──► [GATE 2]: Đổi sang họ Model Tier S đối lập (khuyên mở New Chat sạch) & dán prompt gợi ý
-[Bước 3: Independent Review (03-review.md + domain-review.md)]
-  • Quét cả `git diff HEAD` lẫn mọi file mới untracked (`??`)
-  • Khởi chạy 3 Subagents độc lập: Standards & Domain + Spec & Test + Ponytail
-  • Xuất review-01.md (KHÔNG sửa code)
+       ▼ ──► [GATE 2]: Mở New Chat sạch + Đảo sang họ Model Tier S đối lập (Gemini ↔ Claude)
+[Bước 3: Independent Review — Checker + 3 Subagents (03-review.md)]
+  • Chạy `verify.py diff --ticket CA-XX` (gom đủ cả tracked diff lẫn file mới `??` + quét hygiene/ports)
+  • 3 Subagents độc lập: `Standards & Domain` + `Spec & Test` + `Ponytail & Comment-Sicko`
+  • Xuất review-01.md theo chuẩn đanh thép `FAILED / SAW / FIX` (KHÔNG sửa code)
        │
-       ▼ ──► [GATE 3]: Xem kết quả review-01.md
-   ┌───┴──────────────────────────────────────┐
-   │ CHANGES REQUESTED (Có findings)          │ APPROVED (0 lỗi blocking)
-   ▼                                          │
-[Bước 4: Fix (04-fix.md)]                     │
-  • Vá tận gốc + thêm regression test thật    │
-  • Chạy lại bộ `uv run` ➔ xuất fix-report.md │
-   │                                          │
-   └──────────────► [Bước 5: Final Review (05-final-review.md)] ◄───┘
+       ▼ ──► [GATE 3]: Phân nhánh theo kết quả review-01.md
+   ┌───┴──────────────────────────────────────────┐
+   │ CHANGES REQUESTED                            │ APPROVED (0 Must/Should Fix)
+   ▼                                              │
+[Bước 4: Fix — Engineer (04-fix.md)]              │
+  • Đọc gọn state.md + các khối FAILED/SAW/FIX    │
+  • Tái hiện lỗi ➔ vá gốc ➔ chạy verify.py check  │
+  • Cầu chì 2-Strike: kẹt 2 lần ➔ `Blocked`       │
+   │                                              │
+   └──────────────► [Bước 5: Final Gate & Prevention Audit — Final Checker (05-final-review.md)] ◄──┘
                       • Chuyển Jira sang `31` (Verify / Test)
-                      • Đối chiếu 100% findings RESOLVED & scoped ponytail-review
-                      • Chạy thật `uv run` + `preclose_audit.py --ticket CA-XX` ➔ xuất final-review.md
+                      • Chạy thật `verify.py check --ticket CA-XX --full-format --preclose [--integration all]`
+                      • Tái xác minh 100% AC + Scoped Ponytail/Comment-Sicko + 4-Step Prevention Audit
+                      • Xuất final-review.md (`READY FOR PRE-COMMIT` hoặc cầu chì `Blocked` nếu Strikes >= 2)
                             │
-                            ▼ ──► [GATE 4]: Đạt `READY FOR PRE-COMMIT` ➔ chuyển sang Model nhẹ (Hydrogen/Flash)
-                    [Bước 6: Pre-Commit & PR Prep (06-precommit.md)]
-                      • Quét sạch git status / secrets / NFR-3 / Docker ports
-                      • Soạn PR bằng skill `pr` + khung Verification Evidence 5 mục ➔ xuất precommit.md
-                      • In khối lệnh Git để BẠN tự `git commit` & `git push`
+                            ▼ ──► [GATE 4]: Đổi sang Model siêu nhẹ (Hydrogen / Flash)
+                    [Bước 6: Deliver & Reuse — Release & Memory Keeper (06-precommit.md)]
+                      • Chạy `verify.py diff` + soạn PR bằng skill `pr` + khung Verification Evidence 5 mục
+                      • Chắt lọc Decision/Source/Lesson mới (nếu có) vào `.ai-workflow/MEMORY.md`
+                      • Dừng tại `The Undo Gate` (giữ Jira ở `31`, in lệnh `git commit` & `git push` cho BẠN)
                             │
                             ▼ ──► [GATE 5]: BẠN chạy `git commit` (& `git push`), rồi gõ `/ai-workflow close CA-XX`
-                    [Bước 7 (Tùy chọn): Close Jira (07-close-jira.md)]
-                      • Lấy `<short-sha>` thật từ HEAD + xác nhận lại `preclose_audit.py`
-                      • Gọi `jira_add_comment` (5 mục) ➔ chuyển `CA-XX` sang `41` (Done)
+                    [Bước 7: Close Jira — Jira Release Closer (07-close-jira.md)]
+                      • Lấy `<short-sha>` thật từ HEAD + xác nhận tươi `preclose_audit.py`
+                      • Đăng Verification Evidence 5 mục + chuyển `CA-XX` sang `41` (`Done`) + đóng thẻ trên `BOARD.md`
 ```
 
 ---
 
-## 3. Thứ Tự Sức Mạnh & Chiến Lược Chọn Model Trên Antigravity
+## 3. Công Cụ Kiểm Chứng 1 Lệnh (`verify.py`)
 
-### 3.1. Xếp hạng thực tế các Model trên Antigravity (Từ Mạnh nhất ➔ Nhẹ/Nhanh nhất)
-Trong cùng một dòng model, mức suy luận xếp theo thứ tự: **`XHigh` > `High` > `Medium` > `Low`**.
+Nằm tại [verify.py](scripts/verify.py) (Python `3.12+` stdlib thuần, `0` dependencies mới; `tasks/*` và `BOARD.md` được `.gitignore` che tự động):
 
-1. **Tier S — Flagship Frontier (Đỉnh nhất về suy luận sâu, kiến trúc & bắt bug hiểm)**:
-   - **Gemini 4 Carbon (`High` > `Medium` > `Low`)**: Model mạnh và sâu nhất của Google DeepMind (đặc biệt sắc bén về kiến trúc bất đồng bộ, bảo mật `NFR-3`/HMAC, Redis Lua CAS concurrency và phân tích luồng phức tạp).
-   - **Claude Opus 5.5 (`High` > `Medium` > `Low`)**: Siêu mô hình đầu bảng của Anthropic (đối trọng ngang ngửa với Carbon, cực mạnh về coding quy mô lớn và đối chiếu chi tiết từng dòng spec/AC).
-2. **Tier S- / A+ — Chế độ Nhạc trưởng Đa Model (Đặc sản tiết kiệm Quota của Antigravity)**:
-   - **Orchestrator (Carbon)**: Tự động dùng **Carbon** lập kế hoạch/gỡ ca khó + giao việc sửa file/chạy `uv run` lặp lại cho **Hydrogen** (nhanh hơn ~19%, tiết kiệm ~24% quota mà chất lượng gần ngang Carbon thuần).
-   - **Orchestrator (Argon)**: Dùng **Argon** làm nhạc trưởng + **Hydrogen** thực thi.
-3. **Tier A — Balanced Frontier Engineering (Chủ lực viết code, TDD hàng ngày)**:
-   - **Claude Sonnet 5.5 (`High` > `Medium` > `Low`)** & **Gemini 4 Argon (`High` > `Medium` > `Low`)**.
-4. **Tier B — Fast Execution Engine (Siêu nhanh, nhẹ, tiết kiệm quota)**:
-   - **Gemini 4 Hydrogen (`XHigh` > `High` > `Medium` > `Low`)**: Dòng model nhẹ nhất họ Gemini 4, tối ưu tốc độ chạy checklist, soạn PR và gọi MCP Jira.
-5. **Tier C — Ultra-Light / Phụ trợ**:
-   - **Gemini 3.8 Flash (`High` > `Medium` > `Low`)** *(mặc định cho `browser` subagent)* & **GPT-OSS 120B (`Medium`)**.
+```powershell
+# 1. Xem phạm vi diff + file mới ?? + quét nhánh, Docker port coexistence, debug/skip, secrets (<0.2s):
+python .ai-workflow/scripts/verify.py diff --ticket CA-18
 
-### 3.2. Bảng chọn Model theo từng bước (Chia đều 2 bể Quota Gemini & Claude)
+# 2. Chạy trọn bộ Quality Gates (Ruff scoped + Ruff check + Mypy strict + Pytest >=80% + Domain guards):
+python .ai-workflow/scripts/verify.py check --ticket CA-18 --integration tests/integration/test_hybrid_retriever.py
 
-| Bước | File Prompt | Khuyên dùng số 1 (Cross-Model Chuẩn) | Phương án 2 (Thuần Gemini / Tiết kiệm) | Có nên mở New Chat? |
-| :--- | :--- | :--- | :--- | :--- |
-| **Bước 1: Plan** | `01-plan.md` | **Gemini 4 Carbon (High)** hoặc **Claude Opus 5.5 (High)** | **Gemini 4 Argon (High)** *(task vừa/nhỏ)* | Bắt đầu chat mới cho mỗi ticket |
-| **Bước 2: Implement** | `02-implement.md` | **Claude Sonnet 5.5 (High / Medium)** hoặc **Orchestrator (Carbon)** | **Orchestrator (Argon)** / **Gemini 4 Argon (High)** | Giữ nguyên chat Bước 1 (đổi Model nếu cần) |
-| **Bước 3: Review** | `03-review.md` | **Đảo ngược họ Tier S với Bước 2:**<br>• Bước 2 Claude ➔ **Gemini 4 Carbon (High)**<br>• Bước 2 Gemini ➔ **Claude Opus 5.5 (High)** | **Gemini 4 Carbon (Medium / High)** | **Nên mở New Chat sạch** để triệt tiêu thiên kiến người viết code |
-| **Bước 4: Fix** | `04-fix.md` | **Claude Sonnet 5.5 (Medium / High)** | **Gemini 4 Argon (Medium / High)** / **Orchestrator (Argon)** | Quay lại chat Bước 2 hoặc dùng tiếp chat hiện tại |
-| **Bước 5: Final Review** | `05-final-review.md` | **Gemini 4 Argon (High / Medium)** hoặc **Claude Sonnet 5.5 (Medium)** | **Gemini 4 Argon (Medium)** | Mở New Chat sạch hoặc đổi sang Model Reviewer |
-| **Bước 6: Pre-Commit** | `06-precommit.md` | **Gemini 4 Hydrogen (Medium / High)** | **Gemini 3.8 Flash (High)** | Dùng ngay ô chat hiện tại cho nhanh |
-| **Bước 7: Close Jira** | `07-close-jira.md` | **Gemini 4 Hydrogen (Low / Medium)** | **Gemini 3.8 Flash (High)** | Gửi ngay sau khi chạy `git commit` |
+# 3. Chạy chốt cổng Final Review (Ruff format toàn repo + preclose_audit.py + Integration):
+python .ai-workflow/scripts/verify.py check --ticket CA-18 --full-format --preclose --integration all
 
-> 💡 **Lưu ý về Subagents ở Bước 3**: Công cụ `invoke_subagent` trên Antigravity mặc định chạy với `Model: "inherit"` (thừa kế đúng Model bạn đang chọn trên thanh công cụ ở lượt đó). Vì vậy chọn Model Tier S ở Bước 3 giúp cả 3 Subagents (`Standards & Domain`, `Spec & Test`, `Ponytail`) đều suy luận sắc bén nhất.
+# 4. Đồng bộ bảng trạng thái toàn bộ các ticket CA-* (.ai-workflow/BOARD.md — 0 LLM tokens):
+python .ai-workflow/scripts/verify.py board
+
+# 5. Tự kiểm thử chính công cụ verify.py:
+uv run python .ai-workflow/scripts/test_verify.py -v
+```
+
+> 💡 **Quy tắc Playwright Headed**: Mọi bài kiểm thử trình duyệt cho `/radar` luôn chạy ở chế độ hiển thị cửa sổ trình duyệt (`--headed` / `headless: false`) qua `--e2e <spec>`.
 
 ---
 
-## 4. Cấu Trúc Thư Mục & Chính Sách Git
+## 4. Chiến Lược Chọn Model & Cắt Lịch Sử Chat (`Anti-Re-Read Tax`)
 
-Bộ khung quy trình được commit vào Git để đồng bộ cùng dự án, trong khi toàn bộ hồ sơ nháp từng ticket trong `.ai-workflow/tasks/CA-XX/` được `.gitignore` tự động để không làm bẩn PR:
+Công thức chi phí token thực tế là **`Số vòng gọi công cụ × Độ dài lịch sử chat đọc lại`**. Nhờ đã có `state.md` (`<= 20` dòng) + `MEMORY.md`, bạn **nên mở New Chat sạch (hoặc gõ `/compact`)** mỗi khi chuyển vai:
+
+| Bước | Vai trò (`pstack`) | Model Khuyên Dùng Số 1 (Cross-Model) | Phương Án Tiết Kiệm | Ngữ Cảnh Chat |
+| :--- | :--- | :--- | :--- | :--- |
+| **Bước 1: Plan** | `Chief` + `Researcher` | **Gemini 4 Carbon (High)** hoặc **Claude Opus 5.5 (High)** | **Gemini 4 Argon (High)** | Mở chat mới cho ticket |
+| **Bước 2: Build** | `Engineer` | **Claude Sonnet 5.5 (High / Medium)** hoặc **Orchestrator (Carbon)** | **Orchestrator (Argon)** / **Gemini 4 Argon (High)** | **Mở New Chat sạch** (hoặc `/compact`) |
+| **Bước 3: Review** | `Checker` (3 Subagents) | **Đảo họ Tier S với Bước 2:**<br>• Bước 2 Claude ➔ **Gemini 4 Carbon (High)**<br>• Bước 2 Gemini ➔ **Claude Opus 5.5 (High)** | **Gemini 4 Carbon (Medium / High)** | **Bắt buộc mở New Chat sạch** |
+| **Bước 4: Fix** | `Engineer` | **Claude Sonnet 5.5 (Medium / High)** | **Gemini 4 Argon (Medium)** / **Orchestrator (Argon)** | **Mở New Chat sạch** (chỉ nạp `state.md` + `review-01.md`) |
+| **Bước 5: Final** | `Final Checker` + `OPS` | **Gemini 4 Argon (High / Medium)** hoặc **Claude Sonnet 5.5 (Medium)** | **Gemini 4 Argon (Medium)** | Mở New Chat sạch hoặc `/compact` |
+| **Bước 6: Deliver** | `Release & Memory` | **Gemini 4 Hydrogen (Medium / High)** | **Gemini 3.8 Flash (High)** | Dùng ngay chat hiện tại |
+| **Bước 7: Close** | `Jira Release Closer` | **Gemini 4 Hydrogen (Low / Medium)** | **Gemini 3.8 Flash (High)** | Gửi ngay sau khi chạy `git commit` |
+
+---
+
+## 5. Cấu Trúc Thư Mục `.ai-workflow` (v4.0)
 
 ```text
 .ai-workflow/
-├── README.md                      # Tài liệu hướng dẫn tổng quan này (tracked)
-├── prompts/                       # Bộ prompt chuẩn 7 tệp (tracked)
-│   ├── 00-shared-rules.md         # Luật chung: 1 Turn = 1 Step, nhánh feat/ca-*, diff chưa commit, cổng uv
-│   ├── 01-plan.md                 # Bước 1: Kéo Jira CA-* + chuyển 21 + tạo nhánh từ main + lập plan.md
-│   ├── 02-implement.md            # Bước 2: TDD + code + uv gates + xuất implementation-report.md
-│   ├── 03-review.md               # Bước 3: 3 Subagents review độc lập + xuất review-01.md
-│   ├── 04-fix.md                  # Bước 4: Vá root-cause + regression tests + xuất fix-report.md
-│   ├── 05-final-review.md         # Bước 5: Chuyển Jira 31 + preclose_audit.py + xuất final-review.md
-│   ├── 06-precommit.md            # Bước 6: Vệ sinh Git + soạn PR + xuất precommit.md & lệnh commit
-│   └── 07-close-jira.md           # Bước 7: Lấy <short-sha> thật + đăng Evidence 5 mục + đóng Jira 41
+├── README.md                      # Tài liệu hướng dẫn tổng quan v4.0 (tracked)
+├── MEMORY.md                      # Bộ nhớ dài hạn chống mục nát: Decisions, Canonical Sources, Prompts, Lessons (tracked)
+├── BOARD.md                       # Bảng quản lý 5 trạng thái Todo | Working | Blocked | Ready for Review | Done (gitignored)
+├── scripts/
+│   ├── verify.py                  # CLI kiểm chứng 1 lệnh (diff | check | board) — Python 3.12 stdlib (tracked)
+│   └── test_verify.py             # Unit tests bảo vệ verify.py (tracked)
+├── prompts/
+│   ├── 00-shared-rules.md         # Luật nền (state.md <= 20 dòng, 2-Strike Blocked, Undo Gate, verify.py)
+│   ├── 01-plan.md                 # Bước 1: Jira 21 + nhánh main + Researcher (/how & /why) + Startup Checklist
+│   ├── 02-implement.md            # Bước 2: Canonical Examples + TDD + Comment-Sicko + verify.py check
+│   ├── 03-review.md               # Bước 3: verify.py diff + 3 Subagents + khung FAILED / SAW / FIX
+│   ├── 04-fix.md                  # Bước 4: Đọc gọn state.md + vá gốc + cầu chì 2-Strike
+│   ├── 05-final-review.md         # Bước 5: Jira 31 + full verify.py check --preclose + 4-Step Prevention Audit
+│   ├── 06-precommit.md            # Bước 6: PR + khung Evidence Jira + cập nhật MEMORY.md + dừng tại The Undo Gate
+│   └── 07-close-jira.md           # Bước 7: Lấy <short-sha> thật + đăng Evidence 5 mục + đóng Jira 41 + lưu trữ BOARD.md
 ├── rules/
-│   └── domain-review.md           # Checklist kiến trúc & bảo mật chuyên sâu của CodeSight-AI (tracked)
+│   └── domain-review.md           # Checklist bất biến kiến trúc & bảo mật chuyên sâu của CodeSight-AI (tracked)
 └── tasks/
     ├── .gitkeep                   # Giữ cấu trúc thư mục rỗng trên Git (tracked)
-    └── CA-XX/                     # Hồ sơ làm việc của từng ticket (gitignored tự động)
+    └── CA-XX/                     # Hồ sơ riêng của từng Jira ticket (gitignored tự động)
+        ├── state.md               # Gói bàn giao siêu gọn <= 20 dòng (mới ở v4.0)
         ├── jira.md
         ├── plan.md
         ├── implementation-report.md
         ├── review-01.md
-        ├── fix-report.md          # (Sinh ra khi review-01.md có findings)
+        ├── fix-report.md          # (Chỉ sinh khi review-01.md có findings)
         ├── final-review.md
         └── precommit.md
 ```
 
 ---
 
-## 5. Bảng Tra Nhanh Câu Lệnh Các Bước (Cheat Sheet)
+## 6. Bảng Tra Nhanh Câu Lệnh Các Bước (Cheat Sheet)
 
 | Tình huống | Câu lệnh gửi vào Antigravity |
 | :--- | :--- |
+| **Xem bảng tiến độ (`THE BOARD`)** | `/ai-workflow board` |
 | **Bắt đầu ticket mới (Bước 1)** | `/ai-workflow CA-XX` |
-| **Chạy Bước 2 (Implement)** | `Duyệt plan. Thực hiện Bước 2 (Implement) cho task CA-XX theo .ai-workflow/prompts/02-implement.md và các skills trong blueprint của plan.md.` |
-| **Chạy Bước 3 (Review độc lập)** | `Thực hiện Bước 3 (Independent Review) cho task CA-XX theo .ai-workflow/prompts/03-review.md. Khởi chạy các subagents độc lập (Standards, Spec, Ponytail) đối chiếu jira.md, AGENTS.md và domain-review.md, lưu kết quả vào review-01.md.` |
-| **Chạy Bước 4 (Fix lỗi review)** | `Thực hiện Bước 4 (Fix) cho task CA-XX theo .ai-workflow/prompts/04-fix.md. Xử lý tận gốc các findings trong .ai-workflow/tasks/CA-XX/review-01.md, bổ sung regression tests và lưu báo cáo vào fix-report.md.` |
-| **Chạy Bước 5 (Final Review)** | `Thực hiện Bước 5 (Final Review) cho task CA-XX theo .ai-workflow/prompts/05-final-review.md. Kiểm tra lại toàn bộ findings từ review-01.md và fix-report.md, chạy preclose_audit.py cùng các Quality Gates và lưu kết quả vào final-review.md.` |
-| **Chạy Bước 6 (Pre-Commit & PR)** | `Thực hiện Bước 6 (Pre-Commit) cho task CA-XX theo .ai-workflow/prompts/06-precommit.md. Dùng skill pr soạn nội dung PR, chuẩn bị khung Verification Evidence cho Jira và lưu báo cáo vào precommit.md.` |
+| **Chạy Bước 2 (Implement)** | `Duyệt plan. Thực hiện Bước 2 (Implement) cho task CA-XX theo .ai-workflow/prompts/02-implement.md.` |
+| **Chạy Bước 3 (Review độc lập)** | `Thực hiện Bước 3 (Independent Review) cho task CA-XX theo .ai-workflow/prompts/03-review.md.` |
+| **Chạy Bước 4 (Fix lỗi review)** | `Thực hiện Bước 4 (Fix) cho task CA-XX theo .ai-workflow/prompts/04-fix.md.` |
+| **Chạy Bước 5 (Final Review)** | `Thực hiện Bước 5 (Final Review) cho task CA-XX theo .ai-workflow/prompts/05-final-review.md.` |
+| **Chạy Bước 6 (Pre-Commit & PR)** | `Thực hiện Bước 6 (Pre-Commit & Deliver) cho task CA-XX theo .ai-workflow/prompts/06-precommit.md.` |
 | **Chốt đóng Jira sau khi commit (Bước 7)** | `/ai-workflow close CA-XX` |

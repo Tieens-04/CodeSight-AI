@@ -203,10 +203,53 @@ class DiffBatch(BaseModel):
     file_paths: tuple[str, ...] = ()
     annotated_diff: str = Field(min_length=1)
     estimated_tokens: int = Field(ge=0)
+    right_line_hunks_by_file: dict[str, dict[int, int]] = Field(default_factory=dict)
+    left_deleted_hunks_by_file: dict[str, dict[int, int]] = Field(default_factory=dict)
 
     @field_validator("batch_index", "estimated_tokens", mode="before")
     @classmethod
     def _validate_ints(cls, value: Any) -> int:
+        return _reject_bool_int(value)
+
+
+class BuiltBatchContext(BaseModel):
+    """Zero-LLM structured prompt context assembled for one DiffBatch within token budget."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    batch_id: str = Field(min_length=1)
+    batch_index: int = Field(ge=0)
+    rendered_prompt: str = Field(min_length=1)
+    diff_tokens: int = Field(ge=0)
+    aux_tokens: int = Field(ge=0)
+    total_tokens: int = Field(ge=0)
+    max_user_tokens: int = Field(ge=1)
+    included_sections: tuple[str, ...] = ()
+    enclosing_count: int = Field(default=0, ge=0)
+    delta_cc_count: int = Field(default=0, ge=0)
+    caller_count: int = Field(default=0, ge=0)
+    callee_count: int = Field(default=0, ge=0)
+    adr_count: int = Field(default=0, ge=0)
+    has_custom_rules: bool = False
+    dropped_aux_blocks: int = Field(default=0, ge=0)
+    truncated_sections: tuple[str, ...] = ()
+
+    @field_validator(
+        "batch_index",
+        "diff_tokens",
+        "aux_tokens",
+        "total_tokens",
+        "max_user_tokens",
+        "enclosing_count",
+        "delta_cc_count",
+        "caller_count",
+        "callee_count",
+        "adr_count",
+        "dropped_aux_blocks",
+        mode="before",
+    )
+    @classmethod
+    def _validate_strict_counts(cls, value: Any) -> int:
         return _reject_bool_int(value)
 
 
@@ -279,6 +322,7 @@ class PRReviewState(BaseModel):
     total_diff_tokens: int = Field(default=0, ge=0)
     batching_mode: BatchingMode = "empty"
     batches: list[DiffBatch] = Field(default_factory=list)
+    batch_contexts: dict[str, BuiltBatchContext] = Field(default_factory=dict)
     unreviewable_segments: list[UnreviewableDiffSegment] = Field(default_factory=list)
     security_findings: Annotated[list[FindingCandidate], operator.add] = Field(default_factory=list)
     logic_findings: Annotated[list[FindingCandidate], operator.add] = Field(default_factory=list)

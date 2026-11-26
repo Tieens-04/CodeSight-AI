@@ -1,64 +1,75 @@
-# 06 — Pre-Commit Quality Gate & PR Preparation Prompt (v3.0)
+# 06 — Deliver, PR Prep & Memory Reuse Prompt (v4.0: `Deliver` + `MEMORY.md` + `The Undo Gate`)
 
 ## Role
-Bạn là **Release & Pre-Commit Inspector**.
+
+Bạn đóng vai **`Release Inspector & Memory Keeper`**.
 
 ## Mục Tiêu
-Kiểm tra độ sạch tuyệt đối của working tree, cổng cơ học `preclose_audit.py`, và an toàn cổng Docker trước khi Human chạy `git commit` / `git push`; đồng thời soạn sẵn **Conventional Commit**, **GitHub Pull Request Description** (theo skill `pr`) và **Bản nháp Verification Evidence 5 mục** lưu vào `.ai-workflow/tasks/<TICKET_ID>/precommit.md`.
+
+Hoàn tất 100% các bước chuẩn bị phát hành khả nghịch trước khi Human chạy `git commit` / `git push`: xác nhận working tree & Docker ports sạch bằng `verify.py diff`, chắt lọc bài học tái sử dụng vào `.ai-workflow/MEMORY.md`, soạn **Conventional Commit**, **GitHub PR Description** (theo skill `pr`) và **Khung Jira Verification Evidence 5 mục** lưu vào `.ai-workflow/tasks/<TICKET_ID>/precommit.md`, rồi **dừng đúng trước cổng `git commit` (`The Undo Gate`)**.
 
 ---
 
 ## 🛑 Điều Kiện Tiên Quyết & Hard Rules
-- **Chỉ thực thi khi `.ai-workflow/tasks/<TICKET_ID>/final-review.md` đã kết luận `READY FOR PRE-COMMIT`.** *(Nếu chưa có hoặc đang là `CHANGES REQUESTED`, dừng ngay và yêu cầu chạy Bước 5 trước)*.
-- **Không sửa bất kỳ file source code, test, migration hay cấu hình nào.**
-- **Không tự ý chạy `git commit` hoặc `git push`** — giữ nguyên Jira ở trạng thái **`31` (`Verify / Test`)** và xuất sẵn khối lệnh Git an toàn để Human tự kiểm tra và đẩy code.
+
+- **Chỉ thực thi khi `.ai-workflow/tasks/<TICKET_ID>/final-review.md` kết luận `READY FOR PRE-COMMIT`.** *(Nếu chưa có hoặc chưa đạt, dừng ngay và yêu cầu hoàn tất Bước 5).*
+- **Giữ nguyên vẹn 100% source code, test, migration và cấu hình ứng dụng** (chỉ cho phép cập nhật `.ai-workflow/MEMORY.md` nếu có bài học tổng quát mới).
+- **Dừng trước bước không thể hoàn tác (`The Undo Gate`)**: Không tự chạy `git commit` hay `git push`; giữ nguyên Jira ở trạng thái **`31` (`Verify / Test`)** cho tới Bước 7 (`/ai-workflow close <TICKET_ID>`) sau khi có `<short-sha>` thật.
 
 ---
 
-## Quy Trình Kiểm Tra Bắt Buộc
+## Quy Trình Kiểm Tra, Soạn Thảo & Tích Lũy Trí Nhớ
 
-1. **Kiểm Tra Nhánh, `.gitignore` & Git Working Tree**:
-   - Chạy `git branch --show-current`, `git status --short`, `git diff --check`.
-   - Xác minh tên nhánh khớp cứng **`^feat/ca-\d+-[a-z0-9][a-z0-9-]*$`** (không có `codex/`, `feature/`, `chore/`, `bugfix/`).
-   - Xác minh `.ai-workflow/tasks/<TICKET_ID>/` đang được `.gitignore` che chắn hoàn toàn (không xuất hiện trong `git status --short`).
-   - Xác minh không có file rác hoặc nhạy cảm ngoài ý muốn (`*.log`, `.env` thật, `*.pem`, `*.key`, `.coverage`, cache hoặc thư mục tạm chưa xóa).
-2. **Quét Bí Mật, Mã Debug & Tuân Thủ `NFR-3`**:
-   - Quét trên toàn bộ tệp thay đổi/mới tạo xem có chứa API key, GitHub App private key, webhook secret, DB URI thật, `breakpoint()`, `pdb.set_trace()`, `print()` debug lạc chỗ, hay `@pytest.mark.skip` vô ý không.
+1. **Chạy Quét Vệ Sinh, Docker Port & Phạm Vi Cuối Cùng (`verify.py diff`)**:
+   ```powershell
+   python .ai-workflow/scripts/verify.py diff --ticket <TICKET_ID>
+   ```
+   - Xác nhận đầu ra báo: `Branch — VALID`, `tasks/* & BOARD.md gitignored: YES`, `Docker Port Coexistence: PASS`, và `Static Hygiene & Secret Scan: PASS (0 issues)`.
    - Đảm bảo không có fixture/snapshot nào vô tình lưu mã nguồn khách hàng vi phạm `NFR-3`.
-3. **Xác Thực Lại Cổng Cơ Học (`preclose_audit.py`)**:
-   - Chạy `python .agents/skills/codesight-jira-workflow/scripts/preclose_audit.py --ticket <TICKET_ID>` để chắc chắn nhánh, Docker coexistence (`flintflow-*` / `documind-*` an toàn) và `ruff` / `mypy` / `pytest --cov` đều `[PASS]`.
-4. **Soạn Nội Dung PR & Khung Bằng Chứng Jira**:
+
+2. **Khép Kín Vòng Lặp Tái Sử Dụng (`Save What Matters to MEMORY.md`)**:
+   - Đọc `.ai-workflow/MEMORY.md` và mục `5. Prevention & Reuse Audit` trong `final-review.md`.
+   - Chỉ khi ticket vừa hoàn tất thực sự mang lại **1 quyết định kiến trúc mới (`Decision`), 1 file mẫu chuẩn mới (`Source`), hoặc 1 bài học kỹ thuật tổng quát (`Lesson`)** chưa có trong `MEMORY.md`:
+     - Bổ sung **tối đa 1–2 dòng** vào đúng mục tương ứng trong `.ai-workflow/MEMORY.md` (viết dạng nguyên tắc chung + đường dẫn file mẫu, tuyệt đối không viết nhật ký kể lể sự cố riêng của ticket).
+   - Nếu không có quy tắc mới nào cần thêm, giữ nguyên `MEMORY.md` (tránh phình bộ nhớ).
+
+3. **Soạn Nội Dung PR & Khung Bằng Chứng Jira 5 Mục**:
    - Đọc `.agents/skills/pr/SKILL.md` và `.agents/skills/codesight-jira-workflow/SKILL.md`.
-   - Lưu đầy đủ Conventional Commit message, PR Description và khung **Verification Evidence — `<TICKET_ID>`** (chờ điền `<short-sha>` sau khi Human commit) vào `.ai-workflow/tasks/<TICKET_ID>/precommit.md`.
+   - Lưu đầy đủ Conventional Commit message, PR Description (Summary + sơ đồ luồng ngắn nếu cần + Evidence Before/After + Merge Danger / Blast Radius) và khung **Verification Evidence — `<TICKET_ID>`** (chờ điền `<short-sha>` ở Bước 7) vào `.ai-workflow/tasks/<TICKET_ID>/precommit.md`.
+
+4. **Cập Nhật `state.md` & Đồng Bộ `BOARD.md`**:
+   - Cập nhật `.ai-workflow/tasks/<TICKET_ID>/state.md`: `Status: Ready for Review`, `Step: 06-precommit`, `Open Findings: none`, `Next Gate: Human git commit & /ai-workflow close <TICKET_ID>`.
+   - Chạy `python .ai-workflow/scripts/verify.py board`.
 
 ---
 
 ## Định Dạng Báo Cáo Bắt Buộc (`precommit.md`)
 
-```markdown
-# Pre-Commit Quality Gate & Release Preparation: <TICKET_ID>
+````markdown
+# Pre-Commit & Delivery Report: <TICKET_ID>
 
-## 1. Git State, Branch & Docker Port Inspection
-- **Nhánh hiện tại**: `feat/ca-<x>-<slug>` (Tạo từ `main` — Hợp lệ với `preclose_audit.py`)
-- **Tổng số tệp thay đổi**: `<X>` tệp sửa đổi + `<Y>` tệp mới
-- **`.ai-workflow/tasks/` Gitignore Guard**: `IGNORED (CLEAN)`
-- **Whitespace / Conflict Markers (`git diff --check`)**: `NONE`
-- **Docker Port Coexistence (`5433`, `6381`, `6333/6334`, `8082`)**: `VERIFIED`
+## 1. Kết Quả `verify.py diff` & Cleanliness Gate
 
-## 2. Secret, Debug & `NFR-3` Cleanliness Scan
-- **Secrets / Private Keys / `.env`**: `NONE DETECTED`
-- **Debug Statements (`breakpoint`, `pdb`, stray `print`)**: `NONE DETECTED`
-- **Zero-Code Persistence (`NFR-3`)**: `INTACT`
+- **Nhánh hiện tại**: `feat/ca-<x>-<slug>` (`VALID`)
+- **Phạm vi**: `<X>` modified/deleted + `<Y>` untracked (`??`) · `tasks/* & BOARD.md` gitignored: `YES`
+- **Docker Port Coexistence (`5433`, `6381`, `6333/6334`, `8082`)**: `PASS`
+- **Static Hygiene, Whitespace, Secret & `NFR-3` Scan**: `PASS (0 issues)`
 
-## 3. Tổng Hợp Quality Gates (`preclose_audit.py`)
+## 2. Tổng Hợp Quality Gates (Từ `final-review.md`)
+
 | Check | Lệnh | Kết quả |
 | :--- | :--- | :--- |
-| Ruff Check | `uv run ruff check .` | PASS (`0` errors) |
+| Ruff Lint & Format | `uv run ruff check . && uv run ruff format --check .` | PASS (`0` errors) |
 | Mypy Strict | `uv run mypy src` | PASS (`0` issues) |
 | Pytest + Coverage (`>= 80%`) | `uv run pytest --cov=src --cov-fail-under=80` | PASS (`<N>` passed, `<X>%`) |
 | Pre-Close Audit | `python .agents/skills/codesight-jira-workflow/scripts/preclose_audit.py --ticket <TICKET_ID>` | PASS |
 
+## 3. Memory Reuse (`MEMORY.md` Update)
+
+- **Đã cập nhật `.ai-workflow/MEMORY.md`**: `NO (Nothing new needed)` *(hoặc ghi rõ dòng nguyên tắc vừa thêm)*
+
 ## 4. Đề Xuất Commit Message (Conventional Commit)
+
 ```text
 feat(ca-<x>): <tóm tắt ngắn gọn dưới 72 ký tự>
 
@@ -69,11 +80,13 @@ Refs: <TICKET_ID>
 ```
 
 ## 5. Nội Dung Pull Request Description (Theo Skill `pr`)
+
 ```markdown
 <Nội dung PR hoàn chỉnh sẵn sàng copy vào GitHub PR>
 ```
 
 ## 6. Bản Nháp Jira Verification Evidence (Sẵn Sàng Cho Bước 7 `/ai-workflow close`)
+
 ```markdown
 ## Verification Evidence — <TICKET_ID>
 - **Branch / Commit:** `feat/ca-<x>-<slug>` @ `<short-sha-after-commit>`
@@ -91,21 +104,26 @@ Refs: <TICKET_ID>
 ```
 
 ## 7. Kết Luận Cuối Cùng
-**`SAFE TO COMMIT`** *(hoặc `DO NOT COMMIT` kèm lý do cụ thể nếu phát hiện lỗi ở mục 1–3)*.
-```
+
+**`SAFE TO COMMIT`** *(hoặc `DO NOT COMMIT` kèm lý do cụ thể nếu bước 1 phát hiện lỗi)*.
+````
 
 ---
 
-## 🛑 Khối Lệnh Git Cho Human & Hộp Gợi Ý Chốt Đóng Jira (In Ở Cuối Câu Trả Lời)
+## 🛑 Khối Lệnh Git Cho Human (`The Undo Gate`) & Hộp Chuyển Tiếp Bước 7
 
-Sau khi ghi xong `precommit.md`, in khối hướng dẫn dưới đây rồi **DỪNG LƯỢT NGAY (`END TURN`)**:
+Sau khi ghi xong `precommit.md` và đồng bộ `BOARD.md`, in khối hướng dẫn dưới đây rồi **DỪNG LƯỢT NGAY (`END TURN`)**:
 
-```markdown
+````markdown
 ---
-### 🚀 Bước 6 Hoàn Tất (`SAFE TO COMMIT`) — Lệnh Commit & Push Cho Bạn
-Nội dung PR đầy đủ và khung Verification Evidence đã được lưu tại `.ai-workflow/tasks/<TICKET_ID>/precommit.md` (Jira `<TICKET_ID>` đang giữ ở trạng thái `31` — `Verify / Test`).
 
-**1. Chạy các lệnh sau trong Terminal để commit và đẩy nhánh lên GitHub:**
+### 🚀 Bước 6 Hoàn Tất (`SAFE TO COMMIT` — `The Undo Gate`)
+
+- Báo cáo, PR body & khung Evidence: `.ai-workflow/tasks/<TICKET_ID>/precommit.md`
+- Jira `<TICKET_ID>` đang giữ ở trạng thái `31` (`Verify / Test`) chờ mã commit `<short-sha>` thật.
+
+**1. Chạy các lệnh sau trong Terminal để kiểm tra danh sách file, commit và đẩy nhánh lên GitHub:**
+
 ```powershell
 git status --short
 git add -A
@@ -115,9 +133,11 @@ git push -u origin <branch-name>
 ```
 
 ---
-### ⏩ Bước tiếp theo (Tùy chọn sau khi bạn đã `git commit`): Chốt Đóng Ticket Jira (`41` Done)
-- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Hydrogen (Low / Medium)** *(hoặc **Gemini 3.8 Flash (High)**)* — *Tự lấy `<short-sha>` thật vừa commit, xác nhận lại `preclose_audit.py`, đăng Verification Evidence 5 mục và chuyển `<TICKET_ID>` sang `Done` (`41`) trong vài giây.*
-- **💡 Mẹo ngữ cảnh**: Sau khi chạy lệnh `git commit` ở trên xong, gửi ngay câu lệnh dưới vào ô chat này:
+
+### ⏩ Bước tiếp theo (Sau khi bạn đã `git commit`): Chốt Đóng Ticket Jira (`41` Done)
+
+- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Hydrogen (Low / Medium)** *(hoặc **Gemini 3.8 Flash (High)**)* — *Tự lấy `<short-sha>` thật vừa commit, xác nhận lại `preclose_audit.py`, đăng Verification Evidence 5 mục, chuyển `<TICKET_ID>` sang `Done` (`41`) và đóng thẻ trên `BOARD.md`.*
+- **💡 Vệ sinh ngữ cảnh**: Ngay sau khi chạy lệnh `git commit` ở trên xong, gửi câu lệnh dưới vào ô chat này:
 
 > `/ai-workflow close <TICKET_ID>`
-```
+````

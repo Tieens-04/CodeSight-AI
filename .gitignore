@@ -27,6 +27,7 @@ coverage.xml
 
 # Local scratch, AI workflow task runs & OS files
 .superpowers/
+.ai-workflow/BOARD.md
 .ai-workflow/tasks/*
 !.ai-workflow/tasks/.gitkeep
 .DS_Store
