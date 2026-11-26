@@ -16,11 +16,15 @@ from codesight.agents.llm_factory import (
     LLMStructuredOutputError,
     StructuredInvocationResult,
 )
+from codesight.agents.nodes.context_builder import PRReviewContext, build_batch_context
+from codesight.agents.nodes.security_auditor import run_security_auditor
+from codesight.agents.prompts.security_prompt import SECURITY_AUDITOR_SYSTEM_PROMPT
 from codesight.agents.schemas import (
     AuditorOutput,
     AuditorRole,
     BatchingMode,
     BatchReviewResult,
+    BuiltBatchContext,
     CodeSuggestion,
     CriticDecision,
     CriticOutput,
@@ -46,10 +50,12 @@ __all__ = [
     "DEFAULT_LLM_MAX_CONCURRENCY",
     "DEFAULT_MAX_REQUEST_TOKENS",
     "DEFAULT_OUTPUT_RESERVE_TOKENS",
+    "SECURITY_AUDITOR_SYSTEM_PROMPT",
     "AuditorOutput",
     "AuditorRole",
     "BatchReviewResult",
     "BatchingMode",
+    "BuiltBatchContext",
     "CodeSuggestion",
     "CriticDecision",
     "CriticOutput",
@@ -67,13 +73,16 @@ __all__ = [
     "LLMFindingDraft",
     "LLMRole",
     "LLMStructuredOutputError",
+    "PRReviewContext",
     "PRReviewState",
     "ReviewGraphConfig",
     "ReviewRunStatus",
     "StructuredInvocationResult",
     "TelemetryStatus",
     "UnreviewableDiffSegment",
+    "build_batch_context",
     "build_pr_review_graph",
     "run_pr_review_graph",
+    "run_security_auditor",
     "split_parsed_diff_into_batches",
 ]
