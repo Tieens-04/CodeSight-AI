@@ -13,7 +13,11 @@ import structlog
 from codesight.agents.schemas import BuiltBatchContext, DiffBatch
 from codesight.ast_engine.models import ComplexityDelta, PRFileContext
 from codesight.config_reader.repo_config import RepoConfig
-from codesight.diff.file_filter import estimate_tokens, normalize_diff_path
+from codesight.diff.file_filter import (
+    estimate_tokens,
+    normalize_diff_path,
+    resolve_after_source_for_path,
+)
 from codesight.diff.hunk_mapper import parse_hunk_header, split_diff_lines
 from codesight.rag.retriever import AssembledPRContext
 from codesight.rag.token_packer import PackedContextBlock, PackedContextBundle
@@ -55,6 +59,12 @@ class PRReviewContext:
     repo_config: RepoConfig | None = None
     custom_rules: str | None = None
     block_target_symbols: Mapping[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+    # NFR-3: keep raw after_sources in transient RAM on PRReviewContext only.
+    after_sources_by_file: Mapping[str, str | bytes] = field(default_factory=dict, repr=False)
+
+    def resolve_after_source(self, file_path: str) -> str | bytes | None:
+        """Return in-memory post-PR source for `file_path` using normalized path matching."""
+        return resolve_after_source_for_path(self.after_sources_by_file, file_path)
 
     def resolve_packed_bundle(self) -> PackedContextBundle | None:
         """Return explicit packed_bundle, falling back to assembled_context.packed_bundle."""
@@ -117,7 +127,8 @@ def _neutralize_ref_text(text: str) -> str:
     return _CLOSE_REF_TAG_RE.sub("&lt;/reference_context&gt;", text)
 
 
-def _neutralize_rules_text(text: str) -> str:
+def neutralize_rules_text(text: str) -> str:
+    """Escape closing `</repo_custom_rules>` tags inside untrusted repository rules text."""
     return _CLOSE_RULES_TAG_RE.sub("&lt;/repo_custom_rules&gt;", text)
 
 
@@ -463,7 +474,7 @@ def build_batch_context(
     rules_text = review_context.resolve_custom_rules()
     rules_block = (
         f'<repo_custom_rules source=".codesight.yaml">\n'
-        f"{_neutralize_rules_text(rules_text)}\n</repo_custom_rules>"
+        f"{neutralize_rules_text(rules_text)}\n</repo_custom_rules>"
         if rules_text
         else None
     )

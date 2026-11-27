@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, Literal, Protocol, Self, runtime_checkable
@@ -13,13 +13,14 @@ import httpx
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from codesight.ast_engine.suggestion_validator import TreeSitterSuggestionValidator
 from codesight.core.errors import (
     RateLimitTaskError,
     RetryableTaskError,
     is_rate_limited_403,
     parse_retry_after_header,
 )
-from codesight.diff.file_filter import normalize_diff_path
+from codesight.diff.file_filter import normalize_diff_path, resolve_after_source_for_path
 from codesight.diff.models import ParsedFileDiff, ParsedPullRequestDiff
 from codesight.vcs._http import (
     METHOD_PRESERVING_REDIRECT_STATUSES,
@@ -266,11 +267,39 @@ def partition_review_comments(
     drafts: Sequence[ReviewCommentDraft],
     *,
     summary_body: str = "",
+    after_sources_by_file: Mapping[str, str | bytes] | None = None,
+    suggestion_validator: TreeSitterSuggestionValidator | None = None,
 ) -> PreparedPullRequestReview:
     """Partition comment drafts into valid RIGHT-side inline payloads vs Summary findings."""
     inline_comments: list[dict[str, Any]] = []
     inline_drafts: list[ReviewCommentDraft] = []
     downgraded: list[DowngradedComment] = []
+    active_validator = (
+        suggestion_validator
+        if suggestion_validator is not None
+        else (TreeSitterSuggestionValidator() if after_sources_by_file is not None else None)
+    )
+
+    def _sanitize_inline_body(
+        parsed_file: ParsedFileDiff,
+        body: str,
+        *,
+        start_line: int | None,
+        line: int,
+    ) -> str:
+        if active_validator is None:
+            return body
+        sanitized, _, _ = active_validator.sanitize_markdown_comment(
+            parsed_file.file_path,
+            body,
+            start_line=start_line,
+            line=line,
+            after_source=resolve_after_source_for_path(
+                after_sources_by_file, parsed_file.file_path
+            ),
+            parsed_file=parsed_file,
+        )
+        return sanitized
 
     for draft in drafts:
         parsed_file = _lookup_parsed_file(parsed_diff, draft.path)
@@ -288,15 +317,20 @@ def partition_review_comments(
 
         if draft.start_line is None or draft.start_line == draft.line:
             if parsed_file.is_line_commentable(draft.line):
+                comment_body = _sanitize_inline_body(
+                    parsed_file, draft.body, start_line=None, line=draft.line
+                )
                 inline_comments.append(
                     {
                         "path": parsed_file.file_path,
                         "line": draft.line,
                         "side": "RIGHT",
-                        "body": truncate_markdown_body(draft.body),
+                        "body": truncate_markdown_body(comment_body),
                     }
                 )
-                inline_drafts.append(draft.model_copy(update={"path": parsed_file.file_path}))
+                inline_drafts.append(
+                    draft.model_copy(update={"path": parsed_file.file_path, "body": comment_body})
+                )
             else:
                 downgraded.append(DowngradedComment(draft=draft, reason="line_outside_hunk"))
             continue
@@ -306,6 +340,9 @@ def partition_review_comments(
             continue
 
         if parsed_file.is_range_commentable(draft.start_line, draft.line):
+            comment_body = _sanitize_inline_body(
+                parsed_file, draft.body, start_line=draft.start_line, line=draft.line
+            )
             inline_comments.append(
                 {
                     "path": parsed_file.file_path,
@@ -313,10 +350,12 @@ def partition_review_comments(
                     "start_side": "RIGHT",
                     "line": draft.line,
                     "side": "RIGHT",
-                    "body": truncate_markdown_body(draft.body),
+                    "body": truncate_markdown_body(comment_body),
                 }
             )
-            inline_drafts.append(draft.model_copy(update={"path": parsed_file.file_path}))
+            inline_drafts.append(
+                draft.model_copy(update={"path": parsed_file.file_path, "body": comment_body})
+            )
             continue
 
         both_in_diff = parsed_file.is_line_commentable(
@@ -746,6 +785,8 @@ class GitHubReviewPublisher:
         repo_id: str | None = None,
         check_run_id: int | None = None,
         installation_id: int | None = None,
+        after_sources_by_file: Mapping[str, str | bytes] | None = None,
+        suggestion_validator: TreeSitterSuggestionValidator | None = None,
     ) -> PublishedReviewRecord:
         """Publish all review findings in one batch POST while guarding against HTTP 422."""
         slug = validate_repo_full_name(repo_full_name)
@@ -768,7 +809,13 @@ class GitHubReviewPublisher:
         ):
             raise TypeError("supersede_lock must implement AsyncSupersedeLockProtocol.")
 
-        prepared = partition_review_comments(parsed_diff, drafts, summary_body=summary_body)
+        prepared = partition_review_comments(
+            parsed_diff,
+            drafts,
+            summary_body=summary_body,
+            after_sources_by_file=after_sources_by_file,
+            suggestion_validator=suggestion_validator,
+        )
         lock_repo_id = repo_id if repo_id else slug
         if supersede_lock is None:
             logger.warning(

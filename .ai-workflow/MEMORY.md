@@ -25,6 +25,7 @@
 - **Batch-scoped context & evidence grounding**: Scope batch auxiliary context by both `right_line_hunks_by_file` and `left_deleted_hunks_by_file` (`src/codesight/agents/nodes/context_builder.py`), drop auditor drafts lacking anchored or file-linked `<reference_context>` code identifiers, mask credential literals (including multi-word passphrases while sparing error-message keys), and re-align suggestion indentation (`src/codesight/agents/nodes/security_auditor.py`).
 - **Shared Auditor Guardrails & Indentation Scaling**: Reuse `run_auditor_node` and `validate_auditor_findings` (enclosing-symbol + optional `LEFT` deleted-symbol caller linking, same-hunk suggestion enforcement, batch-wide `RIGHT`+`LEFT`+TS-backtick secret masking, and delta-based 2/4-space scaling) (`src/codesight/agents/nodes/_auditor_common.py`, `src/codesight/agents/nodes/perf_arch_auditor.py`).
 - **Single-Source Gemini Model Catalog & Pricing**: Define supported Gemini models and USD/1M token rates once in `GEMINI_MODEL_PRICING_USD_PER_1M` (`src/codesight/core/config.py`) and derive `ALLOWED_GEMINI_CRITIC_MODELS` and `MODEL_PRICING_PER_1M_TOKENS` (`src/codesight/core/observability.py`) from it.
+- **Zero-Noise Critic & RAM Tree-Sitter Suggestion Guard**: Keep raw `merged_findings` alongside `verified_findings` (`confidence >= 0.75`, empty/all-truncated short-circuit, redacted-evidence re-grounding, canonical-group dedup), mask secrets before LF-only `tree-sitter` + `ast.parse(bytes)` splice checks, and neutralize CommonMark §4.5 `suggestion` fences in prose (`src/codesight/agents/nodes/critic_agent.py`, `src/codesight/ast_engine/suggestion_validator.py`, `src/codesight/agents/schemas.py`).
 
 ---
 
@@ -38,6 +39,7 @@
 - **LangGraph Batch-Grouped Parallel / `Send()` & `LLMFactory`**: `src/codesight/agents/llm_factory.py`, `src/codesight/agents/schemas.py`, `src/codesight/agents/graph.py`, `tests/unit/test_langgraph_batching_and_rate_limit.py`
 - **Zero-LLM Context Builder & Grounded Security Auditor**: `src/codesight/agents/nodes/context_builder.py`, `src/codesight/agents/nodes/security_auditor.py`, `src/codesight/agents/prompts/security_prompt.py`, `tests/unit/test_context_builder_formatting.py`, `tests/integration/test_security_auditor.py`
 - **Parallel Auditors, Shared Guardrails & Live Timing Gate**: `src/codesight/agents/nodes/_auditor_common.py`, `src/codesight/agents/nodes/perf_arch_auditor.py`, `src/codesight/agents/prompts/perf_arch_prompt.py`, `tests/integration/test_parallel_auditors.py`
+- **Zero-Noise Critic & RAM Suggestion Validator**: `src/codesight/agents/nodes/critic_agent.py`, `src/codesight/agents/prompts/critic_prompt.py`, `src/codesight/ast_engine/suggestion_validator.py`, `tests/unit/test_suggestion_syntax_validator.py`, `tests/integration/test_critic_zero_noise.py`
 - **Hermetic Live Docker Integration Suites (`5433` / `6381` / `6333-6334`)**: `tests/integration/test_week1_webhook_to_worker_e2e.py`, `tests/integration/test_week2_dual_lang_rag_e2e.py`
 
 ---

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Final
@@ -147,6 +147,26 @@ def normalize_diff_path(raw_path: str) -> str:
         else:
             normalized = normalized[1:]
     return normalized
+
+
+def resolve_after_source_for_path(
+    after_sources_by_file: Mapping[str, str | bytes] | None,
+    file_path: str,
+) -> str | bytes | None:
+    """Resolve an in-memory post-PR file source by exact or normalized repository path."""
+    if not after_sources_by_file:
+        return None
+    if file_path in after_sources_by_file:
+        return after_sources_by_file[file_path]
+    target_norm = normalize_diff_path(file_path).rstrip("/")
+    if not target_norm:
+        return None
+    if target_norm in after_sources_by_file:
+        return after_sources_by_file[target_norm]
+    for raw_path, src in after_sources_by_file.items():
+        if normalize_diff_path(raw_path).rstrip("/") == target_norm:
+            return src
+    return None
 
 
 def estimate_tokens(content: str | bytes) -> int:
