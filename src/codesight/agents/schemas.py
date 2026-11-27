@@ -28,8 +28,12 @@ _SUGGESTION_FENCE_RE = re.compile(
 )
 
 
-def _neutralize_suggestion_fences(text: str) -> str:
+def neutralize_suggestion_fences(text: str) -> str:
+    """Strip CommonMark suggestion fence headers from prose while keeping content."""
     return _SUGGESTION_FENCE_RE.sub(r"\1", text)
+
+
+_neutralize_suggestion_fences = neutralize_suggestion_fences
 
 
 def _reject_bool_int(value: Any) -> int:
