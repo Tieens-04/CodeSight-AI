@@ -30,6 +30,7 @@ from celery.signals import (
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from codesight.agents.llm_factory import LLMFactory
 from codesight.config_reader.repo_config import RepoConfigLoader
 from codesight.core.config import Settings, get_settings
 from codesight.core.logging import (
@@ -51,7 +52,7 @@ from codesight.worker.lifecycle import (
 from codesight.worker.lifecycle import (
     execute_pr_review_lifecycle as _execute_pr_review_lifecycle_impl,
 )
-from codesight.worker.pr_review_runner import Week1PRReviewRunner
+from codesight.worker.pr_review_runner import Sprint3PRReviewRunner, Week1PRReviewRunner
 from codesight.worker.supersede_lock import AsyncSupersedeLock
 from codesight.worker.supersede_lock import (
     is_pr_event_superseded as _is_pr_superseded_impl,
@@ -653,12 +654,25 @@ class _WorkerAsyncRuntime:
                 http_client, redis_client, session_factory = await self._ensure_pools(
                     active_settings
                 )
+                store: QdrantZeroCodeStore | None = None
+                embedder: GeminiEmbedder | None = None
+                if active_settings.has_gemini_api_key:
+                    try:
+                        store, embedder = await self._ensure_rag_pools(active_settings)
+                    except Exception as rag_exc:
+                        logger.warning(
+                            "worker_pr_rag_pools_degraded",
+                            trace_id=get_trace_id() or "-",
+                            error_type=type(rag_exc).__name__,
+                        )
                 return await run_pr_webhook_task(
                     payload,
                     settings=active_settings,
                     http_client=http_client,
                     session_factory=session_factory,
                     redis_client=redis_client,
+                    qdrant_store=store,
+                    embedder=embedder,
                     is_final_attempt=is_final_attempt,
                 )
             return await run_pr_webhook_task(
@@ -720,15 +734,30 @@ async def run_pr_webhook_task(
     http_client: httpx.AsyncClient | None = None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     redis_client: redis_async.Redis | None = None,
+    qdrant_store: QdrantZeroCodeStore | None = None,
+    embedder: GeminiEmbedder | None = None,
+    llm_factory: LLMFactory | None = None,
     api_base_url: str = "https://api.github.com",
     is_final_attempt: bool = False,
 ) -> dict[str, str]:
-    """Execute live Week 1 PR review flow when configured, else run offline lifecycle stub."""
+    """Execute Sprint 3 AI PR review when Gemini credentials exist, else Week 1 runner."""
     active_settings = settings if settings is not None else get_settings()
     coords = extract_pr_coords(payload)
     repo_full_name = payload.get("repo_full_name")
     has_repo_slug = isinstance(repo_full_name, str) and bool(repo_full_name.strip())
     if coords is not None and has_repo_slug and has_github_credentials(active_settings):
+        if active_settings.has_gemini_api_key or llm_factory is not None:
+            sprint3_runner = Sprint3PRReviewRunner(
+                settings=active_settings,
+                http_client=http_client,
+                session_factory=session_factory,
+                redis_client=redis_client,
+                qdrant_store=qdrant_store,
+                embedder=embedder,
+                llm_factory=llm_factory,
+                api_base_url=api_base_url,
+            )
+            return await sprint3_runner.execute(payload, is_final_attempt=is_final_attempt)
         runner = Week1PRReviewRunner(
             settings=active_settings,
             http_client=http_client,

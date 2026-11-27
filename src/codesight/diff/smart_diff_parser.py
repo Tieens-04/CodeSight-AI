@@ -32,6 +32,9 @@ from codesight.diff.models import (
 logger = structlog.get_logger("codesight.diff")
 
 _BINARY_DIFF_PATHS_RE: Final[re.Pattern[str]] = re.compile(r"^Binary files (.+) and (.+) differ$")
+_INDEX_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    r"^index [0-9a-fA-F]{7,64}\.\.([0-9a-fA-F]{7,64})(?: \d+)?$"
+)
 
 _C_ESCAPE_BYTES: Final[dict[str, int]] = {
     "a": 0x07,
@@ -174,6 +177,7 @@ class _RawFileBlock:
     change_type: FileChangeType = "modified"
     is_binary: bool = False
     seen_hunk: bool = False
+    blob_sha: str | None = None
     raw_lines: list[str] = field(default_factory=list)
     hunk_lines: list[str] = field(default_factory=list)
 
@@ -317,6 +321,12 @@ def _split_raw_diff_blocks(raw_diff: str) -> list[_RawFileBlock]:
                 current.new_path = path
         elif is_binary_patch(raw_line):
             current.is_binary = True
+        else:
+            index_match = _INDEX_LINE_RE.match(raw_line)
+            if index_match is not None:
+                new_sha = index_match.group(1).lower()
+                if set(new_sha) != {"0"}:
+                    current.blob_sha = new_sha
 
     return [b for b in blocks if b.has_git_header or b.seen_hunk or b.is_binary]
 
@@ -378,6 +388,7 @@ class SmartDiffParser:
                 old_path=block.old_path,
                 new_path=block.new_path,
                 change_type=block.change_type,
+                blob_sha=block.blob_sha,
             )
             kept_files.append(parsed_file)
             kept_raw_patches.append(raw_text)

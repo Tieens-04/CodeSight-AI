@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final, Literal, Self
 
 import httpx
@@ -14,7 +15,7 @@ from codesight.core.errors import (
     is_rate_limited_403,
     parse_retry_after_header,
 )
-from codesight.diff.file_filter import FileFilter
+from codesight.diff.file_filter import FileFilter, normalize_diff_path
 from codesight.diff.models import ParsedPullRequestDiff, PatchFileEntry
 from codesight.diff.smart_diff_parser import SmartDiffParser
 from codesight.vcs._http import (
@@ -344,3 +345,92 @@ class GitHubPullRequestClient:
             tokens_saved_pct=metrics.tokens_saved_pct,
         )
         return FetchedPullRequestDiff(parsed_diff=parsed_diff, diff_source=diff_source)
+
+    async def fetch_pr_file_blob_shas(
+        self,
+        repo_full_name: str,
+        pull_number: int,
+        *,
+        installation_id: int | None = None,
+    ) -> dict[str, str]:
+        """Fetch full 40-hex Git blob SHAs per normalized file path via `/pulls/{pr}/files`."""
+        slug = validate_repo_full_name(repo_full_name)
+        valid_pr = validate_positive_int(pull_number, name="pull_number")
+        headers = await self._auth.get_auth_headers(
+            installation_id=installation_id,
+            repo_full_name=slug,
+        )
+        entries = await self._fetch_paginated_files(
+            slug=slug,
+            pull_number=valid_pr,
+            headers=headers,
+            installation_id=installation_id,
+        )
+        sha_map: dict[str, str] = {}
+        for entry in entries:
+            if not entry.blob_sha:
+                continue
+            norm_path = normalize_diff_path(entry.filename).rstrip("/")
+            if norm_path:
+                sha_map[norm_path] = entry.blob_sha.strip().lower()
+        return sha_map
+
+    async def enrich_missing_blob_shas(
+        self,
+        repo_full_name: str,
+        pull_number: int,
+        parsed_diff: ParsedPullRequestDiff,
+        *,
+        installation_id: int | None = None,
+    ) -> ParsedPullRequestDiff:
+        """Enrich kept non-deleted files lacking full 40-hex blob_sha via `/pulls/{pr}/files`."""
+        needs_enrichment = any(
+            pf.change_type != "deleted" and len(pf.blob_sha or "") < 40 for pf in parsed_diff.files
+        )
+        if not needs_enrichment:
+            return parsed_diff
+        try:
+            sha_map = await self.fetch_pr_file_blob_shas(
+                repo_full_name,
+                pull_number,
+                installation_id=installation_id,
+            )
+        except RateLimitTaskError:
+            raise
+        except (RetryableTaskError, GitHubPublishError) as exc:
+            logger.warning(
+                "github_pr_blob_sha_enrichment_degraded",
+                repo=repo_full_name,
+                pr_number=pull_number,
+                error_type=type(exc).__name__,
+            )
+            return parsed_diff
+        return apply_blob_shas_to_parsed_diff(parsed_diff, sha_map)
+
+
+def apply_blob_shas_to_parsed_diff(
+    parsed_diff: ParsedPullRequestDiff,
+    sha_map: Mapping[str, str],
+) -> ParsedPullRequestDiff:
+    """Return a copy of `parsed_diff` with missing/short `blob_sha` values filled from `sha_map`."""
+    if not sha_map or not parsed_diff.files:
+        return parsed_diff
+    norm_shas = {
+        normalize_diff_path(k).rstrip("/"): v.strip().lower()
+        for k, v in sha_map.items()
+        if isinstance(v, str) and v.strip()
+    }
+    updated_files = []
+    changed = False
+    for pf in parsed_diff.files:
+        if pf.change_type != "deleted" and len(pf.blob_sha or "") < 40:
+            norm_path = normalize_diff_path(pf.file_path).rstrip("/")
+            resolved_sha = norm_shas.get(norm_path)
+            if resolved_sha and resolved_sha != pf.blob_sha:
+                updated_files.append(replace(pf, blob_sha=resolved_sha))
+                changed = True
+                continue
+        updated_files.append(pf)
+    if not changed:
+        return parsed_diff
+    return replace(parsed_diff, files=tuple(updated_files))

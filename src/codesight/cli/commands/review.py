@@ -7,20 +7,26 @@ import base64
 import binascii
 import sys
 import time
+import uuid
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Literal, cast
 from urllib.parse import quote, urlsplit
 
 import httpx
+import redis.asyncio as redis_async
+import redis.exceptions
+import sqlalchemy as sa
 import structlog
 import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from codesight import __version__
+from codesight.agents.llm_factory import LLMFactory
 from codesight.config_reader.repo_config import (
     CONFIG_FILENAMES,
     MAX_REPO_CONFIG_BYTES,
@@ -28,10 +34,14 @@ from codesight.config_reader.repo_config import (
     parse_repo_config_yaml,
 )
 from codesight.core.config import Settings, get_settings
-from codesight.core.errors import is_rate_limited_403
+from codesight.core.errors import RateLimitTaskError, RetryableTaskError, is_rate_limited_403
+from codesight.db.models import Repository
+from codesight.db.session import create_db_engine, create_session_factory
 from codesight.diff.file_filter import FileFilter
 from codesight.diff.models import ParsedPullRequestDiff, PatchFileEntry
 from codesight.diff.smart_diff_parser import SmartDiffParser
+from codesight.rag.embedder import GeminiEmbedder
+from codesight.rag.qdrant_store import QdrantZeroCodeStore
 from codesight.vcs._http import (
     REDIRECT_STATUSES,
     BoundedStreamResult,
@@ -40,6 +50,7 @@ from codesight.vcs._http import (
     resolve_same_origin_redirect,
     stream_same_origin_bounded,
 )
+from codesight.vcs.blob_fetcher import GitHubBlobFetcher, GitHubBlobFetchError
 from codesight.vcs.github_auth import (
     GITHUB_ACCEPT_HEADER,
     GITHUB_API_VERSION,
@@ -48,6 +59,18 @@ from codesight.vcs.github_auth import (
     GitHubAuthProvider,
     validate_repo_full_name,
 )
+from codesight.vcs.github_pr_client import GitHubPullRequestClient
+from codesight.vcs.github_publisher import (
+    GitHubPublishError,
+    GitHubReviewPublisher,
+    PublishedReviewRecord,
+)
+from codesight.worker.ai_review_pipeline import (
+    PRReviewExecutionResult,
+    execute_ai_pr_review,
+    persist_pr_review_result,
+)
+from codesight.worker.sha_cache import RedisBlobSHACache
 
 DEFAULT_ALLOWED_PR_HOSTS: Final[frozenset[str]] = frozenset({"github.com", "www.github.com"})
 GITHUB_DIFF_ACCEPT_HEADER: Final[str] = "application/vnd.github.diff"
@@ -89,6 +112,21 @@ class PRDryRunBundle:
     parsed_diff: ParsedPullRequestDiff
     diff_source: Literal["diff", "files_api"]
     elapsed_ms: float
+    base_sha: str = ""
+    github_repo_id: int | None = None
+    default_branch: str = "main"
+
+
+@dataclass(frozen=True, slots=True)
+class CLIAIReviewBundle:
+    """End-to-end AI PR review report bundle returned by `run_cli_ai_review`."""
+
+    pr_bundle: PRDryRunBundle
+    ai_result: PRReviewExecutionResult
+    published_review: PublishedReviewRecord | None = None
+    db_review_id: uuid.UUID | None = None
+    warnings: tuple[str, ...] = ()
+    publish_skipped_reason: str | None = None
 
 
 def parse_github_pr_url(
@@ -444,12 +482,20 @@ async def fetch_pull_request_dry_run(
         base_obj = meta_json.get("base")
         head_obj = meta_json.get("head")
         base_ref = str(base_obj.get("ref") or "main") if isinstance(base_obj, dict) else "main"
+        base_sha = str(base_obj.get("sha") or "") if isinstance(base_obj, dict) else ""
         base_repo = base_obj.get("repo") if isinstance(base_obj, dict) else None
-        config_ref = (
+        default_branch = (
             str(base_repo.get("default_branch") or base_ref)
             if isinstance(base_repo, dict)
             else base_ref
         )
+        raw_repo_id = base_repo.get("id") if isinstance(base_repo, dict) else None
+        github_repo_id = (
+            raw_repo_id
+            if isinstance(raw_repo_id, int) and not isinstance(raw_repo_id, bool)
+            else None
+        )
+        config_ref = default_branch
         head_ref = str(head_obj.get("ref") or "HEAD") if isinstance(head_obj, dict) else "HEAD"
         head_sha = str(head_obj.get("sha") or "") if isinstance(head_obj, dict) else ""
 
@@ -502,6 +548,9 @@ async def fetch_pull_request_dry_run(
             parsed_diff=parsed_diff,
             diff_source=diff_source,
             elapsed_ms=elapsed_ms,
+            base_sha=base_sha,
+            github_repo_id=github_repo_id,
+            default_branch=default_branch,
         )
     finally:
         if owned_client is not None:
@@ -573,6 +622,326 @@ def render_dry_run_report(console: Console, bundle: PRDryRunBundle) -> None:
         console.print(skipped_table)
 
 
+async def run_cli_ai_review(
+    pr_ref: ParsedPRUrl,
+    *,
+    settings: Settings | None = None,
+    publish: bool | None = None,
+    http_client: httpx.AsyncClient | None = None,
+    redis_client: redis_async.Redis | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    qdrant_store: QdrantZeroCodeStore | None = None,
+    embedder: GeminiEmbedder | None = None,
+    llm_factory: LLMFactory | None = None,
+    api_base_url: str = "https://api.github.com",
+) -> CLIAIReviewBundle:
+    """Run CLI AI PR review with best-effort Redis/Qdrant/PostgreSQL and optional GitHub publish."""
+    active_settings = settings if settings is not None else get_settings()
+    api_base = api_base_url.rstrip("/")
+    should_publish = active_settings.has_github_credentials if publish is None else publish
+    if should_publish and not active_settings.has_github_credentials:
+        raise CLIReviewError(
+            "Publishing to GitHub requires GITHUB_TOKEN or GitHub App credentials."
+        )
+
+    warnings: list[str] = []
+    owned_client: httpx.AsyncClient | None = None
+    owned_redis: redis_async.Redis | None = None
+    owned_db_engine: AsyncEngine | None = None
+    owned_qdrant: QdrantZeroCodeStore | None = None
+    owned_embedder: GeminiEmbedder | None = None
+    ai_result: PRReviewExecutionResult | None = None
+
+    client = http_client
+    if client is None:
+        owned_client = httpx.AsyncClient(
+            http2=True,
+            timeout=15.0,
+            follow_redirects=False,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+        client = owned_client
+
+    try:
+        pr_bundle = await fetch_pull_request_dry_run(
+            pr_ref,
+            settings=active_settings,
+            http_client=client,
+            api_base_url=api_base,
+        )
+        slug = pr_ref.repo_full_name
+        auth_provider = (
+            GitHubAuthProvider(active_settings, http_client=client, base_url=api_base)
+            if active_settings.has_github_credentials
+            else None
+        )
+
+        parsed_diff = pr_bundle.parsed_diff
+        if auth_provider is not None:
+            pr_client = GitHubPullRequestClient(
+                auth_provider,
+                http_client=client,
+                base_url=api_base,
+            )
+            parsed_diff = await pr_client.enrich_missing_blob_shas(
+                slug,
+                pr_ref.pull_number,
+                parsed_diff,
+            )
+            blob_fetcher = GitHubBlobFetcher(
+                auth_provider,
+                http_client=client,
+                base_url=api_base,
+            )
+        else:
+            blob_fetcher = GitHubBlobFetcher(
+                None,
+                http_client=client,
+                base_url=api_base,
+                allow_public_fallback=True,
+            )
+
+        active_redis = redis_client
+        sha_cache: RedisBlobSHACache | None = None
+        if active_redis is None:
+            try:
+                owned_redis = redis_async.from_url(
+                    active_settings.redis_url,
+                    decode_responses=True,
+                    socket_timeout=0.5,
+                )
+                await owned_redis.ping()
+                active_redis = owned_redis
+            except Exception as exc:
+                warnings.append(
+                    f"Redis SHA cache unavailable ({type(exc).__name__}); continuing without cache."
+                )
+                if owned_redis is not None:
+                    try:
+                        await owned_redis.aclose()
+                    except (redis.exceptions.RedisError, OSError):
+                        pass
+                    owned_redis = None
+        if active_redis is not None:
+            sha_cache = RedisBlobSHACache(active_redis)
+
+        active_qdrant = qdrant_store
+        active_embedder = embedder
+        if active_qdrant is None:
+            candidate_store: QdrantZeroCodeStore | None = None
+            try:
+                candidate_store = QdrantZeroCodeStore(settings=active_settings)
+                if await candidate_store.client.collection_exists(
+                    active_settings.qdrant_collection_name
+                ):
+                    owned_qdrant = candidate_store
+                    active_qdrant = candidate_store
+                    if active_embedder is None and active_settings.has_gemini_api_key:
+                        owned_embedder = GeminiEmbedder(settings=active_settings)
+                        active_embedder = owned_embedder
+                else:
+                    await candidate_store.aclose()
+            except Exception as exc:
+                if candidate_store is not None and owned_qdrant is None:
+                    try:
+                        await candidate_store.aclose()
+                    except Exception:
+                        pass
+                warnings.append(
+                    f"Qdrant RAG unavailable ({type(exc).__name__}); continuing with diff+AST only."
+                )
+
+        active_session_factory = session_factory
+        if active_session_factory is None:
+            try:
+                owned_db_engine = create_db_engine(active_settings)
+                active_session_factory = create_session_factory(owned_db_engine)
+            except Exception as exc:
+                warnings.append(
+                    f"PostgreSQL unavailable ({type(exc).__name__}); review history not persisted."
+                )
+
+        db_repo_uuid: uuid.UUID | None = None
+        if active_session_factory is not None:
+            try:
+                async with active_session_factory() as db_session:
+                    if pr_bundle.github_repo_id is not None:
+                        db_repo_uuid = await db_session.scalar(
+                            sa.select(Repository.id).where(
+                                Repository.github_repo_id == pr_bundle.github_repo_id
+                            )
+                        )
+                    if db_repo_uuid is None:
+                        db_repo_uuid = await db_session.scalar(
+                            sa.select(Repository.id).where(Repository.full_name == slug)
+                        )
+            except Exception as exc:
+                warnings.append(
+                    f"PostgreSQL unavailable ({type(exc).__name__}); review history not persisted."
+                )
+                active_session_factory = None
+                if owned_db_engine is not None:
+                    try:
+                        await owned_db_engine.dispose()
+                    except Exception:
+                        pass
+                    owned_db_engine = None
+
+        repo_cache_id = (
+            str(db_repo_uuid)
+            if db_repo_uuid is not None
+            else (str(pr_bundle.github_repo_id) if pr_bundle.github_repo_id is not None else slug)
+        )
+        rag_repo_id = str(db_repo_uuid) if db_repo_uuid is not None else None
+        trace_id = f"cli-{uuid.uuid4().hex[:12]}"
+        ai_result = await execute_ai_pr_review(
+            repo_full_name=slug,
+            repo_id=repo_cache_id,
+            pr_number=pr_ref.pull_number,
+            head_sha=pr_bundle.head_sha,
+            parsed_diff=parsed_diff,
+            repo_config=pr_bundle.repo_config,
+            settings=active_settings,
+            trace_id=trace_id,
+            rag_repo_id=rag_repo_id,
+            base_ref=pr_bundle.base_sha or pr_bundle.default_branch,
+            blob_fetcher=blob_fetcher,
+            llm_factory=llm_factory,
+            sha_cache=sha_cache,
+            qdrant_store=active_qdrant,
+            embedder=active_embedder,
+            diff_source=pr_bundle.diff_source,
+        )
+
+        published_review: PublishedReviewRecord | None = None
+        publish_skipped_reason: str | None = None
+        if should_publish:
+            assert auth_provider is not None
+            publisher = GitHubReviewPublisher(
+                auth_provider,
+                http_client=client,
+                base_url=api_base,
+            )
+            published_review = await publisher.publish_review(
+                slug,
+                pr_ref.pull_number,
+                head_sha=pr_bundle.head_sha or "HEAD",
+                parsed_diff=ai_result.parsed_diff,
+                drafts=ai_result.inline_drafts,
+                summary_body=ai_result.summary_markdown,
+                event=ai_result.gate.review_event,
+                after_sources_by_file=ai_result.after_sources_by_file,
+            )
+        else:
+            publish_skipped_reason = (
+                "skipped (--no-publish)" if publish is False else "skipped (no GitHub auth)"
+            )
+
+        db_review_id: uuid.UUID | None = None
+        if active_session_factory is not None:
+            try:
+                db_review_id = await persist_pr_review_result(
+                    active_session_factory,
+                    repo_full_name=slug,
+                    pr_number=pr_ref.pull_number,
+                    head_sha=pr_bundle.head_sha or "HEAD",
+                    result=ai_result,
+                    repo_id=str(db_repo_uuid) if db_repo_uuid is not None else None,
+                    default_branch=pr_bundle.default_branch,
+                    github_repo_id=pr_bundle.github_repo_id,
+                    review_status="completed",
+                )
+            except Exception as exc:
+                warnings.append(
+                    f"PostgreSQL persist failed ({type(exc).__name__}); review printed locally."
+                )
+
+        return CLIAIReviewBundle(
+            pr_bundle=pr_bundle,
+            ai_result=ai_result,
+            published_review=published_review,
+            db_review_id=db_review_id,
+            warnings=tuple(warnings),
+            publish_skipped_reason=publish_skipped_reason,
+        )
+    finally:
+        if ai_result is not None:
+            ai_result.after_sources_by_file.clear()
+        if owned_embedder is not None:
+            try:
+                await owned_embedder.aclose()
+            except Exception:
+                pass
+        if owned_qdrant is not None:
+            try:
+                await owned_qdrant.aclose()
+            except Exception:
+                pass
+        if owned_db_engine is not None:
+            try:
+                await owned_db_engine.dispose()
+            except Exception:
+                pass
+        if owned_redis is not None:
+            try:
+                await owned_redis.aclose()
+            except (redis.exceptions.RedisError, OSError):
+                pass
+        if owned_client is not None:
+            await owned_client.aclose()
+
+
+def render_ai_review_report(console: Console, bundle: CLIAIReviewBundle) -> None:
+    """Render Rich Debt Score, Smart Gate, findings table, and Markdown summary."""
+    pr = bundle.pr_bundle
+    res = bundle.ai_result
+    b = res.breakdown
+    gate = res.gate
+    gate_style = "bold green" if gate.passed else "bold red"
+    gate_text = (
+        "PASS" if gate.passed else f"BLOCKED ({gate.review_event} / {gate.check_conclusion})"
+    )
+
+    pub_state = (
+        escape(bundle.published_review.state)
+        if bundle.published_review
+        else escape(bundle.publish_skipped_reason or "skipped")
+    )
+    db_state = escape(str(bundle.db_review_id)) if bundle.db_review_id else "not persisted"
+    lines = [
+        f"[bold cyan]{escape(pr.pr_ref.repo_full_name)}#{pr.pr_ref.pull_number}[/bold cyan] "
+        f"[bold]{escape(pr.title)}[/bold]",
+        f"Debt Score: [bold]{b.score}/100[/bold] | "
+        f"Smart Gate: [{gate_style}]{escape(gate_text)}[/{gate_style}]",
+        f"Findings: CRITICAL={b.critical_count}, WARNING={b.warning_count}, INFO={b.info_count} "
+        f"| SHA Cache: {res.cache_hits} hit(s), {res.cache_misses} miss(es) "
+        f"| Token Reduction: {res.tokens_saved_pct:.2f}% | Latency: {res.latency_ms}ms",
+        f"GitHub Publish: {pub_state} | PostgreSQL: {db_state}",
+    ]
+    console.print(Panel("\n".join(lines), title="CodeSight-AI Review Report"))
+
+    if res.verified_findings:
+        table = Table(title="Verified Findings")
+        table.add_column("Severity", style="bold")
+        table.add_column("File", style="cyan", overflow="fold")
+        table.add_column("Lines", style="green")
+        table.add_column("Title", overflow="fold")
+        for f in res.verified_findings:
+            loc = (
+                f"L{f.end_line}" if f.start_line == f.end_line else f"L{f.start_line}-L{f.end_line}"
+            )
+            table.add_row(escape(f.severity), escape(f.file_path), loc, escape(f.title))
+        console.print(table)
+    else:
+        console.print("[green]No verified issues detected (Clean PR).[/green]")
+
+    for warn in bundle.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(warn)}")
+
+    console.print("")
+    console.print(res.summary_markdown)
+
+
 def review_command(
     pr_url: str = typer.Argument(
         ...,
@@ -583,15 +952,14 @@ def review_command(
         "--dry-run",
         help="Analyze PR diff, noise filtering, token savings, and hunk coordinates.",
     ),
+    publish: bool | None = typer.Option(
+        None,
+        "--publish/--no-publish",
+        help="Publish review comments to GitHub PR (defaults to on when GitHub auth exists).",
+    ),
 ) -> None:
-    """Inspect a GitHub Pull Request diff and print SmartDiffParser diagnostics."""
+    """Inspect a GitHub Pull Request diff (--dry-run) or run full AI PR review."""
     err_console = Console(file=sys.stderr, soft_wrap=True)
-    if not dry_run:
-        err_console.print(
-            "[red]Error:[/red] Full AI review execution is wired in Sprint 3. "
-            "Pass [bold]--dry-run[/bold] to run diff & hunk inspection now."
-        )
-        raise typer.Exit(code=2)
 
     try:
         pr_ref = parse_github_pr_url(pr_url)
@@ -599,23 +967,66 @@ def review_command(
         err_console.print(f"[red]Invalid PR URL:[/red] {escape(str(exc))}")
         raise typer.Exit(code=2) from exc
 
+    active_settings = get_settings()
+    if dry_run:
+        try:
+            dry_bundle = asyncio.run(fetch_pull_request_dry_run(pr_ref, settings=active_settings))
+        except CLIReviewError as exc:
+            err_console.print(f"[red]GitHub fetch failed:[/red] {escape(str(exc))}")
+            raise typer.Exit(code=1) from exc
+
+        out_console = Console(file=sys.stdout)
+        render_dry_run_report(out_console, dry_bundle)
+
+        m = dry_bundle.parsed_diff.metrics
+        logger.debug(
+            "cli_review_dry_run_completed",
+            repo=pr_ref.repo_full_name,
+            pr_number=pr_ref.pull_number,
+            diff_source=dry_bundle.diff_source,
+            kept_files=m.kept_files,
+            skipped_files=m.skipped_files,
+            tokens_saved_pct=m.tokens_saved_pct,
+            elapsed_ms=dry_bundle.elapsed_ms,
+        )
+        return
+
+    if not active_settings.has_gemini_api_key:
+        err_console.print(
+            "[red]Error:[/red] GEMINI_API_KEY is required for full AI review. "
+            "Pass [bold]--dry-run[/bold] for offline diff & hunk inspection."
+        )
+        raise typer.Exit(code=2)
+
     try:
-        bundle = asyncio.run(fetch_pull_request_dry_run(pr_ref, settings=get_settings()))
-    except CLIReviewError as exc:
-        err_console.print(f"[red]GitHub fetch failed:[/red] {escape(str(exc))}")
+        ai_bundle = asyncio.run(
+            run_cli_ai_review(
+                pr_ref,
+                settings=active_settings,
+                publish=publish,
+            )
+        )
+    except (
+        CLIReviewError,
+        GitHubAuthError,
+        GitHubBlobFetchError,
+        GitHubPublishError,
+        RateLimitTaskError,
+        RetryableTaskError,
+    ) as exc:
+        err_console.print(f"[red]PR review failed:[/red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     out_console = Console(file=sys.stdout)
-    render_dry_run_report(out_console, bundle)
-
-    m = bundle.parsed_diff.metrics
+    render_ai_review_report(out_console, ai_bundle)
     logger.debug(
-        "cli_review_dry_run_completed",
+        "cli_review_completed",
         repo=pr_ref.repo_full_name,
         pr_number=pr_ref.pull_number,
-        diff_source=bundle.diff_source,
-        kept_files=m.kept_files,
-        skipped_files=m.skipped_files,
-        tokens_saved_pct=m.tokens_saved_pct,
-        elapsed_ms=bundle.elapsed_ms,
+        debt_score=ai_bundle.ai_result.breakdown.score,
+        cache_hits=ai_bundle.ai_result.cache_hits,
+        tokens_saved_pct=ai_bundle.ai_result.tokens_saved_pct,
+        latency_ms=ai_bundle.ai_result.latency_ms,
+        published=ai_bundle.published_review is not None,
+        db_persisted=ai_bundle.db_review_id is not None,
     )

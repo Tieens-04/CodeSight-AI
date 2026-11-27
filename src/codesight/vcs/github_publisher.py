@@ -13,6 +13,7 @@ import httpx
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from codesight.agents.schemas import neutralize_suggestion_fences
 from codesight.ast_engine.suggestion_validator import TreeSitterSuggestionValidator
 from codesight.core.errors import (
     RateLimitTaskError,
@@ -67,10 +68,6 @@ _TRUNCATION_FOOTER: Final[str] = "\n\n*(truncated to fit GitHub API length limit
 
 _VALID_CONCLUSIONS: Final[frozenset[str]] = frozenset({"success", "neutral", "failure"})
 _VALID_REVIEW_EVENTS: Final[frozenset[str]] = frozenset({"COMMENT", "APPROVE", "REQUEST_CHANGES"})
-_SUGGESTION_FENCE_RE: Final[re.Pattern[str]] = re.compile(
-    r"^([ \t]*(?:`{3,}|~{3,}))[ \t]*suggestion\b",
-    re.MULTILINE | re.IGNORECASE,
-)
 _CODE_FENCE_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^[ \t]*(`{3,}|~{3,})", re.MULTILINE)
 _BACKTICK_RUN_RE: Final[re.Pattern[str]] = re.compile(r"`+")
 _CONTROL_CHAR_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
@@ -194,6 +191,15 @@ def truncate_markdown_body(text: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str
     return candidate[:limit]
 
 
+def _contains_self_review_phrase(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "own pull request" in lowered
+        or "can not request changes" in lowered
+        or "cannot request changes" in lowered
+    )
+
+
 def _extract_github_error_meta(resp: httpx.Response) -> dict[str, Any]:
     """Extract NFR-3-safe structural GitHub API error fields (no raw code or request echo)."""
     try:
@@ -203,14 +209,24 @@ def _extract_github_error_meta(resp: httpx.Response) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         return {}
     meta: dict[str, Any] = {}
+    self_review_rejected = False
     msg = parsed.get("message")
     if isinstance(msg, str) and msg.strip():
-        meta["github_message"] = msg.strip()[:200]
+        clean_msg = msg.strip()[:200]
+        meta["github_message"] = clean_msg
+        if _contains_self_review_phrase(clean_msg):
+            self_review_rejected = True
     raw_errors = parsed.get("errors")
     if isinstance(raw_errors, list):
         compact: list[dict[str, str]] = []
         for entry in raw_errors[:5]:
-            if isinstance(entry, dict):
+            if isinstance(entry, str):
+                if _contains_self_review_phrase(entry):
+                    self_review_rejected = True
+            elif isinstance(entry, dict):
+                entry_msg = entry.get("message")
+                if isinstance(entry_msg, str) and _contains_self_review_phrase(entry_msg):
+                    self_review_rejected = True
                 item: dict[str, str] = {}
                 for field_key in ("resource", "field", "code"):
                     val = entry.get(field_key)
@@ -220,11 +236,9 @@ def _extract_github_error_meta(resp: httpx.Response) -> dict[str, Any]:
                     compact.append(item)
         if compact:
             meta["github_errors"] = compact
+    if self_review_rejected:
+        meta["self_review_rejected"] = True
     return meta
-
-
-def _neutralize_suggestion_fences(text: str) -> str:
-    return _SUGGESTION_FENCE_RE.sub(r"\1", text)
 
 
 def _format_location_label(draft: ReviewCommentDraft) -> str:
@@ -239,7 +253,7 @@ def _format_downgraded_bullet(item: DowngradedComment) -> str:
     severity_tag = f"**[{item.draft.severity}]** " if item.draft.severity else ""
     loc = _format_location_label(item.draft)
     safe_path = format_markdown_code_span(item.draft.path)
-    safe_body = _neutralize_suggestion_fences(item.draft.body)
+    safe_body = neutralize_suggestion_fences(item.draft.body)
     return f"- {severity_tag}{safe_path} ({loc}) `[{item.reason}]`:\n\n{safe_body}"
 
 
@@ -384,6 +398,26 @@ def partition_review_comments(
         downgraded_comments=tuple(downgraded),
         inline_drafts=tuple(inline_drafts),
     )
+
+
+def _is_self_review_422(error_meta: Mapping[str, Any]) -> bool:
+    """Return True when GitHub rejects REQUEST_CHANGES because the reviewer owns the PR."""
+    if error_meta.get("self_review_rejected") is True:
+        return True
+    fragments: list[str] = []
+    msg = error_meta.get("github_message")
+    if isinstance(msg, str):
+        fragments.append(msg)
+    raw_errors = error_meta.get("github_errors")
+    if isinstance(raw_errors, list):
+        for entry in raw_errors:
+            if isinstance(entry, str):
+                fragments.append(entry)
+            elif isinstance(entry, Mapping):
+                for val in entry.values():
+                    if isinstance(val, str):
+                        fragments.append(val)
+    return _contains_self_review_phrase(" ".join(fragments))
 
 
 def _fold_remaining_into_summary(
@@ -836,14 +870,15 @@ class GitHubReviewPublisher:
             )
 
         review_body = prepared.body
-        if event == "REQUEST_CHANGES" and not review_body:
+        effective_event: ReviewEvent = event
+        if effective_event == "REQUEST_CHANGES" and not review_body:
             review_body = DEFAULT_REQUEST_CHANGES_BODY
 
         endpoint = f"/repos/{slug}/pulls/{valid_pr}/reviews"
         payload: dict[str, Any] = {
             "commit_id": clean_sha,
             "body": review_body,
-            "event": event,
+            "event": effective_event,
             "comments": list(prepared.inline_comments),
         }
 
@@ -853,12 +888,45 @@ class GitHubReviewPublisher:
             slug=slug,
             json_body=payload,
             installation_id=installation_id,
-            allow_422=bool(prepared.inline_comments),
+            allow_422=bool(prepared.inline_comments) or effective_event == "REQUEST_CHANGES",
         )
 
         used_fallback = False
         inline_count = len(prepared.inline_comments)
         downgraded_count = len(prepared.downgraded_comments)
+
+        if (
+            status_code == 422
+            and effective_event == "REQUEST_CHANGES"
+            and _is_self_review_422(data)
+        ):
+            logger.warning(
+                "github_review_self_review_422_fallback",
+                repo=slug,
+                pull_number=valid_pr,
+                **data,
+            )
+            if supersede_lock is not None:
+                await self._ensure_not_superseded(
+                    supersede_lock,
+                    lock_repo_id=lock_repo_id,
+                    repo_slug=slug,
+                    pull_number=valid_pr,
+                    head_sha=clean_sha,
+                    stage="pre_422_fallback",
+                    check_run_id=valid_check_run_id,
+                    installation_id=installation_id,
+                )
+            effective_event = "COMMENT"
+            payload["event"] = effective_event
+            status_code, data = await self._send_json_request(
+                "POST",
+                endpoint,
+                slug=slug,
+                json_body=payload,
+                installation_id=installation_id,
+                allow_422=bool(prepared.inline_comments),
+            )
 
         if status_code == 422 and prepared.inline_comments:
             used_fallback = True
@@ -886,26 +954,65 @@ class GitHubReviewPublisher:
                     review_body,
                     prepared.inline_drafts or prepared.inline_comments,
                 ),
-                "event": event,
+                "event": effective_event,
                 "comments": [],
             }
-            _, data = await self._send_json_request(
+            fb_status, data = await self._send_json_request(
                 "POST",
                 endpoint,
                 slug=slug,
                 json_body=fallback_payload,
                 installation_id=installation_id,
-                allow_422=False,
+                allow_422=(effective_event == "REQUEST_CHANGES"),
             )
+            if fb_status == 422:
+                if effective_event == "REQUEST_CHANGES" and _is_self_review_422(data):
+                    logger.warning(
+                        "github_review_self_review_422_fallback",
+                        repo=slug,
+                        pull_number=valid_pr,
+                        **data,
+                    )
+                    if supersede_lock is not None:
+                        await self._ensure_not_superseded(
+                            supersede_lock,
+                            lock_repo_id=lock_repo_id,
+                            repo_slug=slug,
+                            pull_number=valid_pr,
+                            head_sha=clean_sha,
+                            stage="pre_422_fallback",
+                            check_run_id=valid_check_run_id,
+                            installation_id=installation_id,
+                        )
+                    effective_event = "COMMENT"
+                    fallback_payload["event"] = effective_event
+                    _, data = await self._send_json_request(
+                        "POST",
+                        endpoint,
+                        slug=slug,
+                        json_body=fallback_payload,
+                        installation_id=installation_id,
+                        allow_422=False,
+                    )
+                else:
+                    raise GitHubPublishError(
+                        f"GitHub API rejected POST {endpoint} with HTTP 422.",
+                        status_code=422,
+                    )
             downgraded_count += inline_count
             inline_count = 0
+        elif status_code == 422:
+            raise GitHubPublishError(
+                f"GitHub API rejected POST {endpoint} with HTTP 422.",
+                status_code=422,
+            )
 
         raw_id = data.get("id")
         review_id = raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None
         record = PublishedReviewRecord(
             review_id=review_id,
             html_url=str(data["html_url"]) if data.get("html_url") is not None else None,
-            state=str(data.get("state") or event),
+            state=str(data.get("state") or effective_event),
             inline_count=inline_count,
             downgraded_count=downgraded_count,
             used_422_fallback=used_fallback,
@@ -915,7 +1022,7 @@ class GitHubReviewPublisher:
             repo=slug,
             pull_number=valid_pr,
             review_id=record.review_id,
-            review_event=event,
+            review_event=effective_event,
             inline_count=record.inline_count,
             downgraded_count=record.downgraded_count,
             used_422_fallback=record.used_422_fallback,
