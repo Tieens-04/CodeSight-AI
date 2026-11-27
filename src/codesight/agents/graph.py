@@ -5,40 +5,40 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping, Sequence
-from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any, Final, cast
 
 import structlog
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict
 
 from codesight.agents.llm_factory import LLMFactory
-from codesight.agents.nodes._auditor_common import metrics_from_invocation
 from codesight.agents.nodes.context_builder import PRReviewContext, build_batch_context
+from codesight.agents.nodes.critic_agent import (
+    CriticNodeResult,
+    deduplicate_verified_findings,
+    run_critic_agent,
+)
 from codesight.agents.nodes.perf_arch_auditor import run_perf_arch_auditor
 from codesight.agents.nodes.security_auditor import run_security_auditor
+from codesight.agents.prompts.critic_prompt import CRITIC_SYSTEM_PROMPT
 from codesight.agents.prompts.perf_arch_prompt import PERF_ARCH_AUDITOR_SYSTEM_PROMPT
 from codesight.agents.prompts.security_prompt import SECURITY_AUDITOR_SYSTEM_PROMPT
 from codesight.agents.schemas import (
     AuditorRole,
     BatchReviewResult,
     BuiltBatchContext,
-    CodeSuggestion,
     CriticVerdict,
     DiffBatch,
     FindingCandidate,
-    FindingSeverity,
     LLMAuditorDraftOutput,
     LLMCallMetrics,
-    LLMCodeSuggestionDraft,
     LLMCriticDraftOutput,
-    LLMCriticVerdictDraft,
     PRReviewState,
     UnreviewableDiffSegment,
+    VerifiedFinding,
 )
 from codesight.core.config import Settings
 from codesight.core.logging import get_trace_id, sanitize_trace_id
@@ -54,17 +54,6 @@ _ROLE_ORDER: Final[dict[AuditorRole, int]] = {
     "security_auditor": 0,
     "logic_performance_auditor": 1,
 }
-_SEVERITY_RANK: Final[dict[FindingSeverity, int]] = {
-    "CRITICAL": 0,
-    "WARNING": 1,
-    "INFO": 2,
-}
-
-_CRITIC_SYSTEM_PROMPT: Final[str] = (
-    "You are CodeSight-AI Critic & Verification Agent. Review candidate findings against the diff "
-    "batch, reject false positives, approve or refine grounded issues, and emit CriticVerdict "
-    "entries linked by exact candidate_id."
-)
 
 _AUDITOR_SCHEMA_TOKENS: Final[int] = estimate_tokens(
     json.dumps(LLMAuditorDraftOutput.model_json_schema())
@@ -133,7 +122,7 @@ class ReviewGraphConfig:
 
     def available_critic_payload_tokens(self) -> int:
         """Compute max Critic user-message tokens after reserving instructions, schema, output."""
-        prompt_overhead = estimate_tokens(_CRITIC_SYSTEM_PROMPT) + _CRITIC_SCHEMA_TOKENS + 64
+        prompt_overhead = estimate_tokens(CRITIC_SYSTEM_PROMPT) + _CRITIC_SCHEMA_TOKENS + 64
         available = self.max_request_tokens - self.output_reserve_tokens - prompt_overhead
         if available < 1:
             raise ValueError(
@@ -453,156 +442,6 @@ def split_parsed_diff_into_batches(
 # ---------------------------------------------------------------------------
 
 
-def _validate_suggestion_draft(
-    raw_suggestion: CodeSuggestion | LLMCodeSuggestionDraft | None,
-) -> CodeSuggestion | None:
-    if raw_suggestion is None:
-        return None
-    if isinstance(raw_suggestion, CodeSuggestion):
-        return raw_suggestion
-    try:
-        return CodeSuggestion.model_validate(
-            {
-                "start_line": raw_suggestion.start_line,
-                "end_line": raw_suggestion.end_line,
-                "replacement_code": raw_suggestion.replacement_code,
-                "explanation": raw_suggestion.explanation,
-            }
-        )
-    except ValidationError:
-        return None
-
-
-def _normalize_critic_verdicts(
-    verdicts: Sequence[CriticVerdict | LLMCriticVerdictDraft],
-    *,
-    batch_index: int,
-    valid_candidate_ids: AbstractSet[str],
-) -> tuple[list[CriticVerdict], int]:
-    normalized: list[CriticVerdict] = []
-    seen_ids: set[str] = set()
-    dropped_count = 0
-
-    for item in verdicts:
-        if isinstance(item, CriticVerdict):
-            cid = item.candidate_id
-            if cid not in valid_candidate_ids or cid in seen_ids:
-                dropped_count += 1
-                continue
-            seen_ids.add(cid)
-            normalized.append(item.model_copy(update={"batch_index": batch_index}))
-            continue
-
-        valid_suggestion = _validate_suggestion_draft(item.suggestion)
-        adjusted_severity: str | None = None
-        if item.adjusted_severity is not None:
-            cleaned_sev = item.adjusted_severity.strip().upper()
-            if cleaned_sev in _SEVERITY_RANK:
-                adjusted_severity = cleaned_sev
-        try:
-            verdict = CriticVerdict.model_validate(
-                {
-                    "candidate_id": item.candidate_id,
-                    "batch_index": batch_index,
-                    "decision": item.decision.strip().upper(),
-                    "rationale": item.rationale,
-                    "adjusted_severity": adjusted_severity,
-                    "suggestion": valid_suggestion,
-                }
-            )
-        except ValidationError:
-            dropped_count += 1
-            continue
-
-        if verdict.candidate_id not in valid_candidate_ids or verdict.candidate_id in seen_ids:
-            dropped_count += 1
-            continue
-        seen_ids.add(verdict.candidate_id)
-        normalized.append(verdict)
-
-    return normalized, dropped_count
-
-
-def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text
-    if max_bytes <= 3:
-        return "..."[:max_bytes]
-    clipped = encoded[: max_bytes - 3].decode("utf-8", errors="ignore")
-    return f"{clipped}..."
-
-
-def _build_critic_messages_within_budget(
-    *,
-    batch: DiffBatch,
-    candidates: Sequence[FindingCandidate],
-    available_user_tokens: int,
-) -> tuple[list[BaseMessage], tuple[str, ...]]:
-    """Pack Critic user message strictly inside `available_user_tokens` and return dropped IDs."""
-    ordered = sorted(
-        candidates,
-        key=lambda f: (
-            _SEVERITY_RANK[f.severity],
-            -f.confidence,
-            _ROLE_ORDER[f.role],
-            f.file_path,
-            f.start_line,
-            f.end_line,
-            f.candidate_id,
-        ),
-    )
-
-    header = f"Batch: {batch.batch_id} (index={batch.batch_index})\nCandidate Findings:\n"
-    diff_section_header = "\n\nDiff Excerpt:\n"
-
-    # Reserve at least 60% of Critic user budget for candidates and up to 40% for diff excerpt.
-    candidates_token_cap = max(1, int(available_user_tokens * 0.6)) if ordered else 0
-    selected_serialized: list[str] = []
-    truncated_ids: list[str] = []
-
-    for cand in ordered:
-        compact = {
-            "candidate_id": cand.candidate_id,
-            "role": cand.role,
-            "file_path": cand.file_path,
-            "start_line": cand.start_line,
-            "end_line": cand.end_line,
-            "severity": cand.severity,
-            "category": cand.category,
-            "title": _truncate_text_to_bytes(cand.title, 160),
-            "evidence": _truncate_text_to_bytes(cand.evidence, 320),
-            "confidence": cand.confidence,
-        }
-        entry_line = json.dumps(compact, separators=(",", ":"))
-        trial_text = header + "\n".join([*selected_serialized, entry_line])
-        if estimate_tokens(trial_text) <= candidates_token_cap:
-            selected_serialized.append(entry_line)
-        else:
-            truncated_ids.append(cand.candidate_id)
-
-    candidates_block = (
-        header + "\n".join(selected_serialized) if selected_serialized else f"{header}(none)"
-    )
-
-    used_tokens = estimate_tokens(candidates_block)
-    remaining_tokens = available_user_tokens - used_tokens - estimate_tokens(diff_section_header)
-    if remaining_tokens > 16:
-        diff_excerpt = _truncate_text_to_bytes(batch.annotated_diff, remaining_tokens * 4)
-        user_content = f"{candidates_block}{diff_section_header}{diff_excerpt}"
-    else:
-        user_content = candidates_block
-
-    # Hard final envelope guarantee: never exceed `available_user_tokens`.
-    if estimate_tokens(user_content) > available_user_tokens:
-        user_content = _truncate_text_to_bytes(user_content, available_user_tokens * 4)
-
-    return [
-        SystemMessage(content=_CRITIC_SYSTEM_PROMPT),
-        HumanMessage(content=user_content),
-    ], tuple(truncated_ids)
-
-
 def _sort_findings(findings: Sequence[FindingCandidate]) -> list[FindingCandidate]:
     return sorted(
         findings,
@@ -700,27 +539,18 @@ def build_pr_review_graph(
     async def _run_critic(
         batch: DiffBatch,
         candidates: Sequence[FindingCandidate],
+        batch_context: BuiltBatchContext | None,
         config: RunnableConfig | None,
-    ) -> tuple[list[CriticVerdict], LLMCallMetrics, tuple[str, ...], int]:
-        messages, truncated_ids = _build_critic_messages_within_budget(
+    ) -> CriticNodeResult:
+        return await run_critic_agent(
             batch=batch,
             candidates=candidates,
-            available_user_tokens=critic_user_budget,
-        )
-        inv = await llm_factory.invoke_structured(
-            role="critic",
-            schema=LLMCriticDraftOutput,
-            messages=messages,
+            llm_factory=llm_factory,
+            max_user_tokens=critic_user_budget,
+            batch_context=batch_context,
+            review_context=review_context,
             config=_node_config(config, role="critic", batch=batch),
         )
-        valid_candidate_ids = {c.candidate_id for c in candidates} - set(truncated_ids)
-        verdicts, dropped_verdicts = _normalize_critic_verdicts(
-            inv.parsed.verdicts,
-            batch_index=batch.batch_index,
-            valid_candidate_ids=valid_candidate_ids,
-        )
-        metrics = metrics_from_invocation("critic", batch.batch_index, inv)
-        return verdicts, metrics, truncated_ids, dropped_verdicts
 
     async def plan_batches(state: PRReviewState) -> dict[str, Any]:
         if not state.batches:
@@ -802,25 +632,32 @@ def build_pr_review_graph(
     ) -> dict[str, Any]:
         batch = state.batches[0]
         combined = _sort_findings([*state.security_findings, *state.logic_findings])
-        verdicts, metrics, truncated_ids, dropped_verdicts = await _run_critic(
-            batch, combined, config
+        critic_res = await _run_critic(
+            batch,
+            combined,
+            state.batch_contexts.get(batch.batch_id),
+            config,
         )
-        ordered_verdicts = _sort_verdicts(verdicts)
+        ordered_verdicts = _sort_verdicts(critic_res.verdicts)
         batch_result = BatchReviewResult(
             batch_index=batch.batch_index,
             batch_id=batch.batch_id,
             findings=tuple(combined),
             verdicts=tuple(ordered_verdicts),
-            truncated_candidates_count=len(truncated_ids),
-            truncated_candidate_ids=truncated_ids,
+            verified_findings=tuple(critic_res.verified_findings),
+            stripped_suggestions_count=critic_res.stripped_suggestions_count,
+            truncated_candidates_count=len(critic_res.truncated_ids),
+            truncated_candidate_ids=critic_res.truncated_ids,
             dropped_invalid_findings_count=state.dropped_invalid_findings_count,
-            dropped_invalid_verdicts_count=dropped_verdicts,
+            dropped_invalid_verdicts_count=critic_res.dropped_verdicts,
         )
         return {
             "batch_results": [batch_result],
             "merged_findings": combined,
             "merged_verdicts": ordered_verdicts,
-            "llm_metrics": [metrics],
+            "verified_findings": critic_res.verified_findings,
+            "stripped_suggestions_count": critic_res.stripped_suggestions_count,
+            "llm_metrics": [critic_res.metrics] if critic_res.metrics is not None else [],
         }
 
     async def process_diff_batch(
@@ -846,27 +683,30 @@ def build_pr_review_graph(
             await asyncio.gather(sec_task, log_task, return_exceptions=True)
             raise
         combined = _sort_findings([*sec_findings, *log_findings])
-        verdicts, critic_metrics, truncated_ids, dropped_verdicts = await _run_critic(
-            batch, combined, config
-        )
-        ordered_verdicts = _sort_verdicts(verdicts)
+        critic_res = await _run_critic(batch, combined, state.batch_context, config)
+        ordered_verdicts = _sort_verdicts(critic_res.verdicts)
         total_dropped_findings = sec_dropped + log_dropped
         batch_result = BatchReviewResult(
             batch_index=batch.batch_index,
             batch_id=batch.batch_id,
             findings=tuple(combined),
             verdicts=tuple(ordered_verdicts),
-            truncated_candidates_count=len(truncated_ids),
-            truncated_candidate_ids=truncated_ids,
+            verified_findings=tuple(critic_res.verified_findings),
+            stripped_suggestions_count=critic_res.stripped_suggestions_count,
+            truncated_candidates_count=len(critic_res.truncated_ids),
+            truncated_candidate_ids=critic_res.truncated_ids,
             dropped_invalid_findings_count=total_dropped_findings,
-            dropped_invalid_verdicts_count=dropped_verdicts,
+            dropped_invalid_verdicts_count=critic_res.dropped_verdicts,
         )
+        llm_metrics: list[LLMCallMetrics] = [sec_metrics, log_metrics]
+        if critic_res.metrics is not None:
+            llm_metrics.append(critic_res.metrics)
         return {
             "security_findings": sec_findings,
             "logic_findings": log_findings,
             "dropped_invalid_findings_count": total_dropped_findings,
             "batch_results": [batch_result],
-            "llm_metrics": [sec_metrics, log_metrics, critic_metrics],
+            "llm_metrics": llm_metrics,
         }
 
     async def reduce_batches(state: PRReviewState) -> dict[str, Any]:
@@ -877,9 +717,16 @@ def build_pr_review_graph(
         merged_verdicts = _sort_verdicts(
             [verdict for br in ordered_batches for verdict in br.verdicts]
         )
+        raw_verified: list[VerifiedFinding] = [
+            vf for br in ordered_batches for vf in br.verified_findings
+        ]
+        deduped_verified = deduplicate_verified_findings(raw_verified)
+        stripped_total = sum(br.stripped_suggestions_count for br in ordered_batches)
         return {
             "merged_findings": merged_findings,
             "merged_verdicts": merged_verdicts,
+            "verified_findings": deduped_verified,
+            "stripped_suggestions_count": stripped_total,
         }
 
     async def finalize_review(state: PRReviewState) -> dict[str, Any]:
@@ -1019,6 +866,8 @@ async def run_pr_review_graph(
         unreviewable_count=len(final_state.unreviewable_segments),
         finding_count=len(final_state.merged_findings),
         verdict_count=len(final_state.merged_verdicts),
+        verified_finding_count=len(final_state.verified_findings),
+        stripped_suggestions_count=final_state.stripped_suggestions_count,
         truncated_candidates_count=truncated_total,
         dropped_invalid_findings_count=dropped_findings_total,
         dropped_invalid_verdicts_count=dropped_verdicts_total,

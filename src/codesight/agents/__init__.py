@@ -17,8 +17,14 @@ from codesight.agents.llm_factory import (
     StructuredInvocationResult,
 )
 from codesight.agents.nodes.context_builder import PRReviewContext, build_batch_context
+from codesight.agents.nodes.critic_agent import (
+    MIN_CRITIC_CONFIDENCE,
+    CriticNodeResult,
+    run_critic_agent,
+)
 from codesight.agents.nodes.perf_arch_auditor import run_perf_arch_auditor
 from codesight.agents.nodes.security_auditor import run_security_auditor
+from codesight.agents.prompts.critic_prompt import CRITIC_SYSTEM_PROMPT
 from codesight.agents.prompts.perf_arch_prompt import PERF_ARCH_AUDITOR_SYSTEM_PROMPT
 from codesight.agents.prompts.security_prompt import SECURITY_AUDITOR_SYSTEM_PROMPT
 from codesight.agents.schemas import (
@@ -45,13 +51,16 @@ from codesight.agents.schemas import (
     ReviewRunStatus,
     TelemetryStatus,
     UnreviewableDiffSegment,
+    VerifiedFinding,
 )
 
 __all__ = [
+    "CRITIC_SYSTEM_PROMPT",
     "DEFAULT_BATCH_DIFF_TOKEN_LIMIT",
     "DEFAULT_LLM_MAX_CONCURRENCY",
     "DEFAULT_MAX_REQUEST_TOKENS",
     "DEFAULT_OUTPUT_RESERVE_TOKENS",
+    "MIN_CRITIC_CONFIDENCE",
     "PERF_ARCH_AUDITOR_SYSTEM_PROMPT",
     "SECURITY_AUDITOR_SYSTEM_PROMPT",
     "AuditorOutput",
@@ -61,6 +70,7 @@ __all__ = [
     "BuiltBatchContext",
     "CodeSuggestion",
     "CriticDecision",
+    "CriticNodeResult",
     "CriticOutput",
     "CriticVerdict",
     "DiffBatch",
@@ -83,8 +93,10 @@ __all__ = [
     "StructuredInvocationResult",
     "TelemetryStatus",
     "UnreviewableDiffSegment",
+    "VerifiedFinding",
     "build_batch_context",
     "build_pr_review_graph",
+    "run_critic_agent",
     "run_perf_arch_auditor",
     "run_pr_review_graph",
     "run_security_auditor",

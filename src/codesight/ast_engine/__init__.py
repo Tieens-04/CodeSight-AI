@@ -30,6 +30,12 @@ from codesight.ast_engine.models import (
 )
 from codesight.ast_engine.python_parser import PythonASTParser
 from codesight.ast_engine.registry import ASTParserRegistry
+from codesight.ast_engine.suggestion_validator import (
+    SuggestionValidationResult,
+    TreeSitterSuggestionValidator,
+    is_suggestion_syntax_safe,
+    splice_source_lines,
+)
 from codesight.ast_engine.typescript_parser import TypeScriptASTParser
 
 __all__ = [
@@ -51,13 +57,17 @@ __all__ = [
     "ParsedASTFile",
     "PythonASTParser",
     "PythonComplexityAnalyzer",
+    "SuggestionValidationResult",
     "SymbolKind",
     "TestCompanionReport",
+    "TreeSitterSuggestionValidator",
     "TypeScriptASTParser",
     "TypeScriptComplexityAnalyzer",
     "build_deterministic_point_id",
     "compute_complexity_delta",
     "detect_missing_test_companion",
+    "is_suggestion_syntax_safe",
     "sanitize_signature",
+    "splice_source_lines",
     "test_companion_detector",
 ]

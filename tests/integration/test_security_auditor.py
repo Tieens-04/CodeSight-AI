@@ -1020,7 +1020,7 @@ class TestSecurityAuditorIntegration:
         assert len(state.batches) == len(expected_batches)
         assert calls_per_role["security_auditor"] == len(expected_batches)
         assert calls_per_role["logic_performance_auditor"] == len(expected_batches)
-        assert calls_per_role["critic"] == len(expected_batches)
+        assert calls_per_role["critic"] == sum(1 for br in state.batch_results if br.findings)
         assert any(caller_prompts_seen)
         assert sum(br.dropped_invalid_findings_count for br in state.batch_results) > 0
 
