@@ -31,8 +31,8 @@ Mỗi lượt chỉ đóng **đúng 1 vai trò cho 1 bước**, ghi đúng artif
 | **Bước 3: Review** | `Reviewer / Checker` (3 `research` subagents) | `review-01.md` (`FAILED/SAW/FIX`), `state.md` | Chỉ đọc & kiểm chứng độc lập; không sửa bất kỳ file code/test/docs nào |
 | **Bước 4: Fix** | `Engineer` | `fix-report.md`, `state.md` | Vá đúng root-cause + regression tests + `verify.py check`; không mở rộng scope |
 | **Bước 5: Final Review** | `Final Checker` + `OPS` Prevention Auditor | `final-review.md`, `state.md` | Jira `31` (`Verify / Test`) + chạy thật `verify.py check --full-format --preclose` + Prevention Audit |
-| **Bước 6: Pre-Commit** | `Deliver & Memory Keeper` | `precommit.md`, `state.md` (+ `MEMORY.md`) | Soạn PR + khung Evidence Jira + chắt lọc `MEMORY.md`; **dừng tại `The Undo Gate` trước `git commit`** |
-| **Bước 7: Close Jira** | `Jira Release Closer` | Cập nhật `precommit.md` & `state.md` (`Done`) | Sau khi Human `git commit`: lấy `<short-sha>` thật + `preclose_audit.py` + đăng Evidence 5 mục + Jira `41` (`Done`) |
+| **Bước 6: Deliver** | `Deliver & Memory Keeper` | `precommit.md`, `state.md` (+ `MEMORY.md`) | Thực thi tuần tự 5 bước nhỏ: **6.1 Pre-commit ➔ 6.2 Commit (`preclose_audit.py`) ➔ 6.3 Push ➔ 6.4 Tạo PR ➔ 6.5 Đóng Jira `41` (`Done`)** |
+| **Bước 6.5 Standalone** *(tùy chọn)* | `Jira Release Closer` | Cập nhật `precommit.md` & `state.md` (`Done`) | Shortcut `/ai-workflow close CA-XX` (`07-close-jira.md`) khi Human đã tự commit/push và chỉ cần chạy bước đóng Jira `41` (`Done`) |
 
 ---
 
@@ -97,7 +97,7 @@ Thay vì gọi rời rạc 6–7 lệnh terminal làm phình context bởi log t
    - Giữa các vòng Review ↔ Fix: mỗi lần `final-review.md` trả về `CHANGES REQUESTED` trên cùng một lỗi cũ, tăng `Strikes` trong `state.md` thêm `1`. Khi **`Strikes >= 2`**, chuyển `Status: Blocked` trong `state.md`, chạy `python .ai-workflow/scripts/verify.py board` và báo ngay cho Human kèm 2 phương án xử lý rõ ràng.
 2. **Gate Priced by Undo Cost**:
    - **Tự hoàn tất 100% bước khả nghịch**: khảo sát code, chuyển Jira `21`/`31`, viết test/code local, chạy `verify.py`, tạo báo cáo, soạn PR description & khung Verification Evidence.
-   - **Dừng hỏi trước bước khó/không thể hoàn tác**: `git commit`, `git push`, đóng Jira `41` (`Done`) khi chưa có `<short-sha>` thật, tạo Alembic migration hoặc `uv add` package ngoài `plan.md` đã duyệt, hoặc khi AC trên Jira mâu thuẫn với `AGENTS.md`.
+   - **Kiểm soát chặt bước khó/không thể hoàn tác**: tạo Alembic migration hoặc `uv add` package ngoài `plan.md` đã duyệt, hoặc khi AC trên Jira mâu thuẫn với `AGENTS.md` ➔ **dừng hỏi Human**. Ở Bước 6, chỉ chạy `6.2 Commit ➔ 6.3 Push ➔ 6.4 Tạo PR ➔ 6.5 Đóng Jira 41 ("Done")` khi `final-review.md` đạt `READY FOR PRE-COMMIT`, `6.1 Pre-commit` đạt `SAFE TO COMMIT`, và `preclose_audit.py` đạt `[PASS]` với `<short-sha>` thật (cấm `--force` hay push thẳng lên `main`).
 
 ---
 

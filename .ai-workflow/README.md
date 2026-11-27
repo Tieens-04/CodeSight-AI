@@ -64,14 +64,12 @@ Hệ thống điều phối phát triển phần mềm theo Jira ticket `CA-*` d
                             │
                             ▼ ──► [GATE 4]: Đổi sang Model siêu nhẹ (Hydrogen / Flash)
                     [Bước 6: Deliver & Reuse — Release & Memory Keeper (06-precommit.md)]
-                      • Chạy `verify.py diff` + soạn PR bằng skill `pr` + khung Verification Evidence 5 mục
-                      • Chắt lọc Decision/Source/Lesson mới (nếu có) vào `.ai-workflow/MEMORY.md`
-                      • Dừng tại `The Undo Gate` (giữ Jira ở `31`, in lệnh `git commit` & `git push` cho BẠN)
-                            │
-                            ▼ ──► [GATE 5]: BẠN chạy `git commit` (& `git push`), rồi gõ `/ai-workflow close CA-XX`
-                    [Bước 7: Close Jira — Jira Release Closer (07-close-jira.md)]
-                      • Lấy `<short-sha>` thật từ HEAD + xác nhận tươi `preclose_audit.py`
-                      • Đăng Verification Evidence 5 mục + chuyển `CA-XX` sang `41` (`Done`) + đóng thẻ trên `BOARD.md`
+                      • 6.1 Pre-commit: `verify.py diff` + soạn PR (skill `pr`) + khung Evidence + `MEMORY.md`
+                      • 6.2 Commit: `git status` + `git add` + `git commit` ➔ `<short-sha>` + `preclose_audit.py`
+                      • 6.3 Push: `git push -u origin feat/ca-xx-<slug>`
+                      • 6.4 Tạo PR: `gh pr create --base main` (hoặc GitHub MCP) ➔ lấy PR URL
+                      • 6.5 Đóng task trên Jira: đăng Evidence 5 mục + chuyển `41` (`"Done"`) + `BOARD.md`
+                      *(Fallback độc lập cho riêng 6.5 nếu đã tự commit thủ công: `/ai-workflow close CA-XX` — `07-close-jira.md`)*
 ```
 
 ---
@@ -163,5 +161,5 @@ Công thức chi phí token thực tế là **`Số vòng gọi công cụ × Đ
 | **Chạy Bước 3 (Review độc lập)** | `Thực hiện Bước 3 (Independent Review) cho task CA-XX theo .ai-workflow/prompts/03-review.md.` |
 | **Chạy Bước 4 (Fix lỗi review)** | `Thực hiện Bước 4 (Fix) cho task CA-XX theo .ai-workflow/prompts/04-fix.md.` |
 | **Chạy Bước 5 (Final Review)** | `Thực hiện Bước 5 (Final Review) cho task CA-XX theo .ai-workflow/prompts/05-final-review.md.` |
-| **Chạy Bước 6 (Pre-Commit & PR)** | `Thực hiện Bước 6 (Pre-Commit & Deliver) cho task CA-XX theo .ai-workflow/prompts/06-precommit.md.` |
-| **Chốt đóng Jira sau khi commit (Bước 7)** | `/ai-workflow close CA-XX` |
+| **Chạy Bước 6 (Pre-commit → Commit → Push → PR → Jira Done)** | `Thực hiện Bước 6 (Deliver: Pre-commit → Commit → Push → Tạo PR → Đóng Jira Done) cho task CA-XX theo .ai-workflow/prompts/06-precommit.md.` |
+| **Chốt đóng Jira độc lập (fallback 6.5 nếu đã commit thủ công)** | `/ai-workflow close CA-XX` |

@@ -99,14 +99,14 @@ Chọn **đúng 1 hộp** theo kết luận thực tế trong `final-review.md`,
 ```markdown
 ---
 
-### ⏩ Bước tiếp theo: Pre-Commit, Soạn PR, Khung Evidence Jira & Lưu Trí Nhớ (Bước 6 — `Deliver & Reuse`)
+### ⏩ Bước tiếp theo: Phát Hành Trọn Gói (Bước 6 — `6.1 Pre-commit ➔ 6.2 Commit ➔ 6.3 Push ➔ 6.4 Tạo PR ➔ 6.5 Đóng Jira "Done"`)
 
-- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Hydrogen (Medium / High)** *(hoặc **Gemini 3.8 Flash (High)**)* — *Thực thi siêu tốc `verify.py diff`, soạn PR, chuẩn bị khung Verification Evidence 5 mục và cập nhật `MEMORY.md` / `BOARD.md` với chi phí quota thấp nhất.*
+- **🤖 Model khuyến nghị trên Antigravity**: **Gemini 4 Hydrogen (Medium / High)** *(hoặc **Gemini 3.8 Flash (High)**)* — *Thực thi tuần tự 5 bước nhỏ: `verify.py diff` + `MEMORY.md`, `git commit` + `preclose_audit.py`, `git push`, tạo PR, và đăng Verification Evidence 5 mục + chuyển Jira sang `41` (`Done`) với chi phí quota thấp nhất.*
 - **💡 Vệ sinh ngữ cảnh**: Đổi sang Model nhẹ ngay tại ô chat hiện tại rồi gửi câu lệnh dưới.
 
 Copy câu lệnh dưới đây và gửi vào ô chat:
 
-> `Thực hiện Bước 6 (Pre-Commit & Deliver) cho task <TICKET_ID> theo .ai-workflow/prompts/06-precommit.md.`
+> `Thực hiện Bước 6 (Deliver: Pre-commit → Commit → Push → Tạo PR → Đóng Jira Done) cho task <TICKET_ID> theo .ai-workflow/prompts/06-precommit.md.`
 ```
 
 - **Trường hợp 2 — Còn lỗi sửa được (`CHANGES REQUESTED`, `Strikes == 1`)**:
