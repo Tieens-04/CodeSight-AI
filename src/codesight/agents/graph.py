@@ -16,9 +16,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from codesight.agents.llm_factory import LLMFactory, StructuredInvocationResult
+from codesight.agents.llm_factory import LLMFactory
+from codesight.agents.nodes._auditor_common import metrics_from_invocation
 from codesight.agents.nodes.context_builder import PRReviewContext, build_batch_context
+from codesight.agents.nodes.perf_arch_auditor import run_perf_arch_auditor
 from codesight.agents.nodes.security_auditor import run_security_auditor
+from codesight.agents.prompts.perf_arch_prompt import PERF_ARCH_AUDITOR_SYSTEM_PROMPT
 from codesight.agents.prompts.security_prompt import SECURITY_AUDITOR_SYSTEM_PROMPT
 from codesight.agents.schemas import (
     AuditorRole,
@@ -34,8 +37,6 @@ from codesight.agents.schemas import (
     LLMCodeSuggestionDraft,
     LLMCriticDraftOutput,
     LLMCriticVerdictDraft,
-    LLMFindingDraft,
-    LLMRole,
     PRReviewState,
     UnreviewableDiffSegment,
 )
@@ -49,10 +50,6 @@ DEFAULT_BATCH_DIFF_TOKEN_LIMIT: Final[int] = 12_000
 DEFAULT_MAX_REQUEST_TOKENS: Final[int] = 24_000
 DEFAULT_OUTPUT_RESERVE_TOKENS: Final[int] = 4_096
 
-_ROLE_PREFIX: Final[dict[AuditorRole, str]] = {
-    "security_auditor": "sec",
-    "logic_performance_auditor": "log",
-}
 _ROLE_ORDER: Final[dict[AuditorRole, int]] = {
     "security_auditor": 0,
     "logic_performance_auditor": 1,
@@ -63,11 +60,6 @@ _SEVERITY_RANK: Final[dict[FindingSeverity, int]] = {
     "INFO": 2,
 }
 
-_LOGIC_SYSTEM_PROMPT: Final[str] = (
-    "You are CodeSight-AI Logic & Performance Auditor. Inspect the line-annotated PR diff for "
-    "logic defects, race conditions, resource leaks, and N+1 or algorithmic regressions. "
-    "Emit ONLY grounded FindingCandidate objects referencing exact RIGHT-side line numbers."
-)
 _CRITIC_SYSTEM_PROMPT: Final[str] = (
     "You are CodeSight-AI Critic & Verification Agent. Review candidate findings against the diff "
     "batch, reject false positives, approve or refine grounded issues, and emit CriticVerdict "
@@ -121,7 +113,7 @@ class ReviewGraphConfig:
         system_tokens = (
             max(
                 estimate_tokens(SECURITY_AUDITOR_SYSTEM_PROMPT),
-                estimate_tokens(_LOGIC_SYSTEM_PROMPT),
+                estimate_tokens(PERF_ARCH_AUDITOR_SYSTEM_PROMPT),
             )
             if system_prompt is None
             else estimate_tokens(system_prompt)
@@ -481,53 +473,6 @@ def _validate_suggestion_draft(
         return None
 
 
-def _normalize_auditor_findings(
-    findings: Sequence[FindingCandidate | LLMFindingDraft],
-    *,
-    role: AuditorRole,
-    batch_index: int,
-) -> tuple[list[FindingCandidate], int]:
-    prefix = _ROLE_PREFIX[role]
-    normalized: list[FindingCandidate] = []
-    dropped_count = 0
-    for item in findings:
-        stable_id = f"b{batch_index:03d}-{prefix}-{len(normalized):03d}"
-        if isinstance(item, FindingCandidate):
-            normalized.append(
-                item.model_copy(
-                    update={
-                        "candidate_id": stable_id,
-                        "role": role,
-                        "batch_index": batch_index,
-                    }
-                )
-            )
-            continue
-        valid_suggestion = _validate_suggestion_draft(item.suggestion)
-        try:
-            candidate = FindingCandidate.model_validate(
-                {
-                    "candidate_id": stable_id,
-                    "role": role,
-                    "batch_index": batch_index,
-                    "file_path": item.file_path,
-                    "start_line": item.start_line,
-                    "end_line": item.end_line,
-                    "severity": item.severity.strip().upper(),
-                    "category": item.category,
-                    "title": item.title,
-                    "evidence": item.evidence,
-                    "confidence": item.confidence,
-                    "suggestion": valid_suggestion,
-                }
-            )
-        except ValidationError:
-            dropped_count += 1
-            continue
-        normalized.append(candidate)
-    return normalized, dropped_count
-
-
 def _normalize_critic_verdicts(
     verdicts: Sequence[CriticVerdict | LLMCriticVerdictDraft],
     *,
@@ -576,13 +521,6 @@ def _normalize_critic_verdicts(
         normalized.append(verdict)
 
     return normalized, dropped_count
-
-
-def _build_logic_auditor_messages(batch_context: BuiltBatchContext) -> list[BaseMessage]:
-    return [
-        SystemMessage(content=_LOGIC_SYSTEM_PROMPT),
-        HumanMessage(content=batch_context.rendered_prompt),
-    ]
 
 
 def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
@@ -708,24 +646,6 @@ def _node_config(
 # ---------------------------------------------------------------------------
 
 
-def _metrics_from_invocation(
-    role: LLMRole,
-    batch_index: int,
-    inv: StructuredInvocationResult[Any],
-) -> LLMCallMetrics:
-    return LLMCallMetrics(
-        role=role,
-        batch_index=batch_index,
-        model_name=inv.model_name,
-        input_tokens=inv.input_tokens,
-        output_tokens=inv.output_tokens,
-        total_tokens=inv.total_tokens,
-        estimated_cost_usd=inv.estimated_cost_usd,
-        latency_ms=inv.latency_ms,
-        attempts=inv.attempts,
-    )
-
-
 class _BatchWorkerInput(BaseModel):
     """Input payload dispatched to each Map-Reduce `Send('process_diff_batch', ...)` branch."""
 
@@ -770,20 +690,12 @@ def build_pr_review_graph(
                 llm_factory=llm_factory,
                 config=node_cfg,
             )
-        messages = _build_logic_auditor_messages(effective_ctx)
-        inv = await llm_factory.invoke_structured(
-            role=role,
-            schema=LLMAuditorDraftOutput,
-            messages=messages,
+        return await run_perf_arch_auditor(
+            batch=batch,
+            batch_context=effective_ctx,
+            llm_factory=llm_factory,
             config=node_cfg,
         )
-        normalized, dropped_count = _normalize_auditor_findings(
-            inv.parsed.findings,
-            role=role,
-            batch_index=batch.batch_index,
-        )
-        metrics = _metrics_from_invocation(role, batch.batch_index, inv)
-        return normalized, metrics, dropped_count
 
     async def _run_critic(
         batch: DiffBatch,
@@ -807,7 +719,7 @@ def build_pr_review_graph(
             batch_index=batch.batch_index,
             valid_candidate_ids=valid_candidate_ids,
         )
-        metrics = _metrics_from_invocation("critic", batch.batch_index, inv)
+        metrics = metrics_from_invocation("critic", batch.batch_index, inv)
         return verdicts, metrics, truncated_ids, dropped_verdicts
 
     async def plan_batches(state: PRReviewState) -> dict[str, Any]:
