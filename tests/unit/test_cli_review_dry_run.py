@@ -360,7 +360,11 @@ def test_cli_review_dry_run_outputs_clean_rich_report_and_isolates_logs(
         for rec in log_records
     )
 
-    # 3. Missing --dry-run exits cleanly with code 2
+    # 3. Missing --dry-run exits cleanly with code 2 when GEMINI_API_KEY is absent
+    monkeypatch.setattr(
+        "codesight.cli.commands.review.get_settings",
+        lambda: Settings(_env_file=None, gemini_api_key=None),
+    )
     no_dry = runner.invoke(cli_app, ["review", "https://github.com/acme/app/pull/42"])
     assert no_dry.exit_code == 2
 

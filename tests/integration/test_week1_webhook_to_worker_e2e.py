@@ -181,6 +181,7 @@ async def test_week1_e2e_webhook_ack_latency_under_100ms_and_worker_publishes_ze
             "github_private_key": SecretStr(b64_pem),
             "github_webhook_secret": SecretStr(E2E_WEBHOOK_SECRET),
             "github_token": None,
+            "gemini_api_key": None,
             "week1_smoke_inline_comment": True,
         }
     )
@@ -418,6 +419,7 @@ async def test_week1_e2e_rapid_two_commits_cancel_on_supersede_queued_and_midfli
             "github_private_key": SecretStr(b64_pem),
             "github_webhook_secret": SecretStr(E2E_WEBHOOK_SECRET),
             "github_token": None,
+            "gemini_api_key": None,
             "week1_smoke_inline_comment": True,
         }
     )
@@ -635,6 +637,7 @@ async def test_week1_e2e_duplicate_delivery_files_api_fallback_and_noise_only_pr
             "github_private_key": SecretStr(b64_pem),
             "github_webhook_secret": SecretStr(E2E_WEBHOOK_SECRET),
             "github_token": None,
+            "gemini_api_key": None,
             "week1_smoke_inline_comment": True,
         }
     )
