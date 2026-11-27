@@ -65,7 +65,7 @@ Hệ thống điều phối phát triển phần mềm theo Jira ticket `CA-*` d
                             ▼ ──► [GATE 4]: Đổi sang Model siêu nhẹ (Hydrogen / Flash)
                     [Bước 6: Deliver & Reuse — Release & Memory Keeper (06-precommit.md)]
                       • 6.1 Pre-commit: `verify.py diff` + soạn PR (skill `pr`) + khung Evidence + `MEMORY.md`
-                      • 6.2 Commit: `git status` + `git add` + `git commit` ➔ `<short-sha>` + `preclose_audit.py`
+                      • 6.2 Commit: commit theo từng phần (atomic commits theo tầng DB/Core/Tests/Docs, không `git add -A` gộp 1 lần) ➔ `<short-sha>` + `preclose_audit.py`
                       • 6.3 Push: `git push -u origin feat/ca-xx-<slug>`
                       • 6.4 Tạo PR: `gh pr create --base main` (hoặc GitHub MCP) ➔ lấy PR URL
                       • 6.5 Đóng task trên Jira: đăng Evidence 5 mục + chuyển `41` (`"Done"`) + `BOARD.md`

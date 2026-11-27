@@ -7,8 +7,8 @@ Bạn đóng vai **`Release Inspector & Memory Keeper`** của **CodeSight-AI**.
 ## Mục Tiêu
 
 Hoàn tất phát hành ticket `<TICKET_ID>` (`CA-*`) theo đúng **5 bước nhỏ tuần tự có chốt chặn (`Fail-Fast`)**:
-1. **6.1 Pre-commit**: Quét vệ sinh & Docker ports bằng `verify.py diff`, cập nhật `.ai-workflow/MEMORY.md` (nếu có bài học mới), soạn Conventional Commit, GitHub PR Description (skill `pr`) và khung **Verification Evidence 5 mục**, lưu vào `precommit.md` (`SAFE TO COMMIT`).
-2. **6.2 Commit**: Kiểm tra `git status --short`, stage tệp hợp lệ, chạy `git commit`, lấy `<short-sha>` thật và chạy tươi `preclose_audit.py --ticket <TICKET_ID>` (`[PASS]`).
+1. **6.1 Pre-commit**: Quét vệ sinh & Docker ports bằng `verify.py diff`, cập nhật `.ai-workflow/MEMORY.md` (nếu có bài học mới), lập danh sách **Atomic Commits theo từng phần**, soạn GitHub PR Description (skill `pr`) và khung **Verification Evidence 5 mục**, lưu vào `precommit.md` (`SAFE TO COMMIT`).
+2. **6.2 Commit (Theo từng phần — Atomic Commits)**: Kiểm tra `git status --short`, tách các file thay đổi theo nhóm logic (DB/Alembic/Config, Core/Pipeline/API, Tests/Evals, Docs/Memory), stage tường minh từng nhóm (`git add <files>`) và commit riêng từng phần (không gộp hết bằng `git add -A` vào 1 commit), lấy `<short-sha>` của `HEAD` và chạy tươi `preclose_audit.py --ticket <TICKET_ID>` (`[PASS]`).
 3. **6.3 Push**: Đẩy nhánh `feat/ca-<x>-<slug>` lên remote (`git push -u origin <branch-name>`).
 4. **6.4 Tạo PR**: Mở Pull Request vào nhánh `main` bằng `gh pr create` (hoặc MCP `codesight-github_github`) sử dụng nội dung PR trong `precommit.md` và lấy **PR URL**.
 5. **6.5 Đóng task trên Jira**: Đăng bình luận **Verification Evidence 5 mục** (kèm `<short-sha>` thật + **PR URL**) trước, sau đó chuyển trạng thái ticket sang **`Done` (`41`)**, cập nhật `precommit.md`, `state.md` (`Done`) và `BOARD.md`.
@@ -42,26 +42,37 @@ Hoàn tất phát hành ticket `<TICKET_ID>` (`CA-*`) theo đúng **5 bước nh
 2. **Khép Kín Vòng Lặp Tái Sử Dụng (`Save What Matters to MEMORY.md`)**:
    - Đọc `.ai-workflow/MEMORY.md` và mục `5. Prevention & Reuse Audit` trong `final-review.md`.
    - Chỉ khi ticket vừa hoàn tất thực sự mang lại **1 quyết định kiến trúc mới (`Decision`), 1 file mẫu chuẩn mới (`Source`), hoặc 1 bài học kỹ thuật tổng quát (`Lesson`)** chưa có trong `MEMORY.md`: bổ sung **tối đa 1–2 dòng** vào đúng mục tương ứng. Nếu không, giữ nguyên `MEMORY.md`.
-3. **Soạn Nội Dung PR & Khung Bằng Chứng Jira 5 Mục**:
+3. **Soạn Kế Hoạch Commit Theo Từng Phần, Nội Dung PR & Khung Bằng Chứng Jira 5 Mục**:
    - Đọc `.agents/skills/pr/SKILL.md` và `.agents/skills/codesight-jira-workflow/SKILL.md`.
-   - Lưu đầy đủ Conventional Commit message, PR Description và khung **Verification Evidence — `<TICKET_ID>`** vào `.ai-workflow/tasks/<TICKET_ID>/precommit.md` với kết luận **`SAFE TO COMMIT`** *(nếu có lỗi ➔ ghi `DO NOT COMMIT` và DỪNG NGAY)*.
+   - Lưu đầy đủ danh sách **Atomic Commits theo từng phần** (vd: `db/config` ➔ `core/pipeline/api` ➔ `tests/evals` ➔ `docs/chore`), PR Description và khung **Verification Evidence — `<TICKET_ID>`** vào `.ai-workflow/tasks/<TICKET_ID>/precommit.md` với kết luận **`SAFE TO COMMIT`** *(nếu có lỗi ➔ ghi `DO NOT COMMIT` và DỪNG NGAY)*.
 
-### 6.2 Commit (Stage, Commit & Chạy Tươi `preclose_audit.py`)
+### 6.2 Commit (Commit Theo Từng Phần — Atomic Commits & Chạy Tươi `preclose_audit.py`)
 
 1. Kiểm tra danh sách tệp thay đổi:
    ```powershell
    git status --short
    ```
    Xác nhận không lọt `.env*` thật, `*.pem`/`*.key`, log rác hay file ngoài phạm vi ticket (`tasks/*` & `BOARD.md` đã gitignore).
-2. Stage và commit đúng thông điệp Conventional Commit ở mục 4 của `precommit.md`, rồi lấy `<short-sha>` thật:
+2. **Cấm dồn toàn bộ vào 1 commit bằng `git add -A`**: Chia các tệp thay đổi thành từng nhóm logic (chỉ commit các nhóm có thay đổi thực tế) và stage tường minh theo đúng thứ tự phụ thuộc:
+   - **Phần 1 — DB / Alembic / Config** *(nếu có)*: `alembic/**`, `pyproject.toml`, `uv.lock`, `docker-compose.yml`
+   - **Phần 2 — Core / Pipeline / API / UI** *(nếu có)*: `src/codesight/**` (tách riêng theo module nếu ticket chạm nhiều tầng độc lập như `ast_engine`/`rag` vs `api`/`radar`)
+   - **Phần 3 — Tests / Evals** *(nếu có)*: `tests/**`, `evals/**`
+   - **Phần 4 — Docs / Skills / Memory** *(nếu có)*: `docs/**`, `.ai-workflow/MEMORY.md`
+3. Với **mỗi phần**, stage đúng danh sách file của phần đó, xác nhận `git diff --cached --stat`, rồi commit theo Conventional Commit kèm `Refs: <TICKET_ID>`:
    ```powershell
-   git add -A
+   git add <file-nhom-1-a> <file-nhom-1-b>
+   git diff --cached --stat
+   git commit -m "feat(ca-<x>): <tóm tắt ngắn gọn phần 1 dưới 72 ký tự>" -m "Refs: <TICKET_ID>"
+   # Lặp lại cho từng phần tiếp theo (feat / fix / refactor / test / docs / chore)
+   ```
+4. Xác nhận working tree đã sạch, ghi nhận danh sách commit vừa tạo cùng `<short-sha>` mới nhất:
+   ```powershell
    git status --short
-   git commit -m "feat(ca-<x>): <tóm tắt ngắn gọn dưới 72 ký tự>" -m "- <Thay đổi kỹ thuật chính 1>`n- <Thay đổi kỹ thuật chính 2>" -m "Refs: <TICKET_ID>"
+   git log --oneline main..HEAD
    git rev-parse --short HEAD
    ```
-   *(Nếu working tree đã sạch và commit của ticket đã có sẵn trên nhánh, ghi nhận `<short-sha>` hiện tại).*
-3. **Chạy tươi cổng cơ học (`verification-before-completion`)**:
+   *(Nếu toàn bộ thay đổi đã được commit theo từng phần từ trước và working tree sạch, ghi nhận danh sách commit & `<short-sha>` hiện tại).*
+5. **Chạy tươi cổng cơ học (`verification-before-completion`)**:
    ```powershell
    python .agents/skills/codesight-jira-workflow/scripts/preclose_audit.py --ticket <TICKET_ID>
    ```
@@ -141,15 +152,13 @@ Hoàn tất phát hành ticket `<TICKET_ID>` (`CA-*`) theo đúng **5 bước nh
 
 - **Đã cập nhật `.ai-workflow/MEMORY.md`**: `NO (Nothing new needed)` *(hoặc ghi rõ dòng nguyên tắc vừa thêm)*
 
-## 4. Commit Message (Conventional Commit)
+## 4. Kế Hoạch Commit Theo Từng Phần (Atomic Conventional Commits)
 
 ```text
-feat(ca-<x>): <tóm tắt ngắn gọn dưới 72 ký tự>
-
-- <Thay đổi kỹ thuật chính 1>
-- <Thay đổi kỹ thuật chính 2>
-
-Refs: <TICKET_ID>
+1. feat(ca-<x>): <tóm tắt phần 1 dưới 72 ký tự>     # <nhóm file 1> · Refs: <TICKET_ID>
+2. feat(ca-<x>): <tóm tắt phần 2 dưới 72 ký tự>     # <nhóm file 2> · Refs: <TICKET_ID>
+3. test(ca-<x>): <tóm tắt test bổ sung>             # <nhóm file test> · Refs: <TICKET_ID>
+4. docs(ca-<x>): <tóm tắt tài liệu / MEMORY.md>     # <nhóm file docs> · Refs: <TICKET_ID>
 ```
 
 ## 5. Nội Dung Pull Request Description (Theo Skill `pr`)
@@ -160,7 +169,7 @@ Refs: <TICKET_ID>
 
 ## 6. Kết Quả Phát Hành (6.2 Commit ➔ 6.3 Push ➔ 6.4 PR ➔ 6.5 Jira Done)
 
-- **6.2 Commit**: `<short-sha>` trên nhánh `feat/ca-<x>-<slug>` (`preclose_audit.py`: `PASS`)
+- **6.2 Commits (`<N>` atomic commits, HEAD `<short-sha>`)**: `<sha1>, <sha2>, ...` trên nhánh `feat/ca-<x>-<slug>` (`preclose_audit.py`: `PASS`)
 - **6.3 Push**: `origin/feat/ca-<x>-<slug>` (`OK`)
 - **6.4 Pull Request**: `<PR_URL>` (base: `main`)
 - **6.5 Jira (`CA`)**: Comment ID `<id>` (Verification Evidence 5 mục) · `31` (`Verify / Test`) ➔ **`41` (`Done`)**
