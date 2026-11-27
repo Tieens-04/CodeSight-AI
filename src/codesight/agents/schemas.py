@@ -157,7 +157,7 @@ class LLMFindingDraft(BaseModel):
     file_path: str = ""
     start_line: int | None = None
     end_line: int | None = None
-    severity: str = ""
+    severity: str = Field(default="", description="Severity level: CRITICAL, WARNING, or INFO.")
     category: str = ""
     title: str = ""
     evidence: str = ""

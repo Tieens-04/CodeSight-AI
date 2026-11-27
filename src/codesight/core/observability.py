@@ -33,7 +33,7 @@ from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from pydantic import BaseModel
 
 from codesight.agents.schemas import TelemetryStatus
-from codesight.core.config import Settings, get_settings
+from codesight.core.config import GEMINI_MODEL_PRICING_USD_PER_1M, Settings, get_settings
 
 logger = structlog.get_logger("codesight.observability")
 
@@ -48,8 +48,8 @@ class ModelPricing:
 
 # Estimated Google Gemini Developer API standard list rates (USD per 1M tokens).
 MODEL_PRICING_PER_1M_TOKENS: Final[dict[str, ModelPricing]] = {
-    "gemini-2.5-flash": ModelPricing(input_per_1m_usd=0.30, output_per_1m_usd=2.50),
-    "gemini-2.5-pro": ModelPricing(input_per_1m_usd=1.25, output_per_1m_usd=10.00),
+    model: ModelPricing(input_per_1m_usd=in_rate, output_per_1m_usd=out_rate)
+    for model, (in_rate, out_rate) in GEMINI_MODEL_PRICING_USD_PER_1M.items()
 }
 
 ALLOWED_METADATA_SUBKEYS: Final[frozenset[str]] = frozenset(

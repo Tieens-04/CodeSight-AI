@@ -1,11 +1,25 @@
 """Application configuration with dual-topology defaults and SecretStr protection."""
 
 from functools import lru_cache
-from typing import Literal, Self
+from typing import Final, Literal, Self
 from urllib.parse import quote_plus
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+GEMINI_MODEL_PRICING_USD_PER_1M: Final[dict[str, tuple[float, float]]] = {
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-2.5-pro": (1.25, 10.00),
+    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.1-flash-lite": (0.25, 1.50),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+    "gemini-3.8-flash": (0.75, 3.75),
+    "gemini-4-hydrogen": (1.50, 7.50),
+    "gemini-4-argon": (2.00, 10.00),
+    "gemini-4-neon": (3.00, 15.00),
+    "gemini-4-carbon": (2.00, 10.00),
+}
+ALLOWED_GEMINI_CRITIC_MODELS: Final[frozenset[str]] = frozenset(GEMINI_MODEL_PRICING_USD_PER_1M)
 
 
 class Settings(BaseSettings):
@@ -100,12 +114,10 @@ class Settings(BaseSettings):
             raise ValueError("CRITIC_MODEL must not be empty.")
         self.auditor_model = cleaned_auditor
         self.critic_model = cleaned_critic
-        if self.llm_provider == "gemini" and cleaned_critic not in {
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-        }:
+        if self.llm_provider == "gemini" and cleaned_critic not in ALLOWED_GEMINI_CRITIC_MODELS:
             raise ValueError(
-                "CRITIC_MODEL must be 'gemini-2.5-flash' or 'gemini-2.5-pro' "
+                "CRITIC_MODEL must be a supported Gemini model "
+                "(e.g. 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3.5-flash-lite') "
                 "when LLM_PROVIDER is 'gemini'."
             )
         return self
