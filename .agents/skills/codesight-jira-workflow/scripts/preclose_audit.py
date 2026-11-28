@@ -86,7 +86,11 @@ def check_docker_ports(repo_root: Path) -> list[str]:
     return errors
 
 
-def check_python_gates(repo_root: Path) -> tuple[list[str], list[str]]:
+def check_python_gates(
+    repo_root: Path,
+    *,
+    include_live_gemini: bool = False,
+) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     summaries: list[str] = []
     pyproject = repo_root / "pyproject.toml"
@@ -111,14 +115,18 @@ def check_python_gates(repo_root: Path) -> tuple[list[str], list[str]]:
     if rc != 0:
         errors.append(f"`uv run ruff format --check .` failed:\n{out}")
 
-    target_dir = "src" if (repo_root / "src").exists() else "."
-    rc, out = run_cmd([uv_bin, "run", "mypy", target_dir], repo_root)
+    mypy_targets = [d for d in ("src", "tests", "evals", "alembic") if (repo_root / d).exists()]
+    if not mypy_targets:
+        mypy_targets = ["."]
+    rc, out = run_cmd([uv_bin, "run", "mypy", *mypy_targets], repo_root)
     summaries.append(f"mypy: {'PASS' if rc == 0 else 'FAIL'} ({out.splitlines()[-1] if out else 'ok'})")
     if rc != 0:
-        errors.append(f"`uv run mypy {target_dir}` failed:\n{out}")
+        errors.append(f"`uv run mypy {' '.join(mypy_targets)}` failed:\n{out}")
 
     if (repo_root / "tests").exists():
         cov_args = [uv_bin, "run", "pytest"]
+        if not include_live_gemini:
+            cov_args.extend(["-k", "not live_gemini and not opt_in_live"])
         if (repo_root / "src").exists():
             cov_args.extend(["--cov=src", "--cov-fail-under=80"])
         rc, out = run_cmd(cov_args, repo_root)
@@ -135,13 +143,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run CodeSight-AI pre-close Jira quality gate.")
     parser.add_argument("--ticket", default=None, help="Jira key, e.g., CA-5")
     parser.add_argument("--repo-root", default=".", help="Path to repository root")
+    parser.add_argument(
+        "--include-live-gemini",
+        action="store_true",
+        help="Include live external Gemini API tests instead of filtering them out for deterministic pre-close runs.",
+    )
     args = parser.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
     all_errors: list[str] = []
     all_errors.extend(check_git(repo_root, args.ticket))
     all_errors.extend(check_docker_ports(repo_root))
-    py_errors, summaries = check_python_gates(repo_root)
+    py_errors, summaries = check_python_gates(
+        repo_root,
+        include_live_gemini=args.include_live_gemini,
+    )
     all_errors.extend(py_errors)
 
     for s in summaries:

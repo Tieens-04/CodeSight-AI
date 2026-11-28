@@ -303,7 +303,7 @@ def test_typescript_parser_extracts_symbols_generics_imports_jsdoc_and_calls() -
     assert AUDIT_PAYLOADS(points) == []
     assert len({pt["id"] for pt in points}) == len(points)
     for pt in points:
-        uuid.UUID(pt["id"], version=5)
+        uuid.UUID(str(pt["id"]), version=5)
 
 
 def test_tsx_parser_extracts_react_hoc_components_and_jsx_called_symbols() -> None:

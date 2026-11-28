@@ -402,7 +402,7 @@ class TestContextBuilderFormattingAndBudgets:
         with pytest.raises(ValueError):
             build_batch_context(batch=batch, max_user_tokens=0)
         with pytest.raises(ValueError):
-            build_batch_context(batch=batch, max_user_tokens=True)  # type: ignore[arg-type]
+            build_batch_context(batch=batch, max_user_tokens=True)
         with pytest.raises(ValueError):
             build_batch_context(batch=batch, max_user_tokens=500, total_batches=0)
         with pytest.raises(ValidationError):
@@ -963,7 +963,7 @@ class TestSecurityAuditorValidationAndRedaction:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             structured_invoker=_invoker,
         )
         findings, metrics, dropped = await run_security_auditor(

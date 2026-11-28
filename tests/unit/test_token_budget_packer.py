@@ -421,7 +421,7 @@ def test_packer_handles_empty_tiny_file_and_invalid_init_args() -> None:
     with pytest.raises(ValueError):
         TokenBudgetPacker(budget_tokens=0)
     with pytest.raises(ValueError):
-        TokenBudgetPacker(budget_tokens=True)  # type: ignore[arg-type]
+        TokenBudgetPacker(budget_tokens=True)
     with pytest.raises(ValueError):
         TokenBudgetPacker(min_truncated_tokens=0)
     with pytest.raises(ValueError):

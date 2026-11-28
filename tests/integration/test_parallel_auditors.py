@@ -7,7 +7,7 @@ import json
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
@@ -935,7 +935,7 @@ class TestParallelAuditorsHermetic:
             }
 
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-ca19-001",
             langfuse_secret_key=SecretStr("sk-lf-ca19-001"),
@@ -1090,8 +1090,8 @@ class TestParallelAuditorsHermetic:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
-            structured_invoker=_map_reduce_invoker,
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
+            structured_invoker=cast(Any, _map_reduce_invoker),
         )
         state = await run_pr_review_graph(
             parsed_diff=parsed,
@@ -1125,7 +1125,7 @@ class TestParallelAuditorsHermetic:
             return {"parsed": LLMAuditorDraftOutput(findings=[])}
 
         fail_factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             chat_model_builder=lambda _role, model_name: _FakeStructuredChatModel(
                 model_name=model_name, handler=_failing_handler
             ),

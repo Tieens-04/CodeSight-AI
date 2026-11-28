@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import httpx
 import jwt
@@ -1337,7 +1337,7 @@ async def test_week3_m3_10_pr_full_pipeline_hermetic_webhook_cli_and_suggestion_
         expected_app_id="10022",
     )
     fake_genai = _DeterministicGenAIClient()
-    embedder = GeminiEmbedder(settings=settings, client=fake_genai)
+    embedder = GeminiEmbedder(settings=settings, client=cast(Any, fake_genai))
     llm_factory = _M3DeterministicLLMFactory(settings, scenarios_by_id)
     span_recorder = RecordingSpanExporter(fail_after_shutdown=True)
     celery_rec = RecordingCelery(task_prefix="m3-task")

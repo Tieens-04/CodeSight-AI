@@ -1433,7 +1433,8 @@ async def test_f03_upsert_repository_state_handles_recreated_and_renamed_collisi
             self._pending.append(obj)
 
         async def execute(self, stmt: Any) -> _FakeScalarResult:
-            compiled = stmt.compile(dialect=postgresql.dialect())
+            dialect_fn: Any = postgresql.dialect
+            compiled = stmt.compile(dialect=dialect_fn())
             sql_text = str(compiled)
             params = compiled.params
             gh_id = next((v for k, v in params.items() if "github_repo_id" in k), None)
@@ -1527,7 +1528,7 @@ async def test_f04_qdrant_grpc_sqlalchemy_retry_classification_and_lock_retry_af
     assert classify_retryable_exception(exc_info.value) == (True, 15.0)
 
     # 2. Transient gRPC, Qdrant HTTP, and SQLAlchemy connection errors are retryable
-    class _FakeGrpcError(grpc.RpcError):
+    class _FakeGrpcError(grpc.RpcError):  # type: ignore[misc]
         def __init__(self, status: grpc.StatusCode) -> None:
             self._status = status
 
@@ -2044,7 +2045,8 @@ async def test_fr02_recreated_repo_rotates_qdrant_repo_id_and_skips_stale_repo_p
             self._pending.append(obj)
 
         async def execute(self, stmt: Any) -> _FakeScalarResult:
-            compiled = stmt.compile(dialect=postgresql.dialect())
+            dialect_fn: Any = postgresql.dialect
+            compiled = stmt.compile(dialect=dialect_fn())
             sql_text = str(compiled)
             where_sql = sql_text.split("WHERE", 1)[1] if "WHERE" in sql_text else sql_text
             params = compiled.params
@@ -2698,6 +2700,7 @@ async def test_cli_embed_code_chunks_flag_and_worker_no_gemini_key_code_sync(
                 mode="incremental_compare",
                 changed_files=1,
                 upserted_points=1,
+                truncated_tree=False,
                 elapsed_ms=2.0,
             )
 
@@ -3180,7 +3183,8 @@ async def test_upsert_repository_state_expected_previous_sha_prevents_cursor_rol
             self._pending.append(obj)
 
         async def execute(self, stmt: Any) -> _FakeScalarResult:
-            compiled = stmt.compile(dialect=postgresql.dialect())
+            dialect_fn: Any = postgresql.dialect
+            compiled = stmt.compile(dialect=dialect_fn())
             sql_text = str(compiled)
             self.executed_sql.append(sql_text)
             where_sql = sql_text.split("WHERE", 1)[1] if "WHERE" in sql_text else sql_text
@@ -3893,10 +3897,10 @@ async def test_s2_06_subtree_walk_cancels_siblings_on_429_and_recreate_guards_tr
     delete_by_repo_calls = 0
 
     class _TrackingStore(_InMemoryZeroCodeStore):
-        async def delete_by_repo(self, **kwargs: Any) -> int:
+        async def delete_by_repo(self, **kwargs: Any) -> None:
             nonlocal delete_by_repo_calls
             delete_by_repo_calls += 1
-            return await super().delete_by_repo(**kwargs)
+            await super().delete_by_repo(**kwargs)
 
     store = _TrackingStore()
     store.points["existing-pt"] = {

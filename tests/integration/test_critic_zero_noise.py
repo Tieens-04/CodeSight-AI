@@ -214,7 +214,7 @@ class TestCriticZeroNoiseHermetic:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             structured_invoker=_invoker,
         )
         state = await run_pr_review_graph(
@@ -259,7 +259,7 @@ class TestCriticZeroNoiseHermetic:
                 title="SQL injection via f-string",
                 evidence="query interpolates {email} into SQL string.",
                 confidence=0.92,
-                suggestion={  # type: ignore[arg-type]
+                suggestion={
                     "start_line": 4,
                     "end_line": 4,
                     "replacement_code": '  query = "SELECT id FROM users WHERE email = ?"',
@@ -335,7 +335,7 @@ class TestCriticZeroNoiseHermetic:
                 title="Sequential await inside loop",
                 evidence="for loop awaits send(item) sequentially.",
                 confidence=0.89,
-                suggestion={  # type: ignore[arg-type]
+                suggestion={
                     "start_line": 2,
                     "end_line": 4,
                     "replacement_code": "  await Promise.all(items.map((item) => send(item)));",
@@ -425,7 +425,7 @@ class TestCriticZeroNoiseHermetic:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             structured_invoker=_critic_invoker,
         )
         result = await run_critic_agent(
@@ -565,7 +565,7 @@ class TestCriticZeroNoiseHermetic:
             )
 
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-ca20-test",
             langfuse_secret_key=SecretStr("sk-lf-ca20-test"),
@@ -774,7 +774,7 @@ class TestCriticZeroNoiseHermetic:
                             decision="MODIFY",
                             confidence=0.96,
                             rationale="Confirmed SQLi; attempted line-99 patch.",
-                            suggestion={  # type: ignore[arg-type]
+                            suggestion={
                                 "start_line": 4,
                                 "end_line": 99,
                                 "replacement_code": '    query = "SELECT 2"',
@@ -835,7 +835,7 @@ class TestCriticZeroNoiseHermetic:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             structured_invoker=_edge_invoker,
         )
         res = await run_critic_agent(
@@ -860,7 +860,7 @@ class TestCriticZeroNoiseHermetic:
             raise AssertionError("Critic LLM must not be called when 100% of candidates truncated")
 
         trunc_factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             structured_invoker=_fail_if_called,
         )
         trunc_res = await run_critic_agent(
@@ -879,9 +879,12 @@ class TestCriticZeroNoiseHermetic:
         from codesight.agents.graph import build_pr_review_graph
         from codesight.agents.schemas import BatchReviewResult, PRReviewState, VerifiedFinding
 
+        async def _unused_invoker(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("reduce_batches should not invoke LLM")
+
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
-            structured_invoker=lambda *a, **k: None,  # type: ignore[arg-type, return-value]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
+            structured_invoker=_unused_invoker,
         )
         compiled = build_pr_review_graph(factory)
 
@@ -990,7 +993,7 @@ async def test_ca20_live_gemini_critic_filters_noise_and_validator_strips_bad_su
             title="SQL injection via f-string interpolation",
             evidence="Line 4 constructs query = f\"SELECT id FROM users WHERE email = '{email}'\".",
             confidence=0.95,
-            suggestion={  # type: ignore[arg-type]
+            suggestion={
                 "start_line": 4,
                 "end_line": 4,
                 "replacement_code": '  query = "SELECT id FROM users WHERE email = ?"',

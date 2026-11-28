@@ -210,7 +210,7 @@ async def test_github_pr_client_redirect_and_input_validation_guards() -> None:
         with pytest.raises(GitHubAuthConfigError):
             await pr_client.fetch_pull_request_diff("../evil", 5)
         with pytest.raises(ValueError, match="positive integer"):
-            await pr_client.fetch_pull_request_diff("acme/api", True)  # type: ignore[arg-type]
+            await pr_client.fetch_pull_request_diff("acme/api", True)
         with pytest.raises(ValueError, match="positive integer"):
             await pr_client.fetch_pull_request_diff("acme/api", 0)
 

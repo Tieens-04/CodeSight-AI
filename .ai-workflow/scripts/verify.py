@@ -1120,11 +1120,13 @@ def main(argv: list[str] | None = None) -> int:
         failures.append(("Ruff Lint", out_lint))
 
     # 3. Mypy Strict
-    rc_mypy, out_mypy, sec_mypy = _run_proc([uv_bin, "run", "mypy", "src"], repo_root)
+    rc_mypy, out_mypy, sec_mypy = _run_proc(
+        [uv_bin, "run", "mypy", "src", "tests", "evals", "alembic"], repo_root
+    )
     gates.append(
         GateRecord(
             name="Mypy Strict",
-            command="uv run mypy src",
+            command="uv run mypy src tests evals alembic",
             status="PASS" if rc_mypy == 0 else "FAIL",
             detail=f"{sec_mypy:.1f}s ({out_mypy.splitlines()[-1] if out_mypy else 'ok'})",
         )

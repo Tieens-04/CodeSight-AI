@@ -53,7 +53,7 @@ def _make_finding(
         file_path=file_path,
         start_line=start_line,
         end_line=end_line,
-        severity=severity,  # type: ignore[arg-type]
+        severity=severity,
         category="sql_injection" if severity == "CRITICAL" else "n_plus_one",
         title=title,
         evidence="Observed in diff line L10",

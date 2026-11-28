@@ -1052,3 +1052,24 @@ def review_command(
         published=ai_bundle.published_review is not None,
         db_persisted=ai_bundle.db_review_id is not None,
     )
+
+
+__all__ = [
+    "CLIAIReviewBundle",
+    "CLIReviewError",
+    "PRDryRunBundle",
+    "ParsedPRUrl",
+    "QdrantZeroCodeStore",
+    "create_db_engine",
+    "create_session_factory",
+    "execute_ai_pr_review",
+    "fetch_pull_request_dry_run",
+    "get_settings",
+    "parse_github_pr_url",
+    "redis_async",
+    "render_ai_review_report",
+    "render_dry_run_report",
+    "review_command",
+    "run_cli_ai_review",
+    "upsert_repository",
+]

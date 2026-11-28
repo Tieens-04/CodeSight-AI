@@ -191,9 +191,9 @@ def test_partition_review_comments_guards_422_and_matches_oracle() -> None:
 
 def test_draft_rejects_bool_lines_and_empty_review_gets_fallback_body() -> None:
     with pytest.raises(ValidationError):
-        ReviewCommentDraft(path="src/auth.py", line=True, body="bad")  # type: ignore[arg-type]
+        ReviewCommentDraft(path="src/auth.py", line=True, body="bad")
     with pytest.raises(ValidationError):
-        ReviewCommentDraft(path="src/auth.py", start_line=False, line=10, body="bad")  # type: ignore[arg-type]
+        ReviewCommentDraft(path="src/auth.py", start_line=False, line=10, body="bad")
 
     parsed = SmartDiffParser().parse_patch_entries(
         [PatchFileEntry(filename="src/a.py", status="modified", patch="@@ -1 +1 @@\n-a\n+b\n")]

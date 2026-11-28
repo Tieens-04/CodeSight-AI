@@ -710,7 +710,7 @@ class TestSecurityAuditorIntegration:
             }
 
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-ca18-int-001",
             langfuse_secret_key=SecretStr("sk-lf-ca18-int-001"),
@@ -999,7 +999,7 @@ class TestSecurityAuditorIntegration:
             return {"parsed": LLMCriticDraftOutput(verdicts=[])}
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             chat_model_builder=lambda role, model_name: _FakeStructuredChatModel(
                 model_name=model_name,
                 handler=_map_reduce_handler,

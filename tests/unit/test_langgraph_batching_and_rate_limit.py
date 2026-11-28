@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import httpx
@@ -290,7 +290,7 @@ class TestConfigAndModelSelection:
             monkeypatch.delenv(env_name, raising=False)
 
     def test_settings_defaults_and_critic_model_variants(self) -> None:
-        default_cfg = Settings(_env_file=None)  # type: ignore[call-arg]
+        default_cfg = Settings(_env_file=None)
         assert default_cfg.llm_provider == "gemini"
         assert default_cfg.auditor_model == "gemini-2.5-flash"
         assert default_cfg.critic_model == "gemini-2.5-flash"
@@ -298,22 +298,22 @@ class TestConfigAndModelSelection:
         assert default_cfg.gemini_embed_concurrency == 2
         assert default_cfg.has_langfuse_credentials is False
 
-        pro_cfg = Settings(_env_file=None, critic_model="gemini-2.5-pro")  # type: ignore[call-arg]
+        pro_cfg = Settings(_env_file=None, critic_model="gemini-2.5-pro")
         assert pro_cfg.critic_model == "gemini-2.5-pro"
 
         with pytest.raises(ValidationError):
-            Settings(_env_file=None, critic_model="gemini-invalid-99")  # type: ignore[call-arg]
+            Settings(_env_file=None, critic_model="gemini-invalid-99")
         with pytest.raises(ValidationError, match="AUDITOR_MODEL"):
-            Settings(_env_file=None, auditor_model="gemini-invalid-99")  # type: ignore[call-arg]
+            Settings(_env_file=None, auditor_model="gemini-invalid-99")
 
     def test_llm_factory_selects_models_and_disables_sdk_retries(self) -> None:
         flash_settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             gemini_api_key=SecretStr("fake-gemini-key"),
             critic_model="gemini-2.5-flash",
         )
         pro_settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             gemini_api_key=SecretStr("fake-gemini-key"),
             critic_model="gemini-2.5-pro",
         )
@@ -340,7 +340,7 @@ class TestConfigAndModelSelection:
             assert mock_chat_cls.call_args.kwargs["max_output_tokens"] == 2048
 
     def test_llm_factory_missing_api_key_and_unknown_provider_fail_fast(self) -> None:
-        no_key = Settings(_env_file=None, gemini_api_key=None)  # type: ignore[call-arg]
+        no_key = Settings(_env_file=None, gemini_api_key=None)
         factory = LLMFactory(settings=no_key)
         with pytest.raises(LLMConfigurationError, match="GEMINI_API_KEY"):
             factory.build_chat_model("security_auditor")
@@ -350,10 +350,10 @@ class TestConfigAndModelSelection:
             custom_factory.build_chat_model("security_auditor")
 
         # Registering a custom provider adapter works cleanly without touching Gemini defaults
-        stub_model = SimpleNamespace(model="custom-llm")
-        custom_factory.register_provider("custom", lambda *_args: stub_model)  # type: ignore[arg-type, return-value]
+        stub_model: Any = SimpleNamespace(model="custom-llm")
+        custom_factory.register_provider("custom", lambda *_args: cast(BaseChatModel, stub_model))
         custom_via_reg = LLMFactory(settings=no_key, provider="custom")
-        custom_via_reg.register_provider("custom", lambda *_args: stub_model)  # type: ignore[arg-type, return-value]
+        custom_via_reg.register_provider("custom", lambda *_args: cast(BaseChatModel, stub_model))
         assert custom_via_reg.build_chat_model("critic") is stub_model
 
         # Optional providers: missing API key & missing optional package both fail clearly
@@ -418,7 +418,7 @@ class TestAgentSchemas:
         with pytest.raises(ValidationError):
             CodeSuggestion(start_line=0, end_line=1, replacement_code="x = 1")
         with pytest.raises(ValidationError):
-            CodeSuggestion(start_line=True, end_line=2, replacement_code="x = 1")  # type: ignore[arg-type]
+            CodeSuggestion(start_line=True, end_line=2, replacement_code="x = 1")
 
     def test_finding_candidate_validates_coordinates_and_github_mapping(self) -> None:
         single = FindingCandidate(
@@ -492,7 +492,7 @@ class TestAgentSchemas:
             CriticVerdict(
                 candidate_id="b000-sec-001",
                 batch_index=0,
-                decision="MAYBE",  # type: ignore[arg-type]
+                decision="MAYBE",
                 rationale="Invalid decision",
             )
 
@@ -537,7 +537,7 @@ class TestLLMFactoryConcurrencyAndRetries:
             finally:
                 in_flight -= 1
 
-        settings = Settings(_env_file=None, llm_max_concurrency=3)  # type: ignore[call-arg]
+        settings = Settings(_env_file=None, llm_max_concurrency=3)
         factory = LLMFactory(settings=settings, structured_invoker=_slow_invoker)
 
         tasks = [
@@ -611,7 +611,7 @@ class TestLLMFactoryConcurrencyAndRetries:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, llm_max_concurrency=3),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, llm_max_concurrency=3),
             structured_invoker=_invoker,
             sleep_fn=_fake_sleep,
             max_retries=2,
@@ -663,8 +663,8 @@ class TestLLMFactoryConcurrencyAndRetries:
             raise GoogleRateLimitError("429") from cause
 
         factory_429 = LLMFactory(
-            settings=Settings(_env_file=None),  # type: ignore[call-arg]
-            structured_invoker=_always_429,
+            settings=Settings(_env_file=None),
+            structured_invoker=cast(Any, _always_429),
             sleep_fn=_fake_sleep,
             max_retries=2,
         )
@@ -689,8 +689,8 @@ class TestLLMFactoryConcurrencyAndRetries:
             raise httpx.ReadTimeout("timed out")
 
         factory_503 = LLMFactory(
-            settings=Settings(_env_file=None),  # type: ignore[call-arg]
-            structured_invoker=_always_503,
+            settings=Settings(_env_file=None),
+            structured_invoker=cast(Any, _always_503),
             sleep_fn=_fake_sleep,
             max_retries=2,
             retry_base_seconds=0.5,
@@ -734,8 +734,8 @@ class TestLLMFactoryConcurrencyAndRetries:
             sleeps.append(delay)
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None),  # type: ignore[call-arg]
-            structured_invoker=_fail_once,
+            settings=Settings(_env_file=None),
+            structured_invoker=cast(Any, _fail_once),
             sleep_fn=_fake_sleep,
             max_retries=3,
         )
@@ -762,8 +762,8 @@ class TestLLMFactoryConcurrencyAndRetries:
             await asyncio.sleep(60.0)
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None),  # type: ignore[call-arg]
-            structured_invoker=_flaky,
+            settings=Settings(_env_file=None),
+            structured_invoker=cast(Any, _flaky),
             sleep_fn=_blocking_sleep,
             max_retries=5,
         )
@@ -806,7 +806,7 @@ class TestLLMFactoryConcurrencyAndRetries:
             finally:
                 in_flight -= 1
 
-        cfg = Settings(_env_file=None, llm_max_concurrency=3)  # type: ignore[call-arg]
+        cfg = Settings(_env_file=None, llm_max_concurrency=3)
         factory_a = LLMFactory(settings=cfg, structured_invoker=_slow_invoker)
         factory_b = LLMFactory(settings=cfg, structured_invoker=_slow_invoker)
 
@@ -851,8 +851,8 @@ class TestLLMFactoryConcurrencyAndRetries:
             raise GoogleRateLimitError("429 RESOURCE_EXHAUSTED") from cause
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None),  # type: ignore[call-arg]
-            structured_invoker=_invoker,
+            settings=Settings(_env_file=None),
+            structured_invoker=cast(Any, _invoker),
             sleep_fn=_fake_sleep,
             max_retries=3,
             retry_cap_seconds=15.0,
@@ -882,8 +882,8 @@ class TestLLMFactoryConcurrencyAndRetries:
             raise GoogleAPIError(code=503, response_json={"error": {"message": "busy"}})
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None),  # type: ignore[call-arg]
-            structured_invoker=_always_503,
+            settings=Settings(_env_file=None),
+            structured_invoker=cast(Any, _always_503),
             sleep_fn=_fake_sleep,
             rng=_MaxBoundRng(),
             max_retries=4,
@@ -939,8 +939,8 @@ class TestLLMFactoryConcurrencyAndRetries:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None),  # type: ignore[call-arg]
-            structured_invoker=_invoker,
+            settings=Settings(_env_file=None),
+            structured_invoker=cast(Any, _invoker),
             sleep_fn=_fake_sleep,
             max_retries=2,
             retry_cap_seconds=15.0,
@@ -970,7 +970,7 @@ class TestLLMFactoryConcurrencyAndRetries:
             return _FakeStructuredChatModel(model_name=model_name, handler=_handler)
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, critic_model="gemini-2.5-pro"),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, critic_model="gemini-2.5-pro"),
             chat_model_builder=_builder,
         )
         await factory.invoke_structured(role="security_auditor", schema=AuditorOutput, messages=[])
@@ -1194,8 +1194,8 @@ class TestLangGraphOrchestration:
             [PatchFileEntry(filename="package-lock.json", patch="@@ -1 +1 @@\n-a\n+b\n")]
         )
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
-            structured_invoker=_unexpected,
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
+            structured_invoker=cast(Any, _unexpected),
         )
         final_state = await run_pr_review_graph(
             parsed_diff=empty_diff,
@@ -1245,7 +1245,7 @@ class TestLangGraphOrchestration:
                 auditors_completed.add(role)
                 finding = FindingCandidate(
                     candidate_id=f"raw-{role}",
-                    role=role,  # type: ignore[arg-type]
+                    role=role,
                     batch_index=0,
                     file_path="src/payments.py",
                     start_line=5 if role == "security_auditor" else 12,
@@ -1300,7 +1300,7 @@ class TestLangGraphOrchestration:
             )
 
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             critic_model="gemini-2.5-pro",
             langfuse_tracing_enabled=False,
         )
@@ -1389,7 +1389,7 @@ class TestLangGraphOrchestration:
                     findings = [
                         FindingCandidate(
                             candidate_id=f"tmp-{idx}",
-                            role=role,  # type: ignore[arg-type]
+                            role=role,
                             batch_index=0,
                             file_path=target_file,
                             start_line=2 + idx,
@@ -1445,7 +1445,7 @@ class TestLangGraphOrchestration:
         factory = LLMFactory(
             settings=Settings(
                 _env_file=None, llm_max_concurrency=3, langfuse_tracing_enabled=False
-            ),  # type: ignore[call-arg]
+            ),
             structured_invoker=_invoker,
         )
         state = await run_pr_review_graph(
@@ -1557,7 +1557,7 @@ class TestLangGraphOrchestration:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             structured_invoker=_raw_payload_invoker,
         )
         state = await run_pr_review_graph(
@@ -1638,7 +1638,7 @@ class TestLangGraphOrchestration:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             structured_invoker=_invoker,
         )
         state = await run_pr_review_graph(
@@ -1673,8 +1673,8 @@ class TestLangGraphOrchestration:
             raise AssertionError("LLM must not be called when only unreviewable segments exist")
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
-            structured_invoker=_unexpected,
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
+            structured_invoker=cast(Any, _unexpected),
         )
         cfg = ReviewGraphConfig(
             batch_diff_token_limit=120,
@@ -1712,8 +1712,8 @@ class TestLangGraphOrchestration:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
-            structured_invoker=_ok,
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
+            structured_invoker=cast(Any, _ok),
         )
         clear_trace_context()
         try:
@@ -1834,7 +1834,7 @@ class TestLangfuseObservabilityAndNFR3:
             }
 
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             critic_model="gemini-2.5-pro",
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-test-unit-001",
@@ -1922,7 +1922,7 @@ class TestLangfuseObservabilityAndNFR3:
             raise ValueError(f"Schema validation failed on input_value='{canary_err}'")
 
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-test-err-001",
             langfuse_secret_key=SecretStr("sk-lf-test-err-001"),
@@ -1971,7 +1971,7 @@ class TestLangfuseObservabilityAndNFR3:
             }
 
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-test-parse-err-001",
             langfuse_secret_key=SecretStr("sk-lf-test-parse-err-001"),
@@ -2031,7 +2031,7 @@ class TestLangfuseObservabilityAndNFR3:
 
         # Case 1: Missing Langfuse keys -> disabled telemetry, review succeeds
         no_lf_settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_public_key=None,
             langfuse_secret_key=None,
         )
@@ -2049,7 +2049,7 @@ class TestLangfuseObservabilityAndNFR3:
         # Case 2: Broken Langfuse exporter -> degraded telemetry, review STILL succeeds!
         broken_exporter = _RecordingSpanExporter(fail_on_export=True, fail_on_flush=True)
         lf_settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-test-broken-001",
             langfuse_secret_key=SecretStr("sk-lf-test-broken-001"),
@@ -2069,7 +2069,7 @@ class TestLangfuseObservabilityAndNFR3:
 
     def test_create_langfuse_session_disabled_when_flag_false(self) -> None:
         settings = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=False,
             langfuse_public_key="pk-lf-disabled",
             langfuse_secret_key=SecretStr("sk-lf-disabled"),
@@ -2165,7 +2165,7 @@ class TestLangfuseObservabilityAndNFR3:
 
         # Init failure degrades session cleanly without raising
         lf_cfg = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-init-fail",
             langfuse_secret_key=SecretStr("sk-lf-init-fail"),
@@ -2184,7 +2184,7 @@ class TestLangfuseObservabilityAndNFR3:
 
         pk = "pk-lf-cache-001"
         cfg = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key=pk,
             langfuse_secret_key=SecretStr("sk-lf-cache-001"),
@@ -2251,7 +2251,7 @@ class TestLangfuseObservabilityAndNFR3:
             )
 
         cfg = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-slow-flush-001",
             langfuse_secret_key=SecretStr("sk-lf-slow-flush-001"),
@@ -2326,7 +2326,7 @@ class TestLangfuseObservabilityAndNFR3:
             )
 
         cfg = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key=pk,
             langfuse_secret_key=SecretStr("sk-lf-prod-fail-001"),
@@ -2371,7 +2371,7 @@ class TestLangfuseObservabilityAndNFR3:
         from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 
         cfg = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             langfuse_tracing_enabled=True,
             langfuse_public_key="pk-lf-chain-end-001",
             langfuse_secret_key=SecretStr("sk-lf-chain-end-001"),
@@ -2432,7 +2432,7 @@ class TestLangfuseObservabilityAndNFR3:
         )
         try:
             cfg = Settings(
-                _env_file=None,  # type: ignore[call-arg]
+                _env_file=None,
                 langfuse_tracing_enabled=True,
                 langfuse_public_key=pk,
                 langfuse_secret_key=SecretStr("sk-lf-unmasked-001"),

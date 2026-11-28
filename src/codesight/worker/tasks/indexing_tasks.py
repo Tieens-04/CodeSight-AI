@@ -319,7 +319,7 @@ class PushSyncRunner:
                 github_repo_id=github_repo_id,
                 installation_id=installation_id,
             )
-            if report.truncated_tree:
+            if bool(getattr(report, "truncated_tree", False)):
                 await self._record_webhook_status(
                     delivery_id,
                     webhook_status="failed",

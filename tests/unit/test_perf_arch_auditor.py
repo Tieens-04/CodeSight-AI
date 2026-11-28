@@ -139,12 +139,12 @@ class TestPerfArchPromptAndConfig:
         assert cfg.available_auditor_user_tokens() > 1000
 
     def test_settings_allows_gemini_3_5_flash_lite_and_prices_it(self) -> None:
-        default_cfg = Settings(_env_file=None)  # type: ignore[call-arg]
+        default_cfg = Settings(_env_file=None)
         assert default_cfg.auditor_model == "gemini-2.5-flash"
         assert default_cfg.critic_model == "gemini-2.5-flash"
 
         lite_cfg = Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             auditor_model="gemini-3.5-flash-lite",
             critic_model="gemini-3.5-flash-lite",
         )
@@ -154,9 +154,9 @@ class TestPerfArchPromptAndConfig:
         assert set(MODEL_PRICING_PER_1M_TOKENS) == set(ALLOWED_GEMINI_CRITIC_MODELS)
         assert "gemini-3.5-flash" not in ALLOWED_GEMINI_CRITIC_MODELS
         with pytest.raises(ValidationError):
-            Settings(_env_file=None, critic_model="gemini-3.5-flash")  # type: ignore[call-arg]
+            Settings(_env_file=None, critic_model="gemini-3.5-flash")
         with pytest.raises(ValidationError):
-            Settings(_env_file=None, critic_model="gemini-invalid-99")  # type: ignore[call-arg]
+            Settings(_env_file=None, critic_model="gemini-invalid-99")
 
         cost = estimate_model_cost_usd(
             "gemini-3.5-flash-lite",
@@ -620,7 +620,7 @@ class TestPerfArchValidationAndGrounding:
             )
 
         factory = LLMFactory(
-            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),  # type: ignore[call-arg]
+            settings=Settings(_env_file=None, langfuse_tracing_enabled=False),
             structured_invoker=_invoker,
         )
         findings, metrics, dropped = await run_perf_arch_auditor(
@@ -1165,7 +1165,7 @@ class TestPerfArchValidationAndGrounding:
             ),
             LLMFindingDraft.model_construct(
                 file_path="src/ok.py",
-                start_line=True,  # type: ignore[arg-type]
+                start_line=True,
                 end_line=2,
                 severity="WARNING",
                 category="n_plus_one_query",

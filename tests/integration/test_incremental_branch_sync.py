@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Any
 
@@ -530,7 +531,7 @@ async def test_s2_01_live_redis_lua_lock_loss_blocks_stale_qdrant_delete_and_cur
     )
     from codesight.vcs.github_auth import GitHubAuthProvider
 
-    repo_slug = "codesight-eval/live-lock-race"
+    repo_slug = f"codesight-eval/live-lock-race-{uuid.uuid4().hex[:8]}"
     sha_v1 = "1" * 40
     sha_v2_stale = "2" * 40
     sha_v3_fresh = "3" * 40
@@ -712,6 +713,7 @@ async def test_s2_01_live_redis_lua_lock_loss_blocks_stale_qdrant_delete_and_cur
                     ).scalar_one()
                     assert row.last_indexed_sha == sha_v3_fresh
     finally:
+        await redis_client.delete(AsyncRepoIndexLock.lock_key(repo_slug))
         await redis_client.aclose()
         await engine.dispose()
 
@@ -755,8 +757,9 @@ async def test_s2_02_and_s2_03_eval_cli_isolates_postgres_cursor_and_preserves_m
     cli_mod = _load_run_m2_eval_module()
 
     main_db_name = urlsplit(isolated_postgres_dsn).path.lstrip("/")
-    py_slug = "codesight-eval/cursor-isolation"
-    ts_slug = "codesight-eval/ts-isolation"
+    run_tag = uuid.uuid4().hex[:8]
+    py_slug = f"codesight-eval/cursor-isolation-{run_tag}"
+    ts_slug = f"codesight-eval/ts-isolation-{run_tag}"
     sha_v0 = "0" * 39 + "1"
     sha_v1 = "b" * 40
     src_v0 = b"def v0_fn() -> int:\n    return 0\n"
@@ -964,5 +967,9 @@ async def test_s2_02_and_s2_03_eval_cli_isolates_postgres_cursor_and_preserves_m
             tmp_q = QdrantZeroCodeStore(settings=main_settings)
             await tmp_q.client.delete_collection(eval_col)
             await tmp_q.aclose()
+        await redis_client.delete(
+            AsyncRepoIndexLock.lock_key(py_slug),
+            AsyncRepoIndexLock.lock_key(ts_slug),
+        )
         await redis_client.aclose()
         await main_engine.dispose()

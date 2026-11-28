@@ -16,7 +16,7 @@ from codesight.ast_engine.suggestion_validator import (
     is_suggestion_syntax_safe,
 )
 from codesight.core.config import Settings
-from codesight.diff.models import PatchFileEntry
+from codesight.diff.models import ParsedFileDiff, ParsedPullRequestDiff, PatchFileEntry
 from codesight.diff.smart_diff_parser import SmartDiffParser
 from codesight.vcs.github_auth import GitHubAuthProvider
 from codesight.vcs.github_publisher import (
@@ -26,7 +26,9 @@ from codesight.vcs.github_publisher import (
 )
 
 
-def _parse_single_file_diff(file_path: str, patch: str, *, status: str = "modified"):
+def _parse_single_file_diff(
+    file_path: str, patch: str, *, status: str = "modified"
+) -> tuple[ParsedPullRequestDiff, ParsedFileDiff]:
     parsed = SmartDiffParser().parse_patch_entries(
         [PatchFileEntry(filename=file_path, patch=patch, status=status)]
     )
@@ -608,7 +610,7 @@ class TestTreeSitterSuggestionValidator:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
             auth = GitHubAuthProvider(
-                Settings(_env_file=None, github_token=SecretStr("ghp_test")),  # type: ignore[call-arg]
+                Settings(_env_file=None, github_token=SecretStr("ghp_test")),
                 http_client=client,
             )
             publisher = GitHubReviewPublisher(auth, http_client=client)

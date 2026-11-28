@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 from tree_sitter import Language
 
@@ -450,7 +452,7 @@ def test_registry_resolve_pr_file_parses_after_source_only_once(
     def _counting_parse(self: TSParser, *args: object, **kwargs: object) -> object:
         nonlocal parse_calls
         parse_calls += 1
-        return original_parse(self, *args, **kwargs)  # type: ignore[arg-type]
+        return original_parse(self, *cast(tuple[Any, ...], args), **cast(dict[str, Any], kwargs))
 
     monkeypatch.setattr(TSParser, "parse", _counting_parse)
 

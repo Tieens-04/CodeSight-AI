@@ -11,7 +11,7 @@ import os
 import random
 import threading
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
-from typing import Any, Final, ParamSpec, TypeVar, cast
+from typing import Any, Final, ParamSpec, Protocol, TypeVar, cast
 
 import httpx
 import redis as redis_sync
@@ -73,6 +73,7 @@ TASK_HARD_TIME_LIMIT_SECONDS: Final[int] = 90
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+_R_co = TypeVar("_R_co", covariant=True)
 _SYSTEM_RNG: Final[random.Random] = random.SystemRandom()
 
 logger = structlog.get_logger("codesight.worker")
@@ -248,22 +249,35 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
     return app
 
 
+class _TypedCeleryTask(Protocol[_P, _R_co]):
+    """Typing protocol exposing Celery runtime task helpers alongside direct call signature."""
+
+    request: Any
+    soft_time_limit: int | None
+    time_limit: int | None
+
+    def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _R_co: ...
+    def push_request(self, *args: Any, **kwargs: Any) -> Any: ...
+    def pop_request(self) -> None: ...
+    def retry(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
 def _typed_task(
     app_instance: Celery,
     *,
     name: str,
     soft_time_limit: int | None = None,
     time_limit: int | None = None,
-) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+) -> Callable[[Callable[_P, _R]], _TypedCeleryTask[_P, _R]]:
     task_opts: dict[str, Any] = {"name": name, "base": CodeSightTask}
     if soft_time_limit is not None:
         task_opts["soft_time_limit"] = soft_time_limit
     if time_limit is not None:
         task_opts["time_limit"] = time_limit
 
-    def _decorator(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    def _decorator(fn: Callable[_P, _R]) -> _TypedCeleryTask[_P, _R]:
         registered = app_instance.task(**task_opts)(fn)
-        return cast(Callable[_P, _R], registered)
+        return cast(_TypedCeleryTask[_P, _R], registered)
 
     return _decorator
 
@@ -921,3 +935,32 @@ def handle_push_event(payload: dict[str, Any]) -> dict[str, str]:
 def sync_default_branch(payload: dict[str, Any]) -> dict[str, str]:
     """Named Celery entrypoint for incremental default-branch Qdrant synchronization."""
     return _dispatch_push_task(sync_default_branch, payload)
+
+
+__all__ = [
+    "MAX_TASK_RETRIES",
+    "RETRY_BASE_SECONDS",
+    "RETRY_CAP_SECONDS",
+    "TASK_HARD_TIME_LIMIT_SECONDS",
+    "TASK_SOFT_TIME_LIMIT_SECONDS",
+    "CodeSightTask",
+    "PRReviewLifecycleContext",
+    "celery_app",
+    "classify_retryable_exception",
+    "compute_retry_countdown",
+    "create_celery_app",
+    "execute_pr_review_lifecycle",
+    "handle_pr_event",
+    "handle_push_event",
+    "inject_trace_id_header",
+    "is_pr_event_superseded",
+    "on_task_postrun",
+    "on_task_prerun",
+    "on_worker_process_init",
+    "on_worker_process_shutdown",
+    "ping",
+    "redis_async",
+    "redis_sync",
+    "run_pr_webhook_task",
+    "sync_default_branch",
+]
