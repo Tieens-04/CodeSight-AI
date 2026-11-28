@@ -27,6 +27,7 @@
 - **Single-Source Gemini Model Catalog & Pricing**: Define supported Gemini models and USD/1M token rates once in `GEMINI_MODEL_PRICING_USD_PER_1M` (`src/codesight/core/config.py`) and derive `ALLOWED_GEMINI_CRITIC_MODELS` and `MODEL_PRICING_PER_1M_TOKENS` (`src/codesight/core/observability.py`) from it.
 - **Zero-Noise Critic & RAM Tree-Sitter Suggestion Guard**: Keep raw `merged_findings` alongside `verified_findings` (`confidence >= 0.75`, empty/all-truncated short-circuit, redacted-evidence re-grounding, canonical-group dedup), mask secrets before LF-only `tree-sitter` + `ast.parse(bytes)` splice checks, and neutralize CommonMark §4.5 `suggestion` fences in prose (`src/codesight/agents/nodes/critic_agent.py`, `src/codesight/ast_engine/suggestion_validator.py`, `src/codesight/agents/schemas.py`).
 - **Deterministic Scoring, Smart Gate & 7d NFR-3 SHA Cache**: Use `Decimal` `TechnicalDebtScorer` (`70/20/15` caps), route `INFO` to `<details>` with `REQUEST_CHANGES -> COMMENT` self-review `422` fallback (`pre_422_fallback` supersede check), and key `RedisBlobSHACache` on full 40/64-hex `blob_sha` + `patch_fingerprint` while fetching RAM `after_sources` for cached suggestions and skipping writes on degraded RAG or truncated batches (`src/codesight/scoring/debt_scorer.py`, `src/codesight/scoring/report_composer.py`, `src/codesight/worker/sha_cache.py`, `src/codesight/worker/ai_review_pipeline.py`).
+- **Caller-owned OTel `SpanExporter` & Pre-cache CLI UUID Sync**: Pass `close_inner=False` on caller-injected `SpanExporter` and guard `LangfuseResourceManager._instances` with `_CLIENT_CACHE_LOCK` (`src/codesight/core/observability.py`); upsert `Repository` and read `repo_row.id` before `commit()` in CLI (`src/codesight/cli/commands/review.py`) so Webhook and CLI share canonical PostgreSQL UUID cache keys.
 
 ---
 
@@ -42,7 +43,7 @@
 - **Parallel Auditors, Shared Guardrails & Live Timing Gate**: `src/codesight/agents/nodes/_auditor_common.py`, `src/codesight/agents/nodes/perf_arch_auditor.py`, `src/codesight/agents/prompts/perf_arch_prompt.py`, `tests/integration/test_parallel_auditors.py`
 - **Zero-Noise Critic & RAM Suggestion Validator**: `src/codesight/agents/nodes/critic_agent.py`, `src/codesight/agents/prompts/critic_prompt.py`, `src/codesight/ast_engine/suggestion_validator.py`, `tests/unit/test_suggestion_syntax_validator.py`, `tests/integration/test_critic_zero_noise.py`
 - **Technical Debt Scorer, Smart Gate, SHA Cache & Shared Pipeline**: `src/codesight/scoring/debt_scorer.py`, `src/codesight/scoring/report_composer.py`, `src/codesight/worker/sha_cache.py`, `src/codesight/worker/ai_review_pipeline.py`, `tests/unit/test_debt_scorer_formula.py`, `tests/unit/test_redis_blob_sha_cache.py`, `tests/unit/test_sprint3_runner_and_cli_review.py`
-- **Hermetic Live Docker Integration Suites (`5433` / `6381` / `6333-6334`)**: `tests/integration/test_week1_webhook_to_worker_e2e.py`, `tests/integration/test_week2_dual_lang_rag_e2e.py`
+- **Hermetic Live Docker Integration Suites (`5433` / `6381` / `6333-6334`)**: `tests/integration/test_week1_webhook_to_worker_e2e.py`, `tests/integration/test_week2_dual_lang_rag_e2e.py`, `tests/integration/test_week3_full_pipeline_e2e.py`, `tests/_helpers.py`
 
 ---
 
