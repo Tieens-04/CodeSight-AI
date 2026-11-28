@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import redis.asyncio as redis_async
@@ -48,6 +48,9 @@ from codesight.worker.lifecycle import (
 )
 from codesight.worker.sha_cache import RedisBlobSHACache
 from codesight.worker.supersede_lock import AsyncSupersedeLock, PRSupersededError
+
+if TYPE_CHECKING:
+    from opentelemetry.sdk.trace.export import SpanExporter
 
 logger = structlog.get_logger("codesight.worker.pr_review_runner")
 
@@ -889,6 +892,7 @@ class Sprint3PRReviewRunner(_BasePRReviewRunner):
         embedder: GeminiEmbedder | None = None,
         llm_factory: LLMFactory | None = None,
         api_base_url: str = "https://api.github.com",
+        span_exporter: SpanExporter | None = None,
     ) -> None:
         super().__init__(
             settings=settings,
@@ -900,6 +904,7 @@ class Sprint3PRReviewRunner(_BasePRReviewRunner):
         self._qdrant_store = qdrant_store
         self._embedder = embedder
         self._llm_factory = llm_factory
+        self._span_exporter = span_exporter
 
     async def _record_audit_best_effort(
         self,
@@ -1024,6 +1029,7 @@ class Sprint3PRReviewRunner(_BasePRReviewRunner):
                 qdrant_store=self._qdrant_store,
                 embedder=self._embedder,
                 diff_source=fetched_diff.diff_source,
+                span_exporter=self._span_exporter,
             )
 
         async def _run_publish(

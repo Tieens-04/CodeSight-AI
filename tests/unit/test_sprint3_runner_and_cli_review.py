@@ -124,6 +124,7 @@ class _RecordingAsyncSession:
         self.repo_exists = repo_exists
         self.added: list[Any] = []
         self.committed = False
+        self.rolled_back = False
         self.executed: list[Any] = []
 
     async def __aenter__(self) -> _RecordingAsyncSession:
@@ -158,6 +159,9 @@ class _RecordingAsyncSession:
 
     async def commit(self) -> None:
         self.committed = True
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
 
 
 class _FakeSessionFactory:
@@ -887,3 +891,317 @@ def test_cli_review_command_no_publish_offline_degradation_and_errors(
     )
     assert err_res.exit_code == 1
     assert "PR review failed" in err_res.stderr
+
+
+async def test_telemetry_span_exporter_plumbing_and_cli_precache_uuid_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codesight.cli.commands import review as review_mod
+    from codesight.db.models import Repository
+    from tests._helpers import RecordingSpanExporter
+
+    for env_key in (
+        "GITHUB_APP_ID",
+        "GITHUB_PRIVATE_KEY",
+        "LLM_PROVIDER",
+        "GEMINI_API_KEY",
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "LANGFUSE_HOST",
+        "LANGFUSE_TRACING_ENABLED",
+    ):
+        monkeypatch.delenv(env_key, raising=False)
+
+    repo_uuid = uuid.uuid4()
+    raw_diff = (
+        "diff --git a/src/auth.py b/src/auth.py\n"
+        f"index {'1' * 40}..{'b' * 40} 100644\n"
+        "--- a/src/auth.py\n"
+        "+++ b/src/auth.py\n"
+        "@@ -1 +1,2 @@\n"
+        " def run(user_input):\n"
+        "+    return user_input.strip()\n"
+    )
+    parsed_diff = SmartDiffParser().parse_diff(raw_diff)
+    settings = Settings(
+        _env_file=None,
+        github_token=SecretStr("ghp_test"),
+        gemini_api_key=SecretStr("fake-gemini-key"),
+        langfuse_tracing_enabled=True,
+        langfuse_public_key="pk-lf-test-ca22",
+        langfuse_secret_key=SecretStr("sk-lf-test-ca22"),
+        langfuse_host="https://cloud.langfuse.com",
+    )
+
+    # 1. execute_ai_pr_review forwards span_exporter and attaches telemetry on uncached run
+    recorder = RecordingSpanExporter(fail_after_shutdown=True)
+    fake_redis = _FakeAsyncRedis()
+    sha_cache = RedisBlobSHACache(fake_redis)  # type: ignore[arg-type]
+    exec_res = await pipeline_mod.execute_ai_pr_review(
+        repo_full_name="acme/app",
+        repo_id=str(repo_uuid),
+        pr_number=22,
+        head_sha="deadbeef" * 5,
+        parsed_diff=parsed_diff,
+        repo_config=RepoConfig(),
+        settings=settings,
+        trace_id="trace-ca22-telemetry",
+        llm_factory=_StubLLMFactory(settings, emit_critical=False),
+        sha_cache=sha_cache,
+        in_memory_after_sources={
+            "src/auth.py": "def run(user_input):\n    return user_input.strip()\n"
+        },
+        span_exporter=recorder,
+    )
+    assert exec_res.telemetry is not None
+    assert exec_res.telemetry.active is True
+    assert exec_res.telemetry.flushed is True
+    assert exec_res.telemetry.trace_id is not None
+    assert len(recorder.spans) > 0
+    assert recorder.shutdown_called is False
+
+    # Full SHA cache hit skips LangGraph -> telemetry is None
+    cached_res = await pipeline_mod.execute_ai_pr_review(
+        repo_full_name="acme/app",
+        repo_id=str(repo_uuid),
+        pr_number=22,
+        head_sha="deadbeef" * 5,
+        parsed_diff=parsed_diff,
+        repo_config=RepoConfig(),
+        settings=settings,
+        trace_id="trace-ca22-cached",
+        llm_factory=_StubLLMFactory(settings, emit_critical=False),
+        sha_cache=sha_cache,
+        in_memory_after_sources={
+            "src/auth.py": "def run(user_input):\n    return user_input.strip()\n"
+        },
+        span_exporter=recorder,
+    )
+    assert cached_res.cache_hits == 1
+    assert cached_res.llm_calls == 0
+    assert cached_res.telemetry is None
+
+    # 2. Sprint3PRReviewRunner reuses span_exporter across PRs without premature shutdown()
+    runner_recorder = RecordingSpanExporter(fail_after_shutdown=True)
+    runner_session = _FakeSessionFactory(repo_uuid)
+    runner_redis = _FakeAsyncRedis()
+
+    def gh_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/acme/app/check-runs":
+            return httpx.Response(201, json={"id": 888})
+        if path == "/repos/acme/app/check-runs/888":
+            return httpx.Response(200, json={"id": 888})
+        if path == "/repos/acme/app/pulls/22":
+            if "vnd.github.diff" in request.headers.get("accept", ""):
+                return httpx.Response(200, text=raw_diff)
+            return httpx.Response(
+                200,
+                json={
+                    "base": {
+                        "ref": "main",
+                        "sha": "base00",
+                        "repo": {"id": 55, "default_branch": "main"},
+                    },
+                    "head": {"ref": "feat/clean", "sha": "deadbeef" * 5},
+                },
+            )
+        if path == "/repos/acme/app/pulls/23":
+            if "vnd.github.diff" in request.headers.get("accept", ""):
+                return httpx.Response(200, text=raw_diff)
+            return httpx.Response(
+                200,
+                json={
+                    "base": {
+                        "ref": "main",
+                        "sha": "base00",
+                        "repo": {"id": 0, "default_branch": "main"},
+                    },
+                    "head": {"ref": "feat/zero-id", "sha": "cafebabe" * 5},
+                },
+            )
+        if path.startswith("/repos/acme/app/contents/src/auth.py"):
+            b64 = base64.b64encode(b"def run(user_input):\n    return user_input.strip()\n").decode(
+                "ascii"
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "type": "file",
+                    "sha": "b" * 40,
+                    "size": 50,
+                    "encoding": "base64",
+                    "content": b64,
+                },
+            )
+        if path in {"/repos/acme/app/pulls/22/reviews", "/repos/acme/app/pulls/23/reviews"}:
+            return httpx.Response(200, json={"id": 901, "state": "COMMENTED"})
+        return httpx.Response(404)
+
+    seen_exporters: list[Any] = []
+    orig_pipeline_exec = pipeline_mod.execute_ai_pr_review
+
+    async def _spy_runner_exec(*args: Any, **kwargs: Any) -> Any:
+        seen_exporters.append(kwargs.get("span_exporter"))
+        return await orig_pipeline_exec(*args, **kwargs)
+
+    monkeypatch.setattr("codesight.worker.pr_review_runner.execute_ai_pr_review", _spy_runner_exec)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gh_handler)) as http_client:
+        runner = Sprint3PRReviewRunner(
+            settings=settings,
+            http_client=http_client,
+            session_factory=runner_session,  # type: ignore[arg-type]
+            redis_client=runner_redis,  # type: ignore[arg-type]
+            llm_factory=_StubLLMFactory(settings, emit_critical=False),
+            span_exporter=runner_recorder,
+        )
+        run_out = await runner.execute(
+            {
+                "delivery_id": "deliv-ca22-runner-1",
+                "repo_id": str(repo_uuid),
+                "repo_full_name": "acme/app",
+                "pr_number": 22,
+                "head_sha": "deadbeef" * 5,
+                "base_sha": "main",
+                "default_branch": "main",
+            }
+        )
+        assert run_out["status"] == "completed"
+        first_span_count = len(runner_recorder.spans)
+        assert first_span_count > 0
+        assert runner_recorder.shutdown_called is False
+
+        runner_redis.store.clear()
+        run_out_2 = await runner.execute(
+            {
+                "delivery_id": "deliv-ca22-runner-2",
+                "repo_id": str(repo_uuid),
+                "repo_full_name": "acme/app",
+                "pr_number": 22,
+                "head_sha": "deadbeef" * 5,
+                "base_sha": "main",
+                "default_branch": "main",
+            }
+        )
+        assert run_out_2["status"] == "completed"
+        assert len(runner_recorder.spans) > first_span_count
+        assert runner_recorder.shutdown_called is False
+    assert seen_exporters == [runner_recorder, runner_recorder]
+
+    # 3. run_cli_ai_review upserts Repository UUID before commit & before RedisBlobSHACache lookup.
+    cli_repo_uuid = uuid.uuid4()
+
+    class _ExpireAfterCommitRow:
+        def __init__(self, inner: Repository, session_ref: Any) -> None:
+            self._inner = inner
+            self._session_ref = session_ref
+
+        @property
+        def id(self) -> uuid.UUID:
+            if self._session_ref.committed:
+                raise RuntimeError("MissingGreenlet: accessed Repository.id after commit")
+            return self._inner.id
+
+    class _ExpireSession(_RecordingAsyncSession):
+        pass
+
+    class _ExpireSessionFactory:
+        def __init__(self, target_uuid: uuid.UUID) -> None:
+            self.session = _ExpireSession(target_uuid, repo_exists=False)
+
+        def __call__(self) -> _ExpireSession:
+            return self.session
+
+    new_repo_session = _ExpireSessionFactory(cli_repo_uuid)
+    upsert_calls: list[dict[str, Any]] = []
+
+    async def _fake_upsert_repo(session: Any, **kwargs: Any) -> Any:
+        upsert_calls.append(kwargs)
+        row = Repository(
+            id=cli_repo_uuid,
+            github_repo_id=kwargs.get("github_repo_id"),
+            full_name=kwargs["full_name"],
+            default_branch=kwargs["default_branch"],
+            installation_id=kwargs.get("installation_id"),
+        )
+        session.added.append(row)
+        return _ExpireAfterCommitRow(row, session)
+
+    monkeypatch.setattr(review_mod, "upsert_repository", _fake_upsert_repo)
+    cli_redis = _FakeAsyncRedis()
+    cli_exporter = RecordingSpanExporter(fail_after_shutdown=True)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gh_handler)) as http_client:
+        first_bundle = await review_mod.run_cli_ai_review(
+            review_mod.parse_github_pr_url("https://github.com/acme/app/pull/22"),
+            settings=settings,
+            publish=True,
+            http_client=http_client,
+            redis_client=cli_redis,  # type: ignore[arg-type]
+            session_factory=new_repo_session,  # type: ignore[arg-type]
+            llm_factory=_StubLLMFactory(settings, emit_critical=False),
+            span_exporter=cli_exporter,
+        )
+        assert len(upsert_calls) == 1
+        assert upsert_calls[0]["github_repo_id"] == 55
+        assert new_repo_session.session.committed is True
+        assert first_bundle.ai_result.cache_misses == 1
+        assert first_bundle.ai_result.telemetry is not None
+        assert first_bundle.ai_result.telemetry.flushed is True
+        assert len(cli_exporter.spans) > 0
+        assert cli_exporter.shutdown_called is False
+        # Cache key must use canonical PostgreSQL UUID, NOT github_repo_id (55)
+        expected_key = f"file_review:{cli_repo_uuid}:{'b' * 40}:{RepoConfig().config_hash}"
+        assert expected_key in cli_redis.store
+
+        existing_repo_session = _ExpireSessionFactory(cli_repo_uuid)
+        second_bundle = await review_mod.run_cli_ai_review(
+            review_mod.parse_github_pr_url("https://github.com/acme/app/pull/22"),
+            settings=settings,
+            publish=False,
+            http_client=http_client,
+            redis_client=cli_redis,  # type: ignore[arg-type]
+            session_factory=existing_repo_session,  # type: ignore[arg-type]
+            llm_factory=_StubLLMFactory(settings, emit_critical=False),
+            span_exporter=cli_exporter,
+        )
+        assert len(upsert_calls) == 2
+        assert second_bundle.ai_result.cache_hits == 1
+        assert second_bundle.ai_result.llm_calls == 0
+
+        # Non-positive github_repo_id (0) must normalize to None before upsert_repository
+        zero_id_session = _ExpireSessionFactory(cli_repo_uuid)
+        await review_mod.run_cli_ai_review(
+            review_mod.parse_github_pr_url("https://github.com/acme/app/pull/23"),
+            settings=settings,
+            publish=False,
+            http_client=http_client,
+            redis_client=cli_redis,  # type: ignore[arg-type]
+            session_factory=zero_id_session,  # type: ignore[arg-type]
+            llm_factory=_StubLLMFactory(settings, emit_critical=False),
+            span_exporter=cli_exporter,
+        )
+        assert upsert_calls[2]["github_repo_id"] is None
+
+        # Pre-cache upsert failure rolls back cleanly and falls back to github_repo_id
+        async def _failing_upsert_repo(session: Any, **kwargs: Any) -> Any:
+            _ = session, kwargs
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(review_mod, "upsert_repository", _failing_upsert_repo)
+        failing_session = _ExpireSessionFactory(cli_repo_uuid)
+        fallback_redis = _FakeAsyncRedis()
+        fallback_bundle = await review_mod.run_cli_ai_review(
+            review_mod.parse_github_pr_url("https://github.com/acme/app/pull/22"),
+            settings=settings,
+            publish=False,
+            http_client=http_client,
+            redis_client=fallback_redis,  # type: ignore[arg-type]
+            session_factory=failing_session,  # type: ignore[arg-type]
+            llm_factory=_StubLLMFactory(settings, emit_critical=False),
+            span_exporter=cli_exporter,
+        )
+        assert failing_session.session.rolled_back is True
+        assert any("PostgreSQL unavailable" in w for w in fallback_bundle.warnings)
+        assert f"file_review:55:{'b' * 40}:{RepoConfig().config_hash}" in fallback_redis.store
+        assert fallback_bundle.db_review_id is None

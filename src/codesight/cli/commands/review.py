@@ -10,13 +10,12 @@ import time
 import uuid
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
-from typing import Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from urllib.parse import quote, urlsplit
 
 import httpx
 import redis.asyncio as redis_async
 import redis.exceptions
-import sqlalchemy as sa
 import structlog
 import typer
 from rich.console import Console
@@ -35,7 +34,7 @@ from codesight.config_reader.repo_config import (
 )
 from codesight.core.config import Settings, get_settings
 from codesight.core.errors import RateLimitTaskError, RetryableTaskError, is_rate_limited_403
-from codesight.db.models import Repository
+from codesight.db.repositories import upsert_repository
 from codesight.db.session import create_db_engine, create_session_factory
 from codesight.diff.file_filter import FileFilter
 from codesight.diff.models import ParsedPullRequestDiff, PatchFileEntry
@@ -71,6 +70,9 @@ from codesight.worker.ai_review_pipeline import (
     persist_pr_review_result,
 )
 from codesight.worker.sha_cache import RedisBlobSHACache
+
+if TYPE_CHECKING:
+    from opentelemetry.sdk.trace.export import SpanExporter
 
 DEFAULT_ALLOWED_PR_HOSTS: Final[frozenset[str]] = frozenset({"github.com", "www.github.com"})
 GITHUB_DIFF_ACCEPT_HEADER: Final[str] = "application/vnd.github.diff"
@@ -492,7 +494,9 @@ async def fetch_pull_request_dry_run(
         raw_repo_id = base_repo.get("id") if isinstance(base_repo, dict) else None
         github_repo_id = (
             raw_repo_id
-            if isinstance(raw_repo_id, int) and not isinstance(raw_repo_id, bool)
+            if isinstance(raw_repo_id, int)
+            and not isinstance(raw_repo_id, bool)
+            and raw_repo_id > 0
             else None
         )
         config_ref = default_branch
@@ -634,6 +638,7 @@ async def run_cli_ai_review(
     embedder: GeminiEmbedder | None = None,
     llm_factory: LLMFactory | None = None,
     api_base_url: str = "https://api.github.com",
+    span_exporter: SpanExporter | None = None,
 ) -> CLIAIReviewBundle:
     """Run CLI AI PR review with best-effort Redis/Qdrant/PostgreSQL and optional GitHub publish."""
     active_settings = settings if settings is not None else get_settings()
@@ -765,16 +770,24 @@ async def run_cli_ai_review(
         if active_session_factory is not None:
             try:
                 async with active_session_factory() as db_session:
-                    if pr_bundle.github_repo_id is not None:
-                        db_repo_uuid = await db_session.scalar(
-                            sa.select(Repository.id).where(
-                                Repository.github_repo_id == pr_bundle.github_repo_id
-                            )
+                    try:
+                        # Ensure CLI and Webhook share the same canonical PostgreSQL UUID cache key.
+                        repo_row = await upsert_repository(
+                            db_session,
+                            github_repo_id=pr_bundle.github_repo_id,
+                            full_name=slug,
+                            default_branch=(pr_bundle.default_branch or "main")[:128],
+                            installation_id=None,
                         )
-                    if db_repo_uuid is None:
-                        db_repo_uuid = await db_session.scalar(
-                            sa.select(Repository.id).where(Repository.full_name == slug)
-                        )
+                        resolved_uuid = repo_row.id
+                        await db_session.commit()
+                        db_repo_uuid = resolved_uuid
+                    except Exception:
+                        try:
+                            await db_session.rollback()
+                        except Exception:
+                            pass
+                        raise
             except Exception as exc:
                 warnings.append(
                     f"PostgreSQL unavailable ({type(exc).__name__}); review history not persisted."
@@ -811,6 +824,7 @@ async def run_cli_ai_review(
             qdrant_store=active_qdrant,
             embedder=active_embedder,
             diff_source=pr_bundle.diff_source,
+            span_exporter=span_exporter,
         )
 
         published_review: PublishedReviewRecord | None = None
