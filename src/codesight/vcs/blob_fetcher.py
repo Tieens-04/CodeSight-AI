@@ -231,6 +231,10 @@ def slice_decoded_lines(
     eff_end = min(max(eff_start, end_line), total)
     selected = lines[eff_start - 1 : eff_end]
     raw_content = "\n".join(selected)
+    # Preserve the trailing newline when the slice ends on an empty line so line-preserving
+    # consumers (e.g. splice_source_lines) count the exact same number of lines as Git.
+    if selected and selected[-1] == "":
+        raw_content = f"{raw_content}\n"
     annotated = "\n".join(f"L{idx}: {line}" for idx, line in enumerate(selected, start=eff_start))
     return eff_start, eff_end, raw_content, annotated
 

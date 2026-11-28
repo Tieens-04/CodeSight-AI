@@ -648,3 +648,31 @@ def test_s2_07_docs_and_fixtures_in_tests_dir_do_not_suppress_p_untested() -> No
     assert rep_tsx_tested.added_test_logic_lines == 3
     assert rep_tsx_tested.test_files == ("src/__tests__/App.test.tsx",)
     assert rep_tsx_tested.is_untested is False
+
+
+def test_detect_missing_test_companion_supports_flat_nextjs_and_monorepo_layouts() -> None:
+    """P2-02: Flat Python, Next.js, and apps/* monorepos trigger P_untested."""
+    diff_parser = SmartDiffParser()
+    raw = (
+        _make_unified_diff("api/routes.py", [f"route_{i} = {i}" for i in range(20)])
+        + _make_unified_diff("pages/index.tsx", [f"export const p{i} = {i};" for i in range(20)])
+        + _make_unified_diff(
+            "apps/web/src/app.tsx", [f"export const a{i} = {i};" for i in range(20)]
+        )
+        + _make_unified_diff("scripts/seed_db.py", [f"seed_{i} = {i}" for i in range(60)])
+        + _make_unified_diff("conftest.py", [f"fix_{i} = {i}" for i in range(60)])
+        + _make_unified_diff("vite.config.ts", [f"export const c{i} = {i};" for i in range(60)])
+    )
+    report = detect_missing_test_companion(diff_parser.parse_diff(raw))
+    assert report.added_source_logic_lines == 60
+    assert report.source_files == ("api/routes.py", "pages/index.tsx", "apps/web/src/app.tsx")
+    assert report.is_untested is True
+
+    # Explicit source_globs override continues to filter strictly
+    strict_report = detect_missing_test_companion(
+        diff_parser.parse_diff(raw),
+        source_globs=("apps/*/src/**",),
+    )
+    assert strict_report.added_source_logic_lines == 20
+    assert strict_report.source_files == ("apps/web/src/app.tsx",)
+    assert strict_report.is_untested is False

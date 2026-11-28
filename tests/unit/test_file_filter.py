@@ -333,3 +333,11 @@ def test_char_class_ignore_case_handles_unicode_multi_char_upper() -> None:
     matcher = compile_posix_glob("src/[a-z].py", ignore_case=True)
     assert matcher.matches("src/A.py") is True
     assert matcher.matches("src/ß.py") is False
+
+
+def test_alembic_versions_filtered_as_migration() -> None:
+    """P3-03a: Alembic migration files under alembic/versions/ are skipped as migration noise."""
+    flt = FileFilter()
+    decision = flt.evaluate("alembic/versions/0001_initial.py", "@@ -1 +1 @@\n+op.create_table()\n")
+    assert decision.should_skip is True
+    assert decision.reason == FilterReason.MIGRATION

@@ -49,6 +49,7 @@ class RepoConfig(BaseModel):
     min_debt_score: int = Field(default=60, ge=0, le=100)
     review_action: ReviewAction = "COMMENT"
     ignore_paths: tuple[str, ...] = ()
+    source_globs: tuple[str, ...] | None = None
     custom_rules: str = ""
 
     @field_validator("min_debt_score", mode="before")
@@ -71,19 +72,30 @@ class RepoConfig(BaseModel):
     @field_validator("ignore_paths", mode="before")
     @classmethod
     def _validate_ignore_paths(cls, value: Any) -> tuple[str, ...]:
+        return cls._validate_glob_tuple(value, field_name="ignore_paths")
+
+    @field_validator("source_globs", mode="before")
+    @classmethod
+    def _validate_source_globs(cls, value: Any) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        return cls._validate_glob_tuple(value, field_name="source_globs")
+
+    @classmethod
+    def _validate_glob_tuple(cls, value: Any, *, field_name: str) -> tuple[str, ...]:
         if not isinstance(value, (list, tuple)):
-            raise ValueError("ignore_paths must be a list of glob strings.")
+            raise ValueError(f"{field_name} must be a list of glob strings.")
         if len(value) > MAX_IGNORE_PATHS:
-            raise ValueError(f"ignore_paths must contain at most {MAX_IGNORE_PATHS} patterns.")
+            raise ValueError(f"{field_name} must contain at most {MAX_IGNORE_PATHS} patterns.")
 
         cleaned_patterns: list[str] = []
         for item in value:
             if not isinstance(item, str) or "\x00" in item:
-                raise ValueError("Each ignore_paths entry must be a valid string without NUL.")
+                raise ValueError(f"Each {field_name} entry must be a valid string without NUL.")
             normalized = item.strip().replace("\\", "/")
             if not normalized or len(normalized) > MAX_IGNORE_PATTERN_CHARS:
                 raise ValueError(
-                    f"Each ignore_paths entry must be 1..{MAX_IGNORE_PATTERN_CHARS} characters."
+                    f"Each {field_name} entry must be 1..{MAX_IGNORE_PATTERN_CHARS} characters."
                 )
             compile_posix_glob(normalized)
             cleaned_patterns.append(normalized)
@@ -103,7 +115,7 @@ class RepoConfig(BaseModel):
     def config_hash(self) -> str:
         """Return deterministic 16-char SHA-256 hex digest for Redis blob cache keys (CA-21)."""
         canonical = json.dumps(
-            self.model_dump(mode="json"),
+            self.model_dump(mode="json", exclude_none=True),
             sort_keys=True,
             separators=(",", ":"),
         )

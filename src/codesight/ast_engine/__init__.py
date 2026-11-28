@@ -2,6 +2,7 @@
 
 from codesight.ast_engine._ast_utils import DEFAULT_MAX_CHUNK_LINES
 from codesight.ast_engine.complexity import (
+    DEFAULT_NON_SOURCE_GLOBS,
     DEFAULT_SOURCE_GLOBS,
     DEFAULT_TEST_GLOBS,
     ComplexityAnalyzer,
@@ -40,6 +41,7 @@ from codesight.ast_engine.typescript_parser import TypeScriptASTParser
 
 __all__ = [
     "DEFAULT_MAX_CHUNK_LINES",
+    "DEFAULT_NON_SOURCE_GLOBS",
     "DEFAULT_SOURCE_GLOBS",
     "DEFAULT_TEST_GLOBS",
     "MAX_SIGNATURE_CHARS",

@@ -109,6 +109,22 @@ DEFAULT_SOURCE_GLOBS: Final[tuple[str, ...]] = (
     "frontend/src/**",
     "packages/*/src/**",
 )
+DEFAULT_NON_SOURCE_GLOBS: Final[tuple[str, ...]] = (
+    "**/conftest.py",
+    "setup.py",
+    "noxfile.py",
+    "tasks.py",
+    "fabfile.py",
+    "**/migrations/**",
+    "**/alembic/**",
+    "docs/**",
+    "scripts/**",
+    "examples/**",
+    "evals/**",
+    "benchmarks/**",
+    "**/*.config.*",
+    "**/*.conf.*",
+)
 _CODE_SOURCE_EXTENSIONS: Final[frozenset[str]] = frozenset(
     {".py", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
 )
@@ -954,7 +970,7 @@ def detect_missing_test_companion(
     pr_diff: ParsedPullRequestDiff | Sequence[ParsedFileDiff],
     *,
     logic_line_threshold: int = 50,
-    source_globs: Sequence[str] = DEFAULT_SOURCE_GLOBS,
+    source_globs: Sequence[str] | None = None,
     test_globs: Sequence[str] = DEFAULT_TEST_GLOBS,
 ) -> TestCompanionReport:
     """Detect PRs adding > `logic_line_threshold` source logic lines without companion tests."""
@@ -962,7 +978,8 @@ def detect_missing_test_companion(
         raise ValueError("logic_line_threshold must be a non-negative integer.")
     files = pr_diff.files if isinstance(pr_diff, ParsedPullRequestDiff) else pr_diff
     test_matchers = _compile_globs(test_globs)
-    source_matchers = _compile_globs(source_globs)
+    source_matchers = _compile_globs(source_globs) if source_globs is not None else None
+    non_source_matchers = _compile_globs(DEFAULT_NON_SOURCE_GLOBS) if source_globs is None else ()
 
     added_source_logic = 0
     added_test_logic = 0
@@ -984,7 +1001,11 @@ def detect_missing_test_companion(
         if _matches_any(norm_path, test_matchers):
             added_test_logic += _count_added_logic_lines(parsed_file, norm_path)
             test_files.append(norm_path)
-        elif _matches_any(norm_path, source_matchers):
+        elif source_matchers is not None:
+            if _matches_any(norm_path, source_matchers):
+                added_source_logic += _count_added_logic_lines(parsed_file, norm_path)
+                source_files.append(norm_path)
+        elif not _matches_any(norm_path, non_source_matchers):
             added_source_logic += _count_added_logic_lines(parsed_file, norm_path)
             source_files.append(norm_path)
 

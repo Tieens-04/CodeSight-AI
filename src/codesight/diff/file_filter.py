@@ -121,7 +121,7 @@ DEFAULT_EXCLUSION_RULES: Final[tuple[tuple[FilterReason, tuple[str, ...]], ...]]
     ),
     (
         FilterReason.MIGRATION,
-        ("**/migrations/**",),
+        ("**/migrations/**", "**/alembic/versions/**"),
     ),
     (
         FilterReason.GENERATED,

@@ -168,7 +168,7 @@ async def _fetch_file_sources_in_ram(
 
     report = await blob_fetcher.fetch_slices(requests, installation_id=installation_id)
     for (side, norm_path), slice_res in zip(targets, report.slices, strict=True):
-        if slice_res.status != "ok" or not slice_res.content:
+        if slice_res.status != "ok":
             continue
         if side == "after":
             after_sources[norm_path] = slice_res.content
@@ -444,6 +444,7 @@ async def execute_ai_pr_review(
             merged_verified,
             file_complexities=file_complexities,
             parsed_diff=parsed_diff,
+            source_globs=repo_config.source_globs,
         )
         gate = evaluate_smart_quality_gate(breakdown, repo_config)
 

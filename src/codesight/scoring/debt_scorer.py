@@ -84,12 +84,17 @@ class TechnicalDebtScorer:
         file_complexities: Sequence[FileComplexityInput] = (),
         test_companion: TestCompanionReport | None = None,
         parsed_diff: ParsedPullRequestDiff | None = None,
+        source_globs: Sequence[str] | None = None,
     ) -> DebtScoreBreakdown:
         """Compute `100 - weighted_findings - complexity - untested` clamped to [0, 100]."""
         effective_companion = (
             test_companion
             if test_companion is not None
-            else (detect_missing_test_companion(parsed_diff) if parsed_diff is not None else None)
+            else (
+                detect_missing_test_companion(parsed_diff, source_globs=source_globs)
+                if parsed_diff is not None
+                else None
+            )
         )
 
         # Decimal accumulation avoids float addition order sensitivity across shuffled inputs.

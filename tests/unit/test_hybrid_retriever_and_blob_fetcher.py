@@ -1828,3 +1828,31 @@ async def test_retriever_separates_ambiguous_symbols_and_applies_affinity_gate()
 
     assert store.called_symbols_queries == [["UserRepository.update"], ["update"]]
     assert [c.symbol_name for c in res.callers] == ["patch_user", "sync_user_di"]
+
+
+@pytest.mark.asyncio
+async def test_blob_fetcher_preserves_trailing_blank_line_for_suggestion_splice() -> None:
+    """P1-02: Trailing blank lines in Git blobs preserve exact line count for splice."""
+    from codesight.ast_engine.suggestion_validator import splice_source_lines
+
+    src_with_trailing_blank = b"def f() -> int:\n    return 1\n\n"
+    sha = _sha1_blob(src_with_trailing_blank)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(f"/git/blobs/{sha}"):
+            return httpx.Response(200, json=_blob_json(src_with_trailing_blank, sha=sha))
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        fetcher = GitHubBlobFetcher(_make_auth(), http_client=client)
+        report = await fetcher.fetch_slices(
+            [BlobSliceRequest("acme/app", "src/trailing.py", 1, 100_000, blob_sha=sha)]
+        )
+
+    assert len(report.slices) == 1
+    sl = report.slices[0]
+    assert sl.status == "ok"
+    assert sl.total_file_lines == 3
+    spliced = splice_source_lines(sl.content, 3, 3, "# trailing")
+    assert spliced is not None
+    assert spliced.decode("utf-8") == "def f() -> int:\n    return 1\n# trailing\n"

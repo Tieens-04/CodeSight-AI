@@ -308,3 +308,13 @@ async def test_yaml_alias_bomb_rejected_and_same_origin_redirect_handled() -> No
         assert moved_cfg.min_debt_score == 91
         evil_cfg = await loader.load("org/evil")
         assert evil_cfg == RepoConfig()
+
+
+def test_repo_config_source_globs_optional_and_hash_compatible() -> None:
+    base_hash = RepoConfig().config_hash
+    explicit_none = RepoConfig(source_globs=None)
+    assert explicit_none.config_hash == base_hash
+
+    custom = parse_repo_config_yaml("source_globs:\n  - 'services/**'\n")
+    assert custom.source_globs == ("services/**",)
+    assert custom.config_hash != base_hash

@@ -192,6 +192,8 @@ class ComplexityDiffSummary:
 class TestCompanionReport:
     """Result of detecting added source logic lines lacking companion test changes."""
 
+    __test__ = False
+
     added_source_logic_lines: int
     added_test_logic_lines: int
     threshold: int
