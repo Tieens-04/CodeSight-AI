@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Final, Literal, Self
 import httpx
 import structlog
 
+from codesight import __version__
 from codesight.core.errors import (
     RateLimitTaskError,
     RetryableTaskError,
@@ -27,6 +28,8 @@ from codesight.vcs._http import (
     validate_positive_int,
 )
 from codesight.vcs.github_auth import (
+    GITHUB_ACCEPT_HEADER,
+    GITHUB_API_VERSION,
     GitHubAuthError,
     GitHubAuthProvider,
     validate_repo_full_name,
@@ -94,17 +97,26 @@ def _raise_for_github_status(
     )
 
 
+def _public_github_headers() -> dict[str, str]:
+    return {
+        "Accept": GITHUB_ACCEPT_HEADER,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "User-Agent": f"codesight-ai/{__version__}",
+    }
+
+
 class GitHubPullRequestClient:
     """Fetches PR unified diffs (with paginated /files fallback) in RAM over HTTP/2."""
 
     def __init__(
         self,
-        auth_provider: GitHubAuthProvider,
+        auth_provider: GitHubAuthProvider | None,
         *,
         http_client: httpx.AsyncClient | None = None,
         base_url: str = "https://api.github.com",
         timeout_seconds: float = 15.0,
         max_diff_bytes: int = MAX_DIFF_BYTES,
+        allow_public_fallback: bool = False,
     ) -> None:
         self._auth = auth_provider
         self._client = http_client
@@ -112,6 +124,28 @@ class GitHubPullRequestClient:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._max_diff_bytes = max_diff_bytes
+        self._allow_public_fallback = allow_public_fallback
+
+    async def _resolve_headers(
+        self,
+        *,
+        slug: str,
+        installation_id: int | None = None,
+    ) -> tuple[dict[str, str], bool]:
+        if self._auth is None:
+            if self._allow_public_fallback:
+                return _public_github_headers(), True
+            raise GitHubAuthError("GitHub authentication provider is required.")
+        try:
+            headers = await self._auth.get_auth_headers(
+                installation_id=installation_id,
+                repo_full_name=slug,
+            )
+            return headers, False
+        except GitHubAuthError:
+            if self._allow_public_fallback:
+                return _public_github_headers(), True
+            raise
 
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is not None and not self._owns_client and self._client.is_closed:
@@ -212,7 +246,7 @@ class GitHubPullRequestClient:
             )
             return None
 
-        if stream_res.status_code == 401 and installation_id is not None:
+        if stream_res.status_code == 401 and installation_id is not None and self._auth is not None:
             await self._auth.invalidate_installation_token(installation_id)
 
         if stream_res.status_code != 200:
@@ -250,7 +284,7 @@ class GitHubPullRequestClient:
                 f"{self._base_url}/repos/{slug}/pulls/{pull_number}/files?per_page=100&page={page}"
             )
             resp = await self._get_same_origin(url, slug=slug, headers=headers)
-            if resp.status_code == 401 and installation_id is not None:
+            if resp.status_code == 401 and installation_id is not None and self._auth is not None:
                 await self._auth.invalidate_installation_token(installation_id)
             _raise_for_github_status(
                 resp.status_code,
@@ -302,9 +336,9 @@ class GitHubPullRequestClient:
             FileFilter.from_repo_config(repo_config) if repo_config is not None else FileFilter()
         )
 
-        json_headers = await self._auth.get_auth_headers(
+        json_headers, _ = await self._resolve_headers(
+            slug=slug,
             installation_id=installation_id,
-            repo_full_name=slug,
         )
         diff_headers = {**json_headers, "Accept": GITHUB_DIFF_ACCEPT_HEADER}
         pr_url = f"{self._base_url}/repos/{slug}/pulls/{valid_pr}"
@@ -356,16 +390,26 @@ class GitHubPullRequestClient:
         """Fetch full 40-hex Git blob SHAs per normalized file path via `/pulls/{pr}/files`."""
         slug = validate_repo_full_name(repo_full_name)
         valid_pr = validate_positive_int(pull_number, name="pull_number")
-        headers = await self._auth.get_auth_headers(
-            installation_id=installation_id,
-            repo_full_name=slug,
-        )
-        entries = await self._fetch_paginated_files(
+        headers, used_public = await self._resolve_headers(
             slug=slug,
-            pull_number=valid_pr,
-            headers=headers,
             installation_id=installation_id,
         )
+        try:
+            entries = await self._fetch_paginated_files(
+                slug=slug,
+                pull_number=valid_pr,
+                headers=headers,
+                installation_id=installation_id,
+            )
+        except GitHubAuthError:
+            if not self._allow_public_fallback or used_public:
+                raise
+            entries = await self._fetch_paginated_files(
+                slug=slug,
+                pull_number=valid_pr,
+                headers=_public_github_headers(),
+                installation_id=None,
+            )
         sha_map: dict[str, str] = {}
         for entry in entries:
             if not entry.blob_sha:
@@ -397,6 +441,16 @@ class GitHubPullRequestClient:
             )
         except RateLimitTaskError:
             raise
+        except GitHubAuthError as exc:
+            if not self._allow_public_fallback:
+                raise
+            logger.warning(
+                "github_pr_blob_sha_enrichment_degraded",
+                repo=repo_full_name,
+                pr_number=pull_number,
+                error_type=type(exc).__name__,
+            )
+            return parsed_diff
         except (RetryableTaskError, GitHubPublishError) as exc:
             logger.warning(
                 "github_pr_blob_sha_enrichment_degraded",

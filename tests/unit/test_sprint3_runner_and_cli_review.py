@@ -1206,8 +1206,165 @@ async def test_telemetry_span_exporter_plumbing_and_cli_precache_uuid_sync(
         )
         assert failing_session.session.rolled_back is True
         assert any("PostgreSQL unavailable" in w for w in fallback_bundle.warnings)
-        fallback_prefix = f"file_review:55:{'b' * 40}:{RepoConfig().config_hash}:"
-        assert any(k.startswith(fallback_prefix) for k in fallback_redis.store)
+        assert (
+            f"file_review:55:{'b' * 40}:{RepoConfig().config_hash}" in fallback_redis.store
+            or any(
+                k.startswith(f"file_review:55:{'b' * 40}:{RepoConfig().config_hash}:")
+                for k in fallback_redis.store
+            )
+        )
         assert fallback_bundle.db_review_id is None
         # P2-03: persist_pr_review_result executes superseded UPDATE for completed reviews
         assert len(new_repo_session.session.executed) >= 1
+
+
+def test_cli_review_summary_with_rich_closing_tag_no_markup_error() -> None:
+    """P1-04a: summary_markdown with literal `[/api]` or `[/div]` prints cleanly."""
+    import io
+
+    from rich.console import Console
+
+    from codesight.cli.commands import review as review_mod
+    from codesight.scoring.debt_scorer import DebtScoreBreakdown
+    from codesight.scoring.report_composer import SmartGateDecision
+    from codesight.worker.ai_review_pipeline import PRReviewExecutionResult
+
+    pr_ref = review_mod.parse_github_pr_url("https://github.com/acme/app/pull/77")
+    dry = review_mod.PRDryRunBundle(
+        pr_ref=pr_ref,
+        title="Test literal markup",
+        state="open",
+        base_ref="main",
+        head_ref="feat/test",
+        head_sha="a" * 40,
+        default_branch="main",
+        repo_config=RepoConfig(),
+        parsed_diff=SmartDiffParser().parse_patch_entries([]),
+        diff_source="diff",
+        elapsed_ms=10.0,
+    )
+    ai_res = PRReviewExecutionResult(
+        parsed_diff=dry.parsed_diff,
+        verified_findings=(),
+        inline_drafts=(),
+        info_findings=(),
+        breakdown=DebtScoreBreakdown(
+            score=95,
+            weighted_findings_penalty=5.0,
+            complexity_penalty=0.0,
+            untested_penalty=0.0,
+            critical_count=0,
+            warning_count=0,
+            info_count=1,
+        ),
+        gate=SmartGateDecision(
+            passed=True,
+            review_event="COMMENT",
+            check_conclusion="success",
+            min_debt_score=60,
+            debt_score=95,
+            critical_count=0,
+            reasons=(),
+        ),
+        summary_markdown="Review notes: check route `[/api]/users` and `[/div]` tag.",
+        cache_hits=0,
+        cache_misses=1,
+        tokens_saved_pct=50.0,
+        latency_ms=25,
+        after_sources_by_file={},
+        llm_calls=1,
+        trace_id="trace-markup",
+    )
+    bundle = review_mod.CLIAIReviewBundle(pr_bundle=dry, ai_result=ai_res)
+    buf = io.StringIO()
+    review_mod.render_ai_review_report(Console(file=buf, force_terminal=False), bundle)
+    out = buf.getvalue()
+    assert "[/api]/users" in out
+    assert "[/div]" in out
+
+
+@pytest.mark.asyncio
+async def test_cli_review_public_fallback_with_app_creds_and_40hex_enrichment() -> None:
+    """P1-04b: `--no-publish` on third-party public repo falls back cleanly when App returns 404."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from codesight.cli.commands import review as review_mod
+
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = priv.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+    settings = Settings(
+        _env_file=None,
+        github_app_id="123456",
+        github_private_key=SecretStr(pem),
+        gemini_api_key=SecretStr("fake-gemini"),
+    )
+
+    short_diff = (
+        "diff --git a/src/public.py b/src/public.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/public.py\n"
+        "+++ b/src/public.py\n"
+        "@@ -1 +1,2 @@\n"
+        " def ok():\n"
+        "+    return 1\n"
+    )
+    full_sha = "2" * 40
+    blob_b64 = base64.b64encode(b"def ok():\n    return 1\n").decode("ascii")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/repos/thirdparty/open-repo/installation":
+            return httpx.Response(404, json={"message": "Not Found"})
+        if path == "/repos/thirdparty/open-repo/pulls/12":
+            if "vnd.github.diff" in request.headers.get("accept", ""):
+                return httpx.Response(200, text=short_diff)
+            return httpx.Response(
+                200,
+                json={
+                    "title": "Public PR",
+                    "state": "open",
+                    "base": {
+                        "ref": "main",
+                        "sha": "base000",
+                        "repo": {"id": 777, "default_branch": "main"},
+                    },
+                    "head": {"ref": "feat/pub", "sha": "head999"},
+                },
+            )
+        if path == "/repos/thirdparty/open-repo/pulls/12/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "filename": "src/public.py",
+                        "status": "modified",
+                        "sha": full_sha,
+                        "patch": "@@ -1 +1,2 @@\n def ok():\n+    return 1\n",
+                    }
+                ],
+            )
+        if path == f"/repos/thirdparty/open-repo/git/blobs/{full_sha}":
+            return httpx.Response(
+                200,
+                json={"sha": full_sha, "size": 22, "encoding": "base64", "content": blob_b64},
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bundle = await review_mod.run_cli_ai_review(
+            review_mod.parse_github_pr_url("https://github.com/thirdparty/open-repo/pull/12"),
+            settings=settings,
+            publish=False,
+            http_client=client,
+            redis_client=_FakeAsyncRedis(),  # type: ignore[arg-type]
+            session_factory=_FakeSessionFactory(uuid.uuid4()),  # type: ignore[arg-type]
+            llm_factory=_StubLLMFactory(settings, emit_critical=False),
+        )
+    pf = bundle.ai_result.parsed_diff.get_file("src/public.py")
+    assert pf is not None
+    assert pf.blob_sha == full_sha

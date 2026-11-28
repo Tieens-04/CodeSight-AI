@@ -25,7 +25,11 @@ from rich.table import Table
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from codesight import __version__
-from codesight.agents.llm_factory import LLMFactory
+from codesight.agents.llm_factory import (
+    LLMConfigurationError,
+    LLMFactory,
+    LLMStructuredOutputError,
+)
 from codesight.config_reader.repo_config import (
     CONFIG_FILENAMES,
     MAX_REPO_CONFIG_BYTES,
@@ -682,29 +686,24 @@ async def run_cli_ai_review(
         )
 
         parsed_diff = pr_bundle.parsed_diff
-        if auth_provider is not None:
-            pr_client = GitHubPullRequestClient(
-                auth_provider,
-                http_client=client,
-                base_url=api_base,
-            )
-            parsed_diff = await pr_client.enrich_missing_blob_shas(
-                slug,
-                pr_ref.pull_number,
-                parsed_diff,
-            )
-            blob_fetcher = GitHubBlobFetcher(
-                auth_provider,
-                http_client=client,
-                base_url=api_base,
-            )
-        else:
-            blob_fetcher = GitHubBlobFetcher(
-                None,
-                http_client=client,
-                base_url=api_base,
-                allow_public_fallback=True,
-            )
+        allow_public = not should_publish
+        pr_client = GitHubPullRequestClient(
+            auth_provider,
+            http_client=client,
+            base_url=api_base,
+            allow_public_fallback=allow_public,
+        )
+        parsed_diff = await pr_client.enrich_missing_blob_shas(
+            slug,
+            pr_ref.pull_number,
+            parsed_diff,
+        )
+        blob_fetcher = GitHubBlobFetcher(
+            auth_provider,
+            http_client=client,
+            base_url=api_base,
+            allow_public_fallback=allow_public,
+        )
 
         active_redis = redis_client
         sha_cache: RedisBlobSHACache | None = None
@@ -953,7 +952,7 @@ def render_ai_review_report(console: Console, bundle: CLIAIReviewBundle) -> None
         console.print(f"[yellow]Warning:[/yellow] {escape(warn)}")
 
     console.print("")
-    console.print(res.summary_markdown)
+    console.print(res.summary_markdown, markup=False)
 
 
 def review_command(
@@ -1005,9 +1004,15 @@ def review_command(
         )
         return
 
-    if not active_settings.has_gemini_api_key:
+    if not active_settings.has_active_llm_api_key:
+        required_key_var = {
+            "gemini": "GEMINI_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+        }[active_settings.llm_provider]
         err_console.print(
-            "[red]Error:[/red] GEMINI_API_KEY is required for full AI review. "
+            f"[red]Error:[/red] {required_key_var} is required for full AI review "
+            f"(LLM_PROVIDER={active_settings.llm_provider}). "
             "Pass [bold]--dry-run[/bold] for offline diff & hunk inspection."
         )
         raise typer.Exit(code=2)
@@ -1025,6 +1030,8 @@ def review_command(
         GitHubAuthError,
         GitHubBlobFetchError,
         GitHubPublishError,
+        LLMConfigurationError,
+        LLMStructuredOutputError,
         RateLimitTaskError,
         RetryableTaskError,
     ) as exc:
