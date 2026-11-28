@@ -73,6 +73,8 @@ class Settings(BaseSettings):
     gemini_embed_concurrency: int = Field(default=2, ge=1, le=10)
     index_task_soft_time_limit_seconds: int = Field(default=300, ge=30)
     index_task_hard_time_limit_seconds: int = Field(default=360, ge=60)
+    pr_task_soft_time_limit_seconds: int = Field(default=120, ge=30)
+    pr_task_hard_time_limit_seconds: int = Field(default=150, ge=60)
 
     # Multi-agent LangGraph LLM orchestration (kept separate from embedding limits)
     llm_provider: Literal["gemini", "openai", "anthropic"] = "gemini"
@@ -108,6 +110,10 @@ class Settings(BaseSettings):
         if self.index_task_hard_time_limit_seconds <= self.index_task_soft_time_limit_seconds:
             raise ValueError(
                 "INDEX_TASK_HARD_TIME_LIMIT_SECONDS must exceed INDEX_TASK_SOFT_TIME_LIMIT_SECONDS."
+            )
+        if self.pr_task_hard_time_limit_seconds <= self.pr_task_soft_time_limit_seconds:
+            raise ValueError(
+                "PR_TASK_HARD_TIME_LIMIT_SECONDS must exceed PR_TASK_SOFT_TIME_LIMIT_SECONDS."
             )
         cleaned_auditor = self.auditor_model.strip()
         cleaned_critic = self.critic_model.strip()

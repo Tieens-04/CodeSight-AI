@@ -55,6 +55,7 @@ async def probe_redis(settings: Settings) -> None:
     client = redis_async.from_url(
         settings.redis_url,
         socket_timeout=settings.health_timeout_seconds,
+        socket_connect_timeout=settings.health_timeout_seconds,
     )
     try:
         await client.ping()

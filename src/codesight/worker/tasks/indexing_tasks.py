@@ -250,6 +250,7 @@ class PushSyncRunner:
                     self._settings.redis_url,
                     decode_responses=True,
                     socket_timeout=0.5,
+                    socket_connect_timeout=0.5,
                 )
                 active_redis = owned_redis
 
@@ -318,6 +319,27 @@ class PushSyncRunner:
                 github_repo_id=github_repo_id,
                 installation_id=installation_id,
             )
+            if report.truncated_tree:
+                await self._record_webhook_status(
+                    delivery_id,
+                    webhook_status="failed",
+                    trace_id=active_trace_id,
+                )
+                logger.warning(
+                    "worker_push_sync_incomplete_truncated_tree",
+                    trace_id=active_trace_id,
+                    repo=repo_full_name,
+                    after_sha=after_sha,
+                    mode=report.mode,
+                    changed_files=report.changed_files,
+                    upserted_points=report.upserted_points,
+                    elapsed_ms=report.elapsed_ms,
+                )
+                return {
+                    "status": "incomplete",
+                    "mode": report.mode,
+                    "trace_id": active_trace_id,
+                }
             await self._record_webhook_status(
                 delivery_id,
                 webhook_status="processed",

@@ -713,6 +713,7 @@ async def run_cli_ai_review(
                     active_settings.redis_url,
                     decode_responses=True,
                     socket_timeout=0.5,
+                    socket_connect_timeout=0.5,
                 )
                 await owned_redis.ping()
                 active_redis = owned_redis

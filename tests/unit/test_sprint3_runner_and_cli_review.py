@@ -1368,3 +1368,123 @@ async def test_cli_review_public_fallback_with_app_creds_and_40hex_enrichment() 
     pf = bundle.ai_result.parsed_diff.get_file("src/public.py")
     assert pf is not None
     assert pf.blob_sha == full_sha
+
+
+@pytest.mark.asyncio
+async def test_sprint3_runner_publish_receipt_prevents_duplicate_github_post() -> None:
+    """P1-06b & P2-06b: Redis publish receipt stops duplicate POST and suppresses stub log."""
+    import io
+
+    from codesight.core.logging import configure_logging
+    from codesight.worker.lifecycle import execute_pr_review_lifecycle
+
+    settings = Settings(
+        _env_file=None,
+        github_token=SecretStr("ghp_test"),
+        gemini_api_key=SecretStr("fake-gemini"),
+    )
+    raw_diff = (
+        "diff --git a/src/svc.py b/src/svc.py\n"
+        f"index {'1' * 40}..{'a' * 40} 100644\n"
+        "--- a/src/svc.py\n"
+        "+++ b/src/svc.py\n"
+        "@@ -1 +1,2 @@\n"
+        " def f():\n"
+        "+    return 1\n"
+    )
+    post_review_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_review_calls
+        path = request.url.path
+        if path == "/repos/acme/app/pulls/33" and "vnd.github.diff" in request.headers.get(
+            "accept", ""
+        ):
+            return httpx.Response(200, text=raw_diff)
+        if path == "/repos/acme/app/pulls/33/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "filename": "src/svc.py",
+                        "status": "modified",
+                        "sha": "a" * 40,
+                        "patch": "@@ -1 +1,2 @@\n def f():\n+    return 1\n",
+                    }
+                ],
+            )
+        if path == "/repos/acme/app/contents/src/svc.py":
+            b64 = base64.b64encode(b"def f():\n    return 1\n").decode("ascii")
+            return httpx.Response(
+                200,
+                json={
+                    "type": "file",
+                    "sha": "a" * 40,
+                    "size": 20,
+                    "encoding": "base64",
+                    "content": b64,
+                },
+            )
+        if path == f"/repos/acme/app/git/blobs/{'a' * 40}":
+            b64 = base64.b64encode(b"def f():\n    return 1\n").decode("ascii")
+            return httpx.Response(
+                200,
+                json={"sha": "a" * 40, "size": 20, "encoding": "base64", "content": b64},
+            )
+        if path == "/repos/acme/app/check-runs" and request.method == "POST":
+            return httpx.Response(
+                201,
+                json={"id": 101, "name": "CodeSight-AI Review", "status": "in_progress"},
+            )
+        if path == "/repos/acme/app/check-runs/101" and request.method == "PATCH":
+            return httpx.Response(
+                200,
+                json={"id": 101, "name": "CodeSight-AI Review", "status": "completed"},
+            )
+        if path == "/repos/acme/app/pulls/33/reviews" and request.method == "POST":
+            post_review_calls += 1
+            return httpx.Response(
+                200, json={"id": 901, "html_url": "https://gh/r/901", "state": "COMMENTED"}
+            )
+        return httpx.Response(404)
+
+    shared_redis = _FakeAsyncRedis()
+    payload = {
+        "delivery_id": "deliv-retry-33",
+        "repo_id": str(uuid.uuid4()),
+        "repo_full_name": "acme/app",
+        "pr_number": 33,
+        "head_sha": "b" * 40,
+        "base_sha": "main",
+        "default_branch": "main",
+    }
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        runner = Sprint3PRReviewRunner(
+            settings=settings,
+            http_client=client,
+            redis_client=shared_redis,  # type: ignore[arg-type]
+            session_factory=_FakeSessionFactory(uuid.UUID(payload["repo_id"])),  # type: ignore[arg-type]
+            llm_factory=_StubLLMFactory(settings, emit_critical=False),
+        )
+        res1 = await runner.execute(payload)
+        res2 = await runner.execute(payload)
+
+    assert res1["status"] == "completed"
+    assert res2["status"] == "completed"
+    assert post_review_calls == 1
+
+    # P2-06b: live review_fn execution does not emit webhook_pr_stub_received
+    buf = io.StringIO()
+    configure_logging(level="INFO", service_name="test-lifecycle", stream=buf)
+
+    async def _noop_review(_ctx: Any) -> None:
+        return None
+
+    lc_out = await execute_pr_review_lifecycle(
+        {"repo_full_name": "acme/app", "pr_number": 33, "action": "opened"},
+        settings=settings,
+        review_fn=_noop_review,
+        check_entry_supersede=False,
+    )
+    assert lc_out["status"] == "accepted"
+    assert "webhook_pr_stub_received" not in buf.getvalue()

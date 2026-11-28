@@ -157,9 +157,16 @@ async def test_default_probes_execute_expected_client_calls(
         async def aclose(self) -> None:
             calls.append("redis:close")
 
-    def _fake_redis_from_url(url: str, *, socket_timeout: float) -> _FakeRedis:
+    def _fake_redis_from_url(
+        url: str,
+        *,
+        socket_timeout: float,
+        socket_connect_timeout: float | None = None,
+    ) -> _FakeRedis:
         assert url == settings.redis_url
         assert socket_timeout == settings.health_timeout_seconds
+        if socket_connect_timeout is not None:
+            assert socket_connect_timeout == settings.health_timeout_seconds
         return _FakeRedis()
 
     class _FakeResponse:

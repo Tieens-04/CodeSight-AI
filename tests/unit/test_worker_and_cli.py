@@ -708,3 +708,82 @@ def test_codesight_task_schedules_retry_on_soft_time_limit_for_pr_and_push_tasks
         handle_push_event.pop_request()
     assert push_final_flags == [False, True]
     push_retry_mock.assert_not_called()
+
+
+async def test_pr_task_timeouts_and_truncated_push_sync_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-06a & P2-06a: PR task limits are configurable and truncated tree marks failed."""
+    from types import SimpleNamespace
+    from typing import Any
+    from unittest.mock import MagicMock
+
+    import httpx
+    from pydantic import SecretStr, ValidationError
+
+    from codesight.core.config import Settings
+    from codesight.worker.celery_app import handle_pr_event
+    from codesight.worker.tasks.indexing_tasks import PushSyncRunner
+
+    defaults = Settings(_env_file=None)
+    assert defaults.pr_task_soft_time_limit_seconds == 120
+    assert defaults.pr_task_hard_time_limit_seconds == 150
+    assert getattr(handle_pr_event, "soft_time_limit", None) == 120
+    assert getattr(handle_pr_event, "time_limit", None) == 150
+    with pytest.raises(ValidationError, match="PR_TASK_HARD_TIME_LIMIT_SECONDS"):
+        Settings(
+            _env_file=None,
+            pr_task_soft_time_limit_seconds=120,
+            pr_task_hard_time_limit_seconds=120,
+        )
+
+    recorded: list[str] = []
+
+    class _TruncatedSyncer:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def sync_push(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                mode="full_bootstrap",
+                changed_files=100,
+                upserted_points=50,
+                elapsed_ms=25.0,
+                truncated_tree=True,
+                persisted_cursor=False,
+            )
+
+    runner = PushSyncRunner(
+        settings=Settings(
+            _env_file=None,
+            github_token=SecretStr("ghp_test"),
+            gemini_api_key=SecretStr("gem_test"),
+        ),
+        http_client=httpx.AsyncClient(),
+        redis_client=MagicMock(),
+        store=MagicMock(),
+        embedder=MagicMock(),
+    )
+
+    async def _rec(delivery_id: str | None, *, webhook_status: str, trace_id: str) -> None:
+        _ = delivery_id, trace_id
+        recorded.append(webhook_status)
+
+    monkeypatch.setattr(runner, "_record_webhook_status", _rec)
+    monkeypatch.setattr(
+        "codesight.worker.tasks.indexing_tasks.IncrementalBranchSyncer",
+        _TruncatedSyncer,
+    )
+    out = await runner.execute(
+        {
+            "delivery_id": "deliv-trunc",
+            "repo_id": "repo-1",
+            "repo_full_name": "acme/big",
+            "after_sha": "a" * 40,
+            "default_branch": "main",
+            "pushed_ref": "refs/heads/main",
+        }
+    )
+    assert out["status"] == "incomplete"
+    assert recorded == ["failed"]
+    await runner._http_client.aclose()  # type: ignore[union-attr]

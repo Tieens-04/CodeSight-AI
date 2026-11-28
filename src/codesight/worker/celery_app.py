@@ -42,7 +42,7 @@ from codesight.core.logging import (
 from codesight.db.session import create_db_engine, create_session_factory
 from codesight.rag.embedder import GeminiEmbedder
 from codesight.rag.qdrant_store import QdrantZeroCodeStore
-from codesight.vcs.github_auth import GitHubAuthConfigError
+from codesight.vcs.github_auth import GitHubAuthConfigError, GitHubAuthProvider
 from codesight.worker.lifecycle import (
     PRReviewLifecycleContext,
     classify_retryable_exception,
@@ -330,6 +330,8 @@ class _WorkerAsyncRuntime:
         self._qdrant_key: tuple[str, int, int, str] | None = None
         self._embedder: GeminiEmbedder | None = None
         self._embedder_key_hash: str | None = None
+        self._auth_provider: GitHubAuthProvider | None = None
+        self._auth_key: tuple[str, str, str, str] | None = None
 
     def _reset_fields(self) -> None:
         self._pid = None
@@ -346,6 +348,8 @@ class _WorkerAsyncRuntime:
         self._qdrant_key = None
         self._embedder = None
         self._embedder_key_hash = None
+        self._auth_provider = None
+        self._auth_key = None
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         with self._state_lock:
@@ -474,6 +478,7 @@ class _WorkerAsyncRuntime:
                     settings.redis_url,
                     decode_responses=True,
                     socket_timeout=0.5,
+                    socket_connect_timeout=0.5,
                     max_connections=10,
                 )
                 self._redis_url = settings.redis_url
@@ -567,6 +572,8 @@ class _WorkerAsyncRuntime:
             self._db_engine = None
             self._session_factory = None
             self._db_dsn = None
+        self._auth_provider = None
+        self._auth_key = None
 
     def shutdown(self) -> None:
         with self._state_lock:
@@ -638,6 +645,37 @@ class _WorkerAsyncRuntime:
                 error_type=type(exc).__name__,
             )
 
+    async def _ensure_auth_provider(
+        self,
+        settings: Settings,
+        *,
+        http_client: httpx.AsyncClient,
+        redis_client: redis_async.Redis,
+    ) -> GitHubAuthProvider:
+        app_id = (settings.github_app_id or "").strip()
+        priv_raw = (
+            settings.github_private_key.get_secret_value()
+            if settings.github_private_key is not None
+            else ""
+        )
+        tok_raw = (
+            settings.github_token.get_secret_value() if settings.github_token is not None else ""
+        )
+        key_fp = (
+            app_id,
+            hashlib.sha256(priv_raw.encode()).hexdigest(),
+            hashlib.sha256(tok_raw.encode()).hexdigest(),
+            settings.redis_url,
+        )
+        if self._auth_provider is None or self._auth_key != key_fp:
+            self._auth_provider = GitHubAuthProvider(
+                settings,
+                redis_client=redis_client,
+                http_client=http_client,
+            )
+            self._auth_key = key_fp
+        return self._auth_provider
+
     def run_pr_webhook_task_sync(
         self,
         payload: Mapping[str, Any],
@@ -653,6 +691,11 @@ class _WorkerAsyncRuntime:
             if coords is not None and has_repo_slug and has_github_credentials(active_settings):
                 http_client, redis_client, session_factory = await self._ensure_pools(
                     active_settings
+                )
+                auth_provider = await self._ensure_auth_provider(
+                    active_settings,
+                    http_client=http_client,
+                    redis_client=redis_client,
                 )
                 store: QdrantZeroCodeStore | None = None
                 embedder: GeminiEmbedder | None = None
@@ -673,6 +716,7 @@ class _WorkerAsyncRuntime:
                     redis_client=redis_client,
                     qdrant_store=store,
                     embedder=embedder,
+                    auth_provider=auth_provider,
                     is_final_attempt=is_final_attempt,
                 )
             return await run_pr_webhook_task(
@@ -737,10 +781,11 @@ async def run_pr_webhook_task(
     qdrant_store: QdrantZeroCodeStore | None = None,
     embedder: GeminiEmbedder | None = None,
     llm_factory: LLMFactory | None = None,
+    auth_provider: GitHubAuthProvider | None = None,
     api_base_url: str = "https://api.github.com",
     is_final_attempt: bool = False,
 ) -> dict[str, str]:
-    """Execute Sprint 3 AI PR review when Gemini credentials exist, else Week 1 runner."""
+    """Execute Sprint 3 AI PR review when active LLM credentials exist, else Week 1 runner."""
     active_settings = settings if settings is not None else get_settings()
     coords = extract_pr_coords(payload)
     repo_full_name = payload.get("repo_full_name")
@@ -755,6 +800,7 @@ async def run_pr_webhook_task(
                 qdrant_store=qdrant_store,
                 embedder=embedder,
                 llm_factory=llm_factory,
+                auth_provider=auth_provider,
                 api_base_url=api_base_url,
             )
             return await sprint3_runner.execute(payload, is_final_attempt=is_final_attempt)
@@ -763,6 +809,7 @@ async def run_pr_webhook_task(
             http_client=http_client,
             session_factory=session_factory,
             redis_client=redis_client,
+            auth_provider=auth_provider,
             api_base_url=api_base_url,
         )
         return await runner.execute(payload, is_final_attempt=is_final_attempt)
@@ -784,7 +831,15 @@ async def run_pr_webhook_task(
     )
 
 
-@_typed_task(celery_app, name="codesight.webhook.handle_pr_event")
+_TASK_SETTINGS = get_settings()
+
+
+@_typed_task(
+    celery_app,
+    name="codesight.webhook.handle_pr_event",
+    soft_time_limit=_TASK_SETTINGS.pr_task_soft_time_limit_seconds,
+    time_limit=_TASK_SETTINGS.pr_task_hard_time_limit_seconds,
+)
 def handle_pr_event(payload: dict[str, Any]) -> dict[str, str]:
     """Handle pull_request webhook events through the Day 3-6 Supersede + Review spine."""
     trace_id = get_trace_id() or "-"
@@ -843,7 +898,7 @@ def _dispatch_push_task(task_obj: Any, payload: dict[str, Any]) -> dict[str, str
     return {"status": "accepted", "trace_id": trace_id}
 
 
-_PUSH_TASK_SETTINGS = get_settings()
+_PUSH_TASK_SETTINGS = _TASK_SETTINGS
 
 
 @_typed_task(

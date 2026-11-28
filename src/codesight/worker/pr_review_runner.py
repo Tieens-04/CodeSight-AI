@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from codesight.agents.llm_factory import LLMFactory
 from codesight.config_reader.repo_config import RepoConfigLoader
 from codesight.core.config import Settings, get_settings
-from codesight.core.errors import RetryableTaskError
+from codesight.core.errors import RateLimitTaskError, RetryableTaskError
 from codesight.core.logging import bind_trace_id, clear_trace_context, get_trace_id
 from codesight.db.models import PRReview, Repository, WebhookEvent
 from codesight.diff.models import ParsedPullRequestDiff
@@ -27,11 +28,16 @@ from codesight.rag.qdrant_store import QdrantZeroCodeStore
 from codesight.scoring.report_composer import ReportComposer
 from codesight.vcs.blob_fetcher import GitHubBlobFetcher
 from codesight.vcs.github_auth import GitHubAuthError, GitHubAuthProvider
-from codesight.vcs.github_pr_client import FetchedPullRequestDiff, GitHubPullRequestClient
+from codesight.vcs.github_pr_client import (
+    FetchedPullRequestDiff,
+    GitHubPullRequestClient,
+    apply_blob_shas_to_parsed_diff,
+)
 from codesight.vcs.github_publisher import (
     CheckConclusion,
     GitHubPublishError,
     GitHubReviewPublisher,
+    PublishedReviewRecord,
     ReviewCommentDraft,
     format_markdown_code_span,
 )
@@ -225,12 +231,14 @@ class _BasePRReviewRunner:
         http_client: httpx.AsyncClient | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         redis_client: redis_async.Redis | None = None,
+        auth_provider: GitHubAuthProvider | None = None,
         api_base_url: str = "https://api.github.com",
     ) -> None:
         self._settings = settings if settings is not None else get_settings()
         self._http_client = http_client
         self._session_factory = session_factory
         self._redis_client = redis_client
+        self._auth_provider = auth_provider
         self._api_base_url = api_base_url.rstrip("/")
 
     async def _is_delivery_already_processed(
@@ -425,14 +433,19 @@ class _BasePRReviewRunner:
                 self._settings.redis_url,
                 decode_responses=True,
                 socket_timeout=0.5,
+                socket_connect_timeout=0.5,
             )
             active_redis = owned_redis
 
-        auth = GitHubAuthProvider(
-            self._settings,
-            redis_client=active_redis,
-            http_client=active_http,
-            base_url=self._api_base_url,
+        auth = (
+            self._auth_provider
+            if self._auth_provider is not None
+            else GitHubAuthProvider(
+                self._settings,
+                redis_client=active_redis,
+                http_client=active_http,
+                base_url=self._api_base_url,
+            )
         )
         infra = _RunnerInfra(
             auth=auth,
@@ -891,6 +904,7 @@ class Sprint3PRReviewRunner(_BasePRReviewRunner):
         qdrant_store: QdrantZeroCodeStore | None = None,
         embedder: GeminiEmbedder | None = None,
         llm_factory: LLMFactory | None = None,
+        auth_provider: GitHubAuthProvider | None = None,
         api_base_url: str = "https://api.github.com",
         span_exporter: SpanExporter | None = None,
     ) -> None:
@@ -899,6 +913,7 @@ class Sprint3PRReviewRunner(_BasePRReviewRunner):
             http_client=http_client,
             session_factory=session_factory,
             redis_client=redis_client,
+            auth_provider=auth_provider,
             api_base_url=api_base_url,
         )
         self._qdrant_store = qdrant_store
@@ -994,17 +1009,39 @@ class Sprint3PRReviewRunner(_BasePRReviewRunner):
                 installation_id=installation_id,
                 output_summary="Running AST/RAG analysis, SHA cache lookup, and Debt Scorer.",
             )
-            fetched_diff = await infra.pr_client.fetch_pull_request_diff(
-                repo_full_name,
-                pr_number,
-                repo_config=ctx.repo_config,
-                installation_id=installation_id,
+
+            async def _fetch_blob_shas_safe() -> dict[str, str]:
+                try:
+                    return await infra.pr_client.fetch_pr_file_blob_shas(
+                        repo_full_name,
+                        pr_number,
+                        installation_id=installation_id,
+                    )
+                except RateLimitTaskError:
+                    raise
+                except (RetryableTaskError, GitHubPublishError, GitHubAuthError) as exc:
+                    logger.warning(
+                        "github_pr_blob_sha_enrichment_degraded",
+                        repo=repo_full_name,
+                        pr_number=pr_number,
+                        error_type=type(exc).__name__,
+                    )
+                    return {}
+
+            diff_res, sha_map = await asyncio.gather(
+                infra.pr_client.fetch_pull_request_diff(
+                    repo_full_name,
+                    pr_number,
+                    repo_config=ctx.repo_config,
+                    installation_id=installation_id,
+                ),
+                _fetch_blob_shas_safe(),
             )
-            enriched_diff = await infra.pr_client.enrich_missing_blob_shas(
-                repo_full_name,
-                pr_number,
-                fetched_diff.parsed_diff,
-                installation_id=installation_id,
+            fetched_diff = diff_res
+            enriched_diff = (
+                apply_blob_shas_to_parsed_diff(diff_res.parsed_diff, sha_map)
+                if sha_map and diff_res.diff_source == "diff"
+                else diff_res.parsed_diff
             )
             blob_fetcher = GitHubBlobFetcher(
                 infra.auth,
@@ -1028,9 +1065,64 @@ class Sprint3PRReviewRunner(_BasePRReviewRunner):
                 sha_cache=sha_cache,
                 qdrant_store=self._qdrant_store,
                 embedder=self._embedder,
-                diff_source=fetched_diff.diff_source,
+                diff_source=diff_res.diff_source,
                 span_exporter=self._span_exporter,
             )
+
+        async def _load_publish_receipt(
+            receipt_key: str, active_redis: redis_async.Redis
+        ) -> PublishedReviewRecord | None:
+            try:
+                raw_receipt = await active_redis.get(receipt_key)
+            except (redis.exceptions.RedisError, TimeoutError, OSError):
+                return None
+            if not raw_receipt:
+                return None
+            try:
+                text = (
+                    raw_receipt.decode("utf-8", errors="replace")
+                    if isinstance(raw_receipt, bytes)
+                    else str(raw_receipt)
+                )
+                data = json.loads(text)
+                if not isinstance(data, dict):
+                    return None
+                return PublishedReviewRecord(
+                    review_id=data.get("review_id"),
+                    html_url=data.get("html_url"),
+                    state=str(data.get("state", "COMMENTED")),
+                    inline_count=int(data.get("inline_count", 0)),
+                    downgraded_count=int(data.get("downgraded_count", 0)),
+                    used_422_fallback=bool(data.get("used_422_fallback", False)),
+                )
+            except (ValueError, TypeError):
+                return None
+
+        async def _save_publish_receipt(
+            receipt_key: str,
+            active_redis: redis_async.Redis,
+            rec: PublishedReviewRecord,
+            *,
+            trace_id: str,
+        ) -> None:
+            payload_json = json.dumps(
+                {
+                    "review_id": rec.review_id,
+                    "html_url": rec.html_url,
+                    "state": rec.state,
+                    "inline_count": rec.inline_count,
+                    "downgraded_count": rec.downgraded_count,
+                    "used_422_fallback": rec.used_422_fallback,
+                }
+            )
+            try:
+                await active_redis.set(receipt_key, payload_json, ex=86_400)
+            except (redis.exceptions.RedisError, TimeoutError, OSError) as exc:
+                logger.warning(
+                    "worker_pr_publish_receipt_write_failed",
+                    trace_id=trace_id,
+                    error_type=type(exc).__name__,
+                )
 
         async def _run_publish(
             ctx: PRReviewLifecycleContext,
@@ -1041,20 +1133,40 @@ class Sprint3PRReviewRunner(_BasePRReviewRunner):
                 raise RuntimeError(
                     "_publish_fn invoked before ai_result was populated by _review_fn."
                 )
-            published = await infra.publisher.publish_review(
-                repo_full_name,
-                pr_number,
-                head_sha=head_sha,
-                parsed_diff=ai_result.parsed_diff,
-                drafts=ai_result.inline_drafts,
-                summary_body=ai_result.summary_markdown,
-                event=ai_result.gate.review_event,
-                supersede_lock=ctx.supersede_lock,
-                repo_id=repo_id,
-                check_run_id=state.check_run_id,
-                installation_id=installation_id,
-                after_sources_by_file=ai_result.after_sources_by_file,
+            receipt_key = (
+                f"pr_publish_receipt:{repo_id}:{pr_number}:{head_sha}:{delivery_id or 'nodelivery'}"
             )
+            published = await _load_publish_receipt(receipt_key, infra.active_redis)
+            if published is not None:
+                logger.info(
+                    "worker_pr_publish_receipt_reused",
+                    trace_id=ctx.trace_id,
+                    repo=repo_full_name,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    review_id=published.review_id,
+                )
+            else:
+                published = await infra.publisher.publish_review(
+                    repo_full_name,
+                    pr_number,
+                    head_sha=head_sha,
+                    parsed_diff=ai_result.parsed_diff,
+                    drafts=ai_result.inline_drafts,
+                    summary_body=ai_result.summary_markdown,
+                    event=ai_result.gate.review_event,
+                    supersede_lock=ctx.supersede_lock,
+                    repo_id=repo_id,
+                    check_run_id=state.check_run_id,
+                    installation_id=installation_id,
+                    after_sources_by_file=ai_result.after_sources_by_file,
+                )
+                await _save_publish_receipt(
+                    receipt_key,
+                    infra.active_redis,
+                    published,
+                    trace_id=ctx.trace_id,
+                )
             latency_ms = max(0, int((time.perf_counter() - started_perf) * 1000))
             if state.check_run_id is not None:
                 check_title, check_summary = ReportComposer().compose_check_summary(

@@ -162,6 +162,7 @@ async def execute_pr_review_lifecycle(
             active_settings.redis_url,
             decode_responses=True,
             socket_timeout=0.5,
+            socket_connect_timeout=0.5,
         )
         active_lock = AsyncSupersedeLock(owned_redis)
 
@@ -254,14 +255,15 @@ async def execute_pr_review_lifecycle(
                         )
                 return {"status": "superseded", "trace_id": trace_id}
 
-        logger.info(
-            "webhook_pr_stub_received",
-            trace_id=trace_id,
-            repo=str(payload.get("repo_full_name", "")),
-            pr_number=payload.get("pr_number"),
-            action=payload.get("action"),
-            config_hash=repo_config.config_hash,
-        )
+        if review_fn is None and publish_fn is None:
+            logger.info(
+                "webhook_pr_stub_received",
+                trace_id=trace_id,
+                repo=str(payload.get("repo_full_name", "")),
+                pr_number=payload.get("pr_number"),
+                action=payload.get("action"),
+                config_hash=repo_config.config_hash,
+            )
         return {"status": "accepted", "trace_id": trace_id}
     finally:
         if owned_redis is not None:

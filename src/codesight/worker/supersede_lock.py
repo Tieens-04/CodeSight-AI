@@ -511,6 +511,7 @@ def is_pr_event_superseded(
             get_settings().redis_url,
             decode_responses=True,
             socket_timeout=0.5,
+            socket_connect_timeout=0.5,
         )
     )
     try:
