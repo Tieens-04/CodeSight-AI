@@ -352,8 +352,9 @@ def mask_otel_spans_allowlist(params: MaskOtelSpansParams) -> MaskOtelSpansResul
 class _ResilientSpanExporter(SpanExporter):
     """Wraps an OTel SpanExporter so export/flush failures degrade telemetry without crashing."""
 
-    def __init__(self, inner: SpanExporter) -> None:
+    def __init__(self, inner: SpanExporter, *, close_inner: bool = True) -> None:
         self._inner = inner
+        self._close_inner = close_inner
         self._lock = threading.Lock()
         self._error_seq = 0
         self.last_error_type: str | None = None
@@ -410,6 +411,8 @@ class _ResilientSpanExporter(SpanExporter):
             return False
 
     def shutdown(self) -> None:
+        if not self._close_inner:
+            return
         try:
             self._inner.shutdown()
         except Exception as exc:
@@ -820,7 +823,8 @@ class LangfuseTraceSession:
                         error_type = type(exc).__name__
                 finally:
                     if self._public_key is not None:
-                        LangfuseResourceManager._instances.pop(self._public_key, None)
+                        with _CLIENT_CACHE_LOCK:
+                            LangfuseResourceManager._instances.pop(self._public_key, None)
 
         if self._handler is not None and self._handler.degraded and error_type is None:
             error_type = self._handler.last_error_type or "CallbackError"
@@ -963,20 +967,21 @@ def create_langfuse_trace_session(
     try:
         isolated = span_exporter is not None
         if span_exporter is not None:
-            resilient_exporter = _ResilientSpanExporter(span_exporter)
+            resilient_exporter = _ResilientSpanExporter(span_exporter, close_inner=False)
             # Clear any stale cached test client for the same public_key and isolate TracerProvider.
-            LangfuseResourceManager._instances.pop(public_key, None)
-            client = Langfuse(
-                public_key=public_key,
-                secret_key=secret_key,
-                base_url=cfg.langfuse_host,
-                environment=cfg.app_env,
-                tracing_enabled=True,
-                mask=sanitize_telemetry_value,
-                mask_otel_spans=mask_otel_spans_allowlist,
-                tracer_provider=TracerProvider(),
-                span_exporter=resilient_exporter,
-            )
+            with _CLIENT_CACHE_LOCK:
+                LangfuseResourceManager._instances.pop(public_key, None)
+                client = Langfuse(
+                    public_key=public_key,
+                    secret_key=secret_key,
+                    base_url=cfg.langfuse_host,
+                    environment=cfg.app_env,
+                    tracing_enabled=True,
+                    mask=sanitize_telemetry_value,
+                    mask_otel_spans=mask_otel_spans_allowlist,
+                    tracer_provider=TracerProvider(),
+                    span_exporter=resilient_exporter,
+                )
         else:
             client, resilient_exporter = _get_or_create_cached_langfuse_client(
                 public_key=public_key,

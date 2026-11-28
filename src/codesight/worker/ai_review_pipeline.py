@@ -8,7 +8,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import sqlalchemy as sa
 import structlog
@@ -18,7 +18,7 @@ from codesight.agents.graph import run_pr_review_graph
 from codesight.agents.llm_factory import LLMFactory
 from codesight.agents.nodes.context_builder import PRReviewContext
 from codesight.agents.nodes.critic_agent import deduplicate_verified_findings
-from codesight.agents.schemas import VerifiedFinding
+from codesight.agents.schemas import TelemetryStatus, VerifiedFinding
 from codesight.ast_engine.models import PRFileContext
 from codesight.ast_engine.registry import ASTParserRegistry
 from codesight.config_reader.repo_config import RepoConfig
@@ -53,6 +53,9 @@ from codesight.worker.sha_cache import (
     is_full_blob_sha,
 )
 
+if TYPE_CHECKING:
+    from opentelemetry.sdk.trace.export import SpanExporter
+
 MAX_FULL_BLOB_LINES: Final[int] = 100_000
 
 logger = structlog.get_logger("codesight.worker.ai_review_pipeline")
@@ -76,6 +79,7 @@ class PRReviewExecutionResult:
     after_sources_by_file: dict[str, str]
     llm_calls: int
     trace_id: str
+    telemetry: TelemetryStatus | None = None
 
 
 def _normalize_text_sources(
@@ -230,6 +234,7 @@ async def execute_ai_pr_review(
     in_memory_after_sources: Mapping[str, str | bytes] | None = None,
     in_memory_before_sources: Mapping[str, str | bytes] | None = None,
     diff_source: str = "diff",
+    span_exporter: SpanExporter | None = None,
 ) -> PRReviewExecutionResult:
     """Execute SHA-cached AST + Hybrid RAG + LangGraph review, Debt Scorer, and Smart Gate."""
     started = time.perf_counter()
@@ -259,6 +264,7 @@ async def execute_ai_pr_review(
     fresh_complexities: dict[str, FileComplexityInput] = {}
     llm_calls = 0
     rag_degraded = False
+    telemetry: TelemetryStatus | None = None
 
     try:
         if reviewable_uncached:
@@ -336,9 +342,11 @@ async def execute_ai_pr_review(
                 head_sha=head_sha,
                 trace_id=trace_id,
                 settings=settings,
+                span_exporter=span_exporter,
             )
             fresh_findings = list(final_state.verified_findings)
             llm_calls = len(final_state.llm_metrics)
+            telemetry = final_state.telemetry
 
             if sha_cache is not None and not rag_degraded:
                 ineligible_paths: set[str] = {
@@ -476,6 +484,7 @@ async def execute_ai_pr_review(
             after_sources_by_file=after_sources,
             llm_calls=llm_calls,
             trace_id=trace_id,
+            telemetry=telemetry,
         )
     except BaseException:
         after_sources.clear()
