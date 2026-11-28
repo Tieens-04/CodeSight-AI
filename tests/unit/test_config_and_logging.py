@@ -1,9 +1,11 @@
 """Unit tests for Settings configuration and structured JSON logging."""
 
+import asyncio
 import io
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 import structlog
@@ -189,3 +191,61 @@ def test_settings_loads_live_eval_overrides_from_dotenv_without_shell_env(
     assert loaded.codesight_live_py_repo == "org/dotenv-py"
     assert loaded.codesight_live_ts_repo == "org/dotenv-ts"
     assert loaded.codesight_qdrant_container == "codesight-qdrant-custom"
+
+
+@pytest.mark.asyncio
+async def test_langfuse_isolated_session_disposes_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-04: CancelledError in run_pr_review_graph disposes isolated TracerProvider."""
+    from langfuse._client.resource_manager import LangfuseResourceManager
+
+    from codesight.agents.graph import run_pr_review_graph
+    from codesight.agents.llm_factory import LLMFactory
+    from codesight.diff.models import PatchFileEntry
+    from codesight.diff.smart_diff_parser import SmartDiffParser
+
+    pub_key = f"pk-lf-cancel-{id(monkeypatch)}"
+    cfg = Settings(
+        _env_file=None,
+        langfuse_tracing_enabled=True,
+        langfuse_public_key=pub_key,
+        langfuse_secret_key=SecretStr("sk-lf-cancel-test"),
+        gemini_api_key=SecretStr("fake-gemini"),
+    )
+
+    class _DummyExporter:
+        def export(self, _spans: Any) -> Any:
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+        def force_flush(self, _timeout_millis: int = 30000) -> bool:
+            return True
+
+    class _FakeCompiled:
+        async def ainvoke(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        "codesight.agents.graph.build_pr_review_graph",
+        lambda *_a, **_kw: _FakeCompiled(),
+    )
+    diff = SmartDiffParser().parse_patch_entries(
+        [
+            PatchFileEntry(
+                filename="src/a.py",
+                status="modified",
+                patch="@@ -1 +1,2 @@\n x = 1\n+y = 2\n",
+            )
+        ]
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await run_pr_review_graph(
+            parsed_diff=diff,
+            llm_factory=LLMFactory(settings=cfg),
+            settings=cfg,
+            span_exporter=_DummyExporter(),
+        )
+    assert pub_key not in LangfuseResourceManager._instances

@@ -746,7 +746,7 @@ async def run_pr_webhook_task(
     repo_full_name = payload.get("repo_full_name")
     has_repo_slug = isinstance(repo_full_name, str) and bool(repo_full_name.strip())
     if coords is not None and has_repo_slug and has_github_credentials(active_settings):
-        if active_settings.has_gemini_api_key or llm_factory is not None:
+        if active_settings.has_active_llm_api_key or llm_factory is not None:
             sprint3_runner = Sprint3PRReviewRunner(
                 settings=active_settings,
                 http_client=http_client,

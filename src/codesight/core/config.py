@@ -20,6 +20,7 @@ GEMINI_MODEL_PRICING_USD_PER_1M: Final[dict[str, tuple[float, float]]] = {
     "gemini-4-carbon": (2.00, 10.00),
 }
 ALLOWED_GEMINI_CRITIC_MODELS: Final[frozenset[str]] = frozenset(GEMINI_MODEL_PRICING_USD_PER_1M)
+ALLOWED_GEMINI_AUDITOR_MODELS: Final[frozenset[str]] = ALLOWED_GEMINI_CRITIC_MODELS
 
 
 class Settings(BaseSettings):
@@ -86,6 +87,8 @@ class Settings(BaseSettings):
     github_webhook_secret: SecretStr | None = None
     github_token: SecretStr | None = None
     gemini_api_key: SecretStr | None = None
+    openai_api_key: SecretStr | None = None
+    anthropic_api_key: SecretStr | None = None
     langfuse_public_key: str | None = None
     langfuse_secret_key: SecretStr | None = None
     langfuse_host: str = "https://cloud.langfuse.com"
@@ -114,12 +117,19 @@ class Settings(BaseSettings):
             raise ValueError("CRITIC_MODEL must not be empty.")
         self.auditor_model = cleaned_auditor
         self.critic_model = cleaned_critic
-        if self.llm_provider == "gemini" and cleaned_critic not in ALLOWED_GEMINI_CRITIC_MODELS:
-            raise ValueError(
-                "CRITIC_MODEL must be a supported Gemini model "
-                "(e.g. 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3.5-flash-lite') "
-                "when LLM_PROVIDER is 'gemini'."
-            )
+        if self.llm_provider == "gemini":
+            if cleaned_auditor not in ALLOWED_GEMINI_AUDITOR_MODELS:
+                raise ValueError(
+                    "AUDITOR_MODEL must be a supported Gemini model "
+                    "(e.g. 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3.5-flash-lite') "
+                    "when LLM_PROVIDER is 'gemini'."
+                )
+            if cleaned_critic not in ALLOWED_GEMINI_CRITIC_MODELS:
+                raise ValueError(
+                    "CRITIC_MODEL must be a supported Gemini model "
+                    "(e.g. 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3.5-flash-lite') "
+                    "when LLM_PROVIDER is 'gemini'."
+                )
         return self
 
     @property
@@ -147,6 +157,19 @@ class Settings(BaseSettings):
         """Return True when a non-empty GEMINI_API_KEY is configured."""
         return bool(
             self.gemini_api_key is not None and self.gemini_api_key.get_secret_value().strip()
+        )
+
+    @property
+    def has_active_llm_api_key(self) -> bool:
+        """Return True when the API key required by the active `llm_provider` is configured."""
+        if self.llm_provider == "gemini":
+            return self.has_gemini_api_key
+        if self.llm_provider == "openai":
+            return bool(
+                self.openai_api_key is not None and self.openai_api_key.get_secret_value().strip()
+            )
+        return bool(
+            self.anthropic_api_key is not None and self.anthropic_api_key.get_secret_value().strip()
         )
 
     @property

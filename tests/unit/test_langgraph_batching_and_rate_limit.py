@@ -303,6 +303,8 @@ class TestConfigAndModelSelection:
 
         with pytest.raises(ValidationError):
             Settings(_env_file=None, critic_model="gemini-invalid-99")  # type: ignore[call-arg]
+        with pytest.raises(ValidationError, match="AUDITOR_MODEL"):
+            Settings(_env_file=None, auditor_model="gemini-invalid-99")  # type: ignore[call-arg]
 
     def test_llm_factory_selects_models_and_disables_sdk_retries(self) -> None:
         flash_settings = Settings(
@@ -354,9 +356,9 @@ class TestConfigAndModelSelection:
         custom_via_reg.register_provider("custom", lambda *_args: stub_model)  # type: ignore[arg-type, return-value]
         assert custom_via_reg.build_chat_model("critic") is stub_model
 
-        # Optional providers surface actionable LLMConfigurationError if package not installed
+        # Optional providers: missing API key & missing optional package both fail clearly
         openai_factory = LLMFactory(settings=no_key, provider="openai", auditor_model="gpt-4o-mini")
-        with pytest.raises(LLMConfigurationError, match="langchain-openai"):
+        with pytest.raises(LLMConfigurationError, match="OPENAI_API_KEY"):
             openai_factory.build_chat_model("security_auditor")
 
         anthropic_factory = LLMFactory(
@@ -364,8 +366,38 @@ class TestConfigAndModelSelection:
             provider="anthropic",
             auditor_model="claude-3-5-sonnet",
         )
-        with pytest.raises(LLMConfigurationError, match="langchain-anthropic"):
+        with pytest.raises(LLMConfigurationError, match="ANTHROPIC_API_KEY"):
             anthropic_factory.build_chat_model("security_auditor")
+
+        with patch(
+            "codesight.agents.llm_factory.importlib.import_module",
+            side_effect=ImportError("no module"),
+        ):
+            with pytest.raises(LLMConfigurationError, match="langchain-openai"):
+                openai_factory.build_chat_model("security_auditor")
+            with pytest.raises(LLMConfigurationError, match="langchain-anthropic"):
+                anthropic_factory.build_chat_model("security_auditor")
+
+        # Configured OpenAI/Anthropic keys flow from Settings into the provider chat models
+        openai_cfg = Settings(
+            _env_file=None,
+            llm_provider="openai",
+            auditor_model="gpt-4o-mini",
+            critic_model="gpt-4o",
+            openai_api_key=SecretStr("sk-test-openai"),
+        )
+        assert openai_cfg.has_active_llm_api_key is True
+        assert LLMFactory(settings=openai_cfg).build_chat_model("security_auditor") is not None
+
+        anthropic_cfg = Settings(
+            _env_file=None,
+            llm_provider="anthropic",
+            auditor_model="claude-3-5-sonnet-latest",
+            critic_model="claude-3-5-sonnet-latest",
+            anthropic_api_key=SecretStr("sk-ant-test"),
+        )
+        assert anthropic_cfg.has_active_llm_api_key is True
+        assert LLMFactory(settings=anthropic_cfg).build_chat_model("critic") is not None
 
 
 # ---------------------------------------------------------------------------

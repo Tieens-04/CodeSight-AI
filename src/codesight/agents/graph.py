@@ -844,7 +844,9 @@ async def run_pr_review_graph(
         was_cancelled = True
         raise
     finally:
-        if not was_cancelled:
+        if was_cancelled:
+            telemetry_session.abort_and_close()
+        else:
             final_telemetry = await telemetry_session.aflush_and_close(
                 timeout_seconds=telemetry_flush_timeout_seconds
             )

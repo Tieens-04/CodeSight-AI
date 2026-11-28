@@ -248,11 +248,29 @@ def _build_gemini_chat_model(
     )
 
 
+def _resolve_provider_api_key(
+    *,
+    provider: str,
+    env_var_name: str,
+    settings_secret: SecretStr | None,
+    override_key: str | None,
+) -> str:
+    if override_key is not None and override_key.strip():
+        return override_key.strip()
+    if settings_secret is not None:
+        cleaned = settings_secret.get_secret_value().strip()
+        if cleaned:
+            return cleaned
+    raise LLMConfigurationError(f"{env_var_name} is required to initialize {provider} chat models.")
+
+
 def _build_optional_provider_model(
     *,
     provider: str,
     module_name: str,
     class_name: str,
+    env_var_name: str,
+    settings_secret: SecretStr | None,
     model_name: str,
     override_api_key: str | None,
     timeout_seconds: float,
@@ -265,6 +283,12 @@ def _build_optional_provider_model(
             f"Provider '{provider}' requires optional package '{module_name.replace('_', '-')}' "
             "to be installed via `uv add`."
         ) from exc
+    api_key = _resolve_provider_api_key(
+        provider=provider,
+        env_var_name=env_var_name,
+        settings_secret=settings_secret,
+        override_key=override_api_key,
+    )
     model_cls = getattr(module, class_name)
     kwargs: dict[str, Any] = {
         "model": model_name,
@@ -272,15 +296,14 @@ def _build_optional_provider_model(
         "max_retries": 0,
         "timeout": timeout_seconds,
         "max_tokens": max_output_tokens,
+        "api_key": SecretStr(api_key),
     }
-    if override_api_key is not None and override_api_key.strip():
-        kwargs["api_key"] = SecretStr(override_api_key.strip())
     return cast(BaseChatModel, model_cls(**kwargs))
 
 
 def _build_openai_chat_model(
     model_name: str,
-    _settings: Settings,
+    settings: Settings,
     override_api_key: str | None,
     timeout_seconds: float,
     max_output_tokens: int,
@@ -289,6 +312,8 @@ def _build_openai_chat_model(
         provider="openai",
         module_name="langchain_openai",
         class_name="ChatOpenAI",
+        env_var_name="OPENAI_API_KEY",
+        settings_secret=settings.openai_api_key,
         model_name=model_name,
         override_api_key=override_api_key,
         timeout_seconds=timeout_seconds,
@@ -298,7 +323,7 @@ def _build_openai_chat_model(
 
 def _build_anthropic_chat_model(
     model_name: str,
-    _settings: Settings,
+    settings: Settings,
     override_api_key: str | None,
     timeout_seconds: float,
     max_output_tokens: int,
@@ -307,6 +332,8 @@ def _build_anthropic_chat_model(
         provider="anthropic",
         module_name="langchain_anthropic",
         class_name="ChatAnthropic",
+        env_var_name="ANTHROPIC_API_KEY",
+        settings_secret=settings.anthropic_api_key,
         model_name=model_name,
         override_api_key=override_api_key,
         timeout_seconds=timeout_seconds,

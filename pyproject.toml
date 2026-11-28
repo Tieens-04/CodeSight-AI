@@ -30,6 +30,12 @@ dependencies = [
     "uvicorn[standard]>=0.32",
 ]
 
+[project.optional-dependencies]
+providers = [
+    "langchain-anthropic>=0.3",
+    "langchain-openai>=0.3",
+]
+
 [project.scripts]
 codesight = "codesight.cli.main:app"
 

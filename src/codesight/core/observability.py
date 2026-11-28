@@ -855,6 +855,22 @@ class LangfuseTraceSession:
             )
         return self._telemetry_status
 
+    def abort_and_close(self) -> None:
+        """Dispose isolated TracerProvider and cached Langfuse client on cancellation."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._client is None or not self._isolated:
+            return
+        try:
+            self._client.shutdown()
+        except Exception as exc:
+            logger.warning("langfuse_abort_shutdown_failed", error_type=type(exc).__name__)
+        finally:
+            if self._public_key is not None:
+                with _CLIENT_CACHE_LOCK:
+                    LangfuseResourceManager._instances.pop(self._public_key, None)
+
     async def aflush_and_close(self, *, timeout_seconds: float = 2.0) -> TelemetryStatus:
         """Flush pending Langfuse spans off the event loop with a hard timeout."""
         if self._closed or self._client is None:
