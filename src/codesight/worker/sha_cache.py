@@ -8,7 +8,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import redis.asyncio as redis_async
 import redis.exceptions
@@ -18,6 +18,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from codesight.agents.schemas import VerifiedFinding
 from codesight.diff.file_filter import estimate_tokens, normalize_diff_path
 from codesight.diff.models import FilterMetrics, ParsedFileDiff, ParsedPullRequestDiff
+
+if TYPE_CHECKING:
+    from codesight.rag.token_packer import TokenBudgetMetrics
 
 DEFAULT_SHA_CACHE_TTL_SECONDS: Final[int] = 604_800  # 7 days
 SHA_CACHE_KEY_PREFIX: Final[str] = "file_review"
@@ -34,9 +37,11 @@ def is_full_blob_sha(raw: str | None) -> bool:
 
 
 def compute_patch_fingerprint(parsed_file: ParsedFileDiff) -> str:
-    """Compute a zero-code SHA-256 fingerprint over hunk coordinates and diff lines."""
+    """Compute a zero-code SHA-256 fingerprint over path, change type, and hunk diff lines."""
     hasher = hashlib.sha256()
-    hasher.update(parsed_file.change_type.encode("utf-8"))
+    norm_path = normalize_diff_path(parsed_file.file_path).rstrip("/") or parsed_file.file_path
+    norm_old = normalize_diff_path(parsed_file.old_path).rstrip("/") if parsed_file.old_path else ""
+    hasher.update(f"{norm_path}\0{norm_old}\0{parsed_file.change_type}\n".encode())
     for hunk in parsed_file.hunks:
         header = f"|{hunk.old_start},{hunk.old_count},{hunk.new_start},{hunk.new_count}\n"
         hasher.update(header.encode("utf-8"))
@@ -55,12 +60,25 @@ def _validate_key_segment(raw: str, *, name: str) -> str:
     return cleaned
 
 
-def build_sha_cache_key(repo_id: str, blob_sha: str, config_hash: str) -> str:
-    """Build deterministic Redis SHA cache key `file_review:{repo_id}:{blob_sha}:{config_hash}`."""
+def build_sha_cache_key(
+    repo_id: str,
+    blob_sha: str,
+    config_hash: str,
+    *,
+    file_path: str | None = None,
+    patch_fingerprint: str | None = None,
+) -> str:
+    """Build deterministic Redis SHA cache key scoped by repo, blob, config, and path/patch."""
     clean_repo = _validate_key_segment(repo_id, name="repo_id")
     clean_sha = _validate_key_segment(blob_sha, name="blob_sha").lower()
     clean_cfg = _validate_key_segment(config_hash, name="config_hash").lower()
-    return f"{SHA_CACHE_KEY_PREFIX}:{clean_repo}:{clean_sha}:{clean_cfg}"
+    base = f"{SHA_CACHE_KEY_PREFIX}:{clean_repo}:{clean_sha}:{clean_cfg}"
+    if file_path is None and patch_fingerprint is None:
+        return base
+    norm_path = normalize_diff_path(file_path or "").rstrip("/")
+    clean_fp = (patch_fingerprint or "").strip().lower()
+    scope_digest = hashlib.sha256(f"{norm_path}\0{clean_fp}".encode()).hexdigest()[:16]
+    return f"{base}:{scope_digest}"
 
 
 class CachedFileReview(BaseModel):
@@ -165,7 +183,13 @@ class RedisBlobSHACache:
                 continue
             try:
                 assert pf.blob_sha is not None
-                key = build_sha_cache_key(repo_id, pf.blob_sha, config_hash)
+                key = build_sha_cache_key(
+                    repo_id,
+                    pf.blob_sha,
+                    config_hash,
+                    file_path=pf.file_path,
+                    patch_fingerprint=compute_patch_fingerprint(pf),
+                )
             except ValueError:
                 continue
             lookup_targets.append((idx, pf, key))
@@ -270,7 +294,13 @@ class RedisBlobSHACache:
             if not is_full_blob_sha(entry.blob_sha):
                 continue
             try:
-                key = build_sha_cache_key(repo_id, entry.blob_sha, config_hash)
+                key = build_sha_cache_key(
+                    repo_id,
+                    entry.blob_sha,
+                    config_hash,
+                    file_path=entry.file_path,
+                    patch_fingerprint=entry.patch_fingerprint,
+                )
             except ValueError:
                 continue
             pairs.append((key, entry.model_dump_json()))
@@ -281,7 +311,7 @@ class RedisBlobSHACache:
         try:
             async with self._redis.pipeline(transaction=False) as pipe:
                 for key, payload_json in pairs:
-                    pipe.setex(key, self._ttl_seconds, payload_json)
+                    pipe.set(key, payload_json, ex=self._ttl_seconds)
                 await pipe.execute()
             return len(pairs)
         except (redis.exceptions.RedisError, TimeoutError, OSError) as exc:
@@ -343,12 +373,16 @@ def build_reduced_parsed_diff(
 def compute_combined_tokens_saved_pct(
     parsed_diff: ParsedPullRequestDiff,
     *,
-    cached_files: Sequence[ParsedFileDiff],
+    cached_files: Sequence[ParsedFileDiff] = (),
+    packed_metrics: TokenBudgetMetrics | None = None,
+    uncached_source_tokens: int = 0,
+    uncached_aux_tokens: int = 0,
 ) -> float:
-    """Compute combined token reduction across noise filtering and Redis SHA cache hits."""
+    """Compute combined token reduction across noise filter, SHA cache, and AST/RAG slicing."""
     raw_tokens = parsed_diff.metrics.raw_estimated_tokens
-    if raw_tokens <= 0:
-        return 0.0
+    if raw_tokens <= 0 and (packed_metrics is None or packed_metrics.baseline_tokens <= 0):
+        if uncached_source_tokens <= 0:
+            return 0.0
     total_kept_annotated = sum(
         estimate_tokens(pf.annotated_diff) for pf in parsed_diff.files if pf.annotated_diff
     )
@@ -360,8 +394,43 @@ def compute_combined_tokens_saved_pct(
         if total_kept_annotated > 0
         else 0.0
     )
+    noise_tokens = float(parsed_diff.metrics.saved_estimated_tokens)
+
+    if packed_metrics is not None:
+        uncached_diff_tokens = max(0, packed_metrics.diff_tokens)
+        packed_file_baseline = max(
+            0, packed_metrics.baseline_tokens - packed_metrics.skipped_noise_tokens
+        )
+        uncached_baseline = float(
+            max(uncached_diff_tokens, packed_file_baseline, uncached_source_tokens)
+        )
+        total_baseline = noise_tokens + cached_raw_share + uncached_baseline
+        if total_baseline <= 0:
+            return 0.0
+        codesight_uncached = float(max(0, packed_metrics.codesight_tokens))
+        total_saved = max(0.0, min(total_baseline, total_baseline - codesight_uncached))
+        return round((total_saved / total_baseline) * 100.0, 2)
+
+    if uncached_source_tokens > 0:
+        uncached_diff_f = max(
+            0.0, float(parsed_diff.metrics.kept_estimated_tokens) - cached_raw_share
+        )
+        uncached_baseline_f = max(uncached_diff_f, float(uncached_source_tokens))
+        total_baseline = noise_tokens + cached_raw_share + uncached_baseline_f
+        if total_baseline <= 0:
+            return 0.0
+        codesight_uncached = (
+            uncached_diff_f + float(max(0, uncached_aux_tokens))
+            if uncached_diff_f > 0 or uncached_aux_tokens > 0
+            else 0.0
+        )
+        total_saved = max(0.0, min(total_baseline, total_baseline - codesight_uncached))
+        return round((total_saved / total_baseline) * 100.0, 2)
+
+    if raw_tokens <= 0:
+        return 0.0
     total_saved = min(
         float(raw_tokens),
-        float(parsed_diff.metrics.saved_estimated_tokens) + cached_raw_share,
+        noise_tokens + cached_raw_share,
     )
     return round((total_saved / raw_tokens) * 100.0, 2)

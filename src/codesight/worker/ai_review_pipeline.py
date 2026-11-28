@@ -26,11 +26,12 @@ from codesight.core.config import Settings
 from codesight.core.errors import RateLimitTaskError, RetryableTaskError
 from codesight.db.models import PRReview, Repository, ReviewFinding, WebhookEvent
 from codesight.db.repositories import upsert_repository
-from codesight.diff.file_filter import normalize_diff_path
+from codesight.diff.file_filter import estimate_tokens, normalize_diff_path
 from codesight.diff.models import ParsedFileDiff, ParsedPullRequestDiff
 from codesight.rag.embedder import GeminiEmbedder
 from codesight.rag.qdrant_store import QdrantZeroCodeStore
 from codesight.rag.retriever import AssembledPRContext, HybridContextRetriever
+from codesight.rag.token_packer import TokenBudgetMetrics
 from codesight.scoring.debt_scorer import (
     DebtScoreBreakdown,
     FileComplexityInput,
@@ -265,6 +266,9 @@ async def execute_ai_pr_review(
     llm_calls = 0
     rag_degraded = False
     telemetry: TelemetryStatus | None = None
+    packed_metrics: TokenBudgetMetrics | None = None
+    uncached_source_tokens = 0
+    uncached_aux_tokens = 0
 
     try:
         if reviewable_uncached:
@@ -347,6 +351,21 @@ async def execute_ai_pr_review(
             fresh_findings = list(final_state.verified_findings)
             llm_calls = len(final_state.llm_metrics)
             telemetry = final_state.telemetry
+            if assembled_context is not None:
+                packed_metrics = assembled_context.packed_bundle.metrics
+            uncached_source_tokens = sum(
+                max(
+                    estimate_tokens(pf.annotated_diff),
+                    estimate_tokens(
+                        after_sources.get(
+                            normalize_diff_path(pf.file_path).rstrip("/") or pf.file_path,
+                            "",
+                        )
+                    ),
+                )
+                for pf in reviewable_uncached
+            )
+            uncached_aux_tokens = sum(bc.aux_tokens for bc in final_state.batch_contexts.values())
 
             if sha_cache is not None and not rag_degraded:
                 ineligible_paths: set[str] = {
@@ -355,7 +374,16 @@ async def execute_ai_pr_review(
                 }
                 batch_by_index = {batch.batch_index: batch for batch in final_state.batches}
                 for br in final_state.batch_results:
-                    if br.truncated_candidates_count > 0:
+                    expected_ids = {c.candidate_id for c in br.findings} - set(
+                        br.truncated_candidate_ids
+                    )
+                    verdict_ids = {v.candidate_id for v in br.verdicts}
+                    batch_incomplete = (
+                        br.truncated_candidates_count > 0
+                        or br.dropped_invalid_verdicts_count > 0
+                        or not expected_ids.issubset(verdict_ids)
+                    )
+                    if batch_incomplete:
                         batch = batch_by_index.get(br.batch_index)
                         if batch is not None:
                             for fp in batch.file_paths:
@@ -453,6 +481,9 @@ async def execute_ai_pr_review(
         tokens_saved_pct = compute_combined_tokens_saved_pct(
             parsed_diff,
             cached_files=cached_files,
+            packed_metrics=packed_metrics,
+            uncached_source_tokens=uncached_source_tokens,
+            uncached_aux_tokens=uncached_aux_tokens,
         )
         latency_ms = max(0, int((time.perf_counter() - started) * 1000))
         summary_markdown = composer.compose_pr_summary(
@@ -546,6 +577,17 @@ async def persist_pr_review_result(
             if latency_ms is not None
             else (result.latency_ms if result is not None else 0)
         )
+
+        if review_status == "completed":
+            await session.execute(
+                sa.update(PRReview)
+                .where(
+                    PRReview.repo_id == target_repo_uuid,
+                    PRReview.pr_number == pr_number,
+                    PRReview.status == "completed",
+                )
+                .values(status="superseded")
+            )
 
         pr_review = PRReview(
             repo_id=target_repo_uuid,

@@ -55,6 +55,9 @@ class _FakePipeline:
     def setex(self, key: str, ttl: int, value: str) -> None:
         self._ops.append((key, value, ttl))
 
+    def set(self, key: str, value: str, *, ex: int | None = None) -> None:
+        self._ops.append((key, value, ex or 0))
+
     async def execute(self) -> list[bool]:
         for key, value, ttl in self._ops:
             self._store[key] = (value, ttl)
@@ -236,7 +239,7 @@ async def test_15_file_pr_second_commit_hits_sha_cache_and_saves_tokens() -> Non
     assert len(fake_redis.store) == 15
     for cached_key, (raw_json, ttl) in fake_redis.store.items():
         assert cached_key.startswith("file_review:repo-101:")
-        assert cached_key.endswith(f":{repo_config.config_hash}")
+        assert f":{repo_config.config_hash}:" in cached_key
         assert ttl == DEFAULT_SHA_CACHE_TTL_SECONDS
         # NFR-3: never persist raw source code inside Redis cache payloads
         assert "def fn_" not in raw_json
@@ -317,7 +320,30 @@ async def test_sha_cache_fail_open_corrupt_entries_and_hunk_revalidation() -> No
     # 2. Corrupt JSON entry & stale out-of-hunk suggestion stripping + rename path remap
     good_redis = _FakeAsyncRedis()
     cache = RedisBlobSHACache(good_redis)  # type: ignore[arg-type]
-    bad_key = build_sha_cache_key("repo-1", "d" * 40, "cfg1")
+    renamed_diff = SmartDiffParser().parse_patch_entries(
+        [
+            PatchFileEntry(
+                filename="src/corrupt.py",
+                status="modified",
+                blob_sha="d" * 40,
+                patch="@@ -1 +1,2 @@\n x = 1\n+y = 2\n",
+            ),
+            PatchFileEntry(
+                filename="src/new_name.py",
+                previous_filename="src/old_name.py",
+                status="renamed",
+                blob_sha="e" * 40,
+                patch="@@ -1 +1,2 @@\n x = 1\n+y = 2\n",
+            ),
+        ]
+    )
+    bad_key = build_sha_cache_key(
+        "repo-1",
+        "d" * 40,
+        "cfg1",
+        file_path="src/corrupt.py",
+        patch_fingerprint=compute_patch_fingerprint(renamed_diff.files[0]),
+    )
     good_redis.store[bad_key] = ("{not-valid-json", 60)
     stale_finding = VerifiedFinding(
         candidate_id="sec-001",
@@ -339,33 +365,23 @@ async def test_sha_cache_fail_open_corrupt_entries_and_hunk_revalidation() -> No
             explanation="Replace stale line",
         ),
     )
-    valid_key = build_sha_cache_key("repo-1", "e" * 40, "cfg1")
+    valid_fp = compute_patch_fingerprint(renamed_diff.files[1])
+    valid_key = build_sha_cache_key(
+        "repo-1",
+        "e" * 40,
+        "cfg1",
+        file_path="src/new_name.py",
+        patch_fingerprint=valid_fp,
+    )
     good_redis.store[valid_key] = (
         CachedFileReview(
             file_path="src/old_name.py",
             blob_sha="e" * 40,
             config_hash="cfg1",
+            patch_fingerprint=valid_fp,
             findings=(stale_finding,),
         ).model_dump_json(),
         60,
-    )
-
-    renamed_diff = SmartDiffParser().parse_patch_entries(
-        [
-            PatchFileEntry(
-                filename="src/corrupt.py",
-                status="modified",
-                blob_sha="d" * 40,
-                patch="@@ -1 +1,2 @@\n x = 1\n+y = 2\n",
-            ),
-            PatchFileEntry(
-                filename="src/new_name.py",
-                previous_filename="src/old_name.py",
-                status="renamed",
-                blob_sha="e" * 40,
-                patch="@@ -1 +1,2 @@\n x = 1\n+y = 2\n",
-            ),
-        ]
     )
     res = await cache.get_many(
         repo_id="repo-1",
@@ -692,3 +708,153 @@ async def test_sha_cache_short_sha_guard_token_units_fingerprint_and_exclusions(
         client = GitHubPullRequestClient(auth, http_client=http_client)
         with pytest.raises(RateLimitTaskError):
             await client.enrich_missing_blob_shas("acme/app", 5, short_diff)
+
+
+async def test_sha_cache_scopes_blobs_blocks_incomplete_critic_and_counts_ast_savings() -> None:
+    """Regression tests for P1-01, P1-03a, and P1-03b."""
+    # 1. P1-03b: Two different files with identical blob_sha do not collide or leak findings
+    same_sha = "7" * 40
+    two_pkg_diff = SmartDiffParser().parse_patch_entries(
+        [
+            PatchFileEntry(
+                filename="pkg_a/helper.py",
+                status="added",
+                blob_sha=same_sha,
+                patch="@@ -0,0 +1,2 @@\n+def f():\n+    return 1\n",
+            ),
+            PatchFileEntry(
+                filename="pkg_b/helper.py",
+                status="added",
+                blob_sha=same_sha,
+                patch="@@ -0,0 +1,2 @@\n+def f():\n+    return 1\n",
+            ),
+        ]
+    )
+    scoped_redis = _FakeAsyncRedis()
+    scoped_cache = RedisBlobSHACache(scoped_redis)  # type: ignore[arg-type]
+    finding_a = VerifiedFinding(
+        candidate_id="sec-a",
+        role="security_auditor",
+        batch_index=0,
+        file_path="pkg_a/helper.py",
+        start_line=1,
+        end_line=2,
+        severity="WARNING",
+        category="bug",
+        title="Package A specific issue",
+        evidence="L2",
+        confidence=0.9,
+        rationale="Verified",
+    )
+    written = await scoped_cache.set_many(
+        repo_id="repo-1",
+        config_hash="cfg1",
+        entries=[
+            CachedFileReview(
+                file_path="pkg_a/helper.py",
+                blob_sha=same_sha,
+                config_hash="cfg1",
+                patch_fingerprint=compute_patch_fingerprint(two_pkg_diff.files[0]),
+                findings=(finding_a,),
+            ),
+            CachedFileReview(
+                file_path="pkg_b/helper.py",
+                blob_sha=same_sha,
+                config_hash="cfg1",
+                patch_fingerprint=compute_patch_fingerprint(two_pkg_diff.files[1]),
+                findings=(),
+            ),
+        ],
+    )
+    assert written == 2
+    assert len(scoped_redis.store) == 2
+    lookup = await scoped_cache.get_many(
+        repo_id="repo-1",
+        config_hash="cfg1",
+        files=two_pkg_diff.files,
+    )
+    assert lookup.hit_count == 2
+    assert len(lookup.hits["pkg_a/helper.py"].findings) == 1
+    assert lookup.hits["pkg_b/helper.py"].findings == ()
+
+    # 2. P1-03a: Critic returning empty verdicts for a non-empty candidate batch blocks caching
+    settings = Settings(_env_file=None, gemini_api_key=SecretStr("fake-gemini"))
+
+    class _SilentCriticFactory(LLMFactory):
+        def __init__(self, cfg: Settings) -> None:
+            super().__init__(settings=cfg, structured_invoker=self._invoke)
+
+        async def _invoke(
+            self,
+            role: Any,
+            model_name: str,
+            schema: type[Any],
+            messages: list[Any],
+            config: Any,
+        ) -> StructuredInvocationResult[Any]:
+            _ = schema, messages, config
+            if role == "security_auditor":
+                parsed: Any = LLMAuditorDraftOutput(
+                    findings=[
+                        LLMFindingDraft(
+                            file_path="src/large_svc.py",
+                            start_line=2,
+                            end_line=2,
+                            severity="CRITICAL",
+                            category="sql_injection",
+                            title="Unsafely interpolated SQL",
+                            evidence="run(user_input) passes unvalidated input on L2",
+                            confidence=0.95,
+                        )
+                    ]
+                )
+            elif role == "logic_performance_auditor":
+                parsed = LLMAuditorDraftOutput(findings=[])
+            else:
+                parsed = LLMCriticDraftOutput(verdicts=[])
+            return StructuredInvocationResult(
+                parsed=parsed,
+                model_name=model_name,
+                input_tokens=100,
+                output_tokens=20,
+                total_tokens=120,
+                estimated_cost_usd=0.0,
+                latency_ms=5.0,
+                attempts=1,
+            )
+
+    # 3. P1-01: Pure .py PR without lockfiles or cache still reports AST token savings > 40%
+    large_body = "\n".join(f"def helper_{i}(x: int) -> int:\n    return x + {i}" for i in range(45))
+    large_source = f"def target(user_input: str) -> None:\n    pass\n\n{large_body}\n"
+    pure_py_diff = SmartDiffParser().parse_patch_entries(
+        [
+            PatchFileEntry(
+                filename="src/large_svc.py",
+                status="modified",
+                blob_sha="9" * 40,
+                patch=(
+                    "@@ -1,2 +1,2 @@\n"
+                    " def target(user_input: str) -> None:\n"
+                    "-    pass\n"
+                    "+    run(user_input)\n"
+                ),
+            )
+        ]
+    )
+    poison_redis = _FakeAsyncRedis()
+    poison_cache = RedisBlobSHACache(poison_redis)  # type: ignore[arg-type]
+    res_silent = await execute_ai_pr_review(
+        repo_full_name="acme/app",
+        repo_id="repo-1",
+        pr_number=9,
+        head_sha="9" * 40,
+        parsed_diff=pure_py_diff,
+        repo_config=RepoConfig(),
+        settings=settings,
+        trace_id="trace-p1-01-03",
+        llm_factory=_SilentCriticFactory(settings),
+        sha_cache=poison_cache,
+        in_memory_after_sources={"src/large_svc.py": large_source},
+    )
+    assert len(poison_redis.store) == 0
+    assert res_silent.tokens_saved_pct >= 40.0

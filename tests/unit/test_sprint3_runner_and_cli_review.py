@@ -90,6 +90,9 @@ class _FakePipeline:
     def setex(self, key: str, ttl: int, value: str) -> None:
         self._ops.append((key, value, ttl))
 
+    def set(self, key: str, value: str, *, ex: int | None = None) -> None:
+        self._ops.append((key, value, ex or 0))
+
     async def execute(self) -> list[bool]:
         for key, value, ttl in self._ops:
             self._store[key] = (value, ttl)
@@ -1151,8 +1154,8 @@ async def test_telemetry_span_exporter_plumbing_and_cli_precache_uuid_sync(
         assert len(cli_exporter.spans) > 0
         assert cli_exporter.shutdown_called is False
         # Cache key must use canonical PostgreSQL UUID, NOT github_repo_id (55)
-        expected_key = f"file_review:{cli_repo_uuid}:{'b' * 40}:{RepoConfig().config_hash}"
-        assert expected_key in cli_redis.store
+        expected_prefix = f"file_review:{cli_repo_uuid}:{'b' * 40}:{RepoConfig().config_hash}:"
+        assert any(k.startswith(expected_prefix) for k in cli_redis.store)
 
         existing_repo_session = _ExpireSessionFactory(cli_repo_uuid)
         second_bundle = await review_mod.run_cli_ai_review(
@@ -1203,5 +1206,8 @@ async def test_telemetry_span_exporter_plumbing_and_cli_precache_uuid_sync(
         )
         assert failing_session.session.rolled_back is True
         assert any("PostgreSQL unavailable" in w for w in fallback_bundle.warnings)
-        assert f"file_review:55:{'b' * 40}:{RepoConfig().config_hash}" in fallback_redis.store
+        fallback_prefix = f"file_review:55:{'b' * 40}:{RepoConfig().config_hash}:"
+        assert any(k.startswith(fallback_prefix) for k in fallback_redis.store)
         assert fallback_bundle.db_review_id is None
+        # P2-03: persist_pr_review_result executes superseded UPDATE for completed reviews
+        assert len(new_repo_session.session.executed) >= 1
